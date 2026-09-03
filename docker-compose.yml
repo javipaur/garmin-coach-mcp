@@ -1,9 +1,9 @@
 services:
-  garmin-coach:
+  garmin-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    image: garmincoachmcp-garmincoachmcp
+    image: garmincoachmcp-garminmcp
     restart: unless-stopped
     ports:
       - "${PORT:-8000}:8000"
