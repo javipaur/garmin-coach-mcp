@@ -2176,6 +2176,51 @@ async def api_connection_test(request: Request) -> JSONResponse:
 
 # Admin user management routes
 
+def _admin_page_html(title: str, body: str, extra_head: str = "") -> str:
+    """Shared chrome for admin pages (dark / lime aesthetic)."""
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_html.escape(title)}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--bg:#0a0d0b;--panel:#111710;--line:#1e2820;--fg:#e6ede8;--dim:#93a399;--faint:#5d6b63;--acc:#c8f169;--acc-dim:#8fa84e}}
+body{{font-family:'Space Grotesk',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;padding:32px 20px}}
+.wrap{{max-width:880px;margin:0 auto}}
+.back{{display:inline-flex;align-items:center;gap:.4rem;color:var(--dim);text-decoration:none;font-size:.85rem;margin-bottom:1.5rem;transition:color .15s}}
+.back:hover{{color:var(--acc)}}
+h1{{font-size:1.9rem;font-weight:700;letter-spacing:-.02em;margin-bottom:8px}}
+h1 .acc{{color:var(--acc)}}
+.sub{{color:var(--dim);font-size:.95rem;margin-bottom:2rem}}
+.mono{{font-family:'IBM Plex Mono',monospace}}
+.card{{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px;margin-bottom:20px}}
+.card h2{{font-size:1.15rem;font-weight:600;margin-bottom:6px}}
+.card .card-sub{{color:var(--dim);font-size:.88rem;margin-bottom:16px}}
+label{{display:block;color:var(--dim);font-size:.85rem;font-weight:500;margin:16px 0 6px}}
+input[type=text],input[type=email]{{width:100%;background:#0d120e;border:1px solid var(--line);color:var(--fg);padding:12px 14px;border-radius:10px;font-size:1rem;font-family:inherit;transition:border-color .15s}}
+input:focus{{outline:none;border-color:var(--acc)}}
+input::placeholder{{color:var(--faint)}}
+.btn{{display:inline-flex;align-items:center;gap:.5rem;background:var(--acc);color:#0a0d0b;border:none;font-weight:600;font-family:inherit;font-size:1rem;padding:12px 22px;border-radius:10px;cursor:pointer;transition:filter .15s,transform .1s}}
+.btn:hover{{filter:brightness(1.08)}}
+.btn:active{{transform:translateY(1px)}}
+.btn.secondary{{background:transparent;color:var(--fg);border:1px solid var(--line)}}
+.btn.secondary:hover{{border-color:var(--acc);color:var(--acc);filter:none}}
+.btn.block{{width:100%;justify-content:center}}
+.badge{{display:inline-flex;align-items:center;gap:.4rem;background:rgba(200,241,105,.12);color:var(--acc);border:1px solid rgba(200,241,105,.25);padding:.25rem .7rem;border-radius:6px;font-size:.78rem;font-weight:500}}
+.hint{{font-size:.8rem;color:var(--faint)}}
+</style>
+{extra_head}
+</head>
+<body>
+<div class="wrap">
+<a class="back" href="/admin">&larr; Volver al panel</a>
+{body}
+</div>
+</body></html>"""
+
+
 @mcp.custom_route("/admin/users", methods=["GET"])
 async def admin_users_list(request: Request) -> Response:
     from starlette.responses import HTMLResponse
@@ -2186,66 +2231,160 @@ async def admin_users_list(request: Request) -> Response:
     db = _load_users_db()
     users = db.get("users", {})
 
+    # Build table with real base_url
     rows = ""
     for uid, u in users.items():
         u_key = u.get("api_key", "")
         login_link = f"{base_url}/u/login?api_key={u_key}"
-        key_display = u_key[:20] + "..."
+        key_display = u_key[:24] + "…"
+        email = u.get("garmin_email", "")
+        created = (u.get("created_at", "") or "")[:10]
+        has_token = (u.get("garmin_tokens_json") or "").strip() != "" or (USERS_DB_DIR / uid / "garmin_tokens.json").exists()
+        dot = "<span style=\"color:var(--acc)\">●</span>" if has_token else "<span style=\"color:var(--faint)\">○</span>"
         rows += f"""<tr>
-<td>{uid}</td>
-<td>{u.get('display_name', '')}</td>
-<td>{u.get('garmin_email', '')}</td>
-<td><code style="font-size:11px">{key_display}</code></td>
-<td><a href="{_html.escape(login_link)}" style="color:#60a5fa;font-size:12px">Panel</a></td>
-<td>{u.get('created_at', '')[:10]}</td>
+<td><span class="mono" style="font-size:.8rem">{_html.escape(uid[:6])}</span></td>
+<td>{_html.escape(u.get('display_name',''))}</td>
+<td>{_html.escape(email) or '—'}</td>
+<td><code style="font-size:.74rem;color:var(--acc-dim)">{_html.escape(key_display)}</code></td>
+<td>{dot}</td>
+<td style="font-size:.82rem;color:var(--dim)">{created}</td>
+<td style="text-align:right"><a href="{_html.escape(login_link)}" class="btn secondary" style="font-size:.76rem;padding:6px 12px">Panel</a></td>
 </tr>"""
 
-    html = f"""<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Admin - Usuarios</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:system-ui,sans-serif;background:#0a0a0a;color:#e0e0e0;padding:20px;max-width:1000px;margin:0 auto}}
-h1{{color:#4ade80;margin-bottom:4px}}
-p.muted{{color:#888;margin-bottom:20px;font-size:14px}}
-table{{width:100%;border-collapse:collapse;margin-top:16px}}
-th,td{{padding:10px;text-align:left;border-bottom:1px solid #333;font-size:14px}}
-th{{color:#60a5fa;font-weight:600}}
-.btn{{background:#4ade80;color:#000;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;font-weight:600}}
-.input{{background:#1a1a1a;border:1px solid #333;color:#e0e0e0;padding:8px 12px;border-radius:6px;margin-right:8px}}
-.card{{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:20px;margin-top:24px}}
-.card label{{display:block;color:#9a9aa2;font-size:13px;margin:8px 0 4px}}
-</style>
-</head>
-<body>
-<h1>Usuarios Registrados</h1>
-<p class="muted">Cada usuario accede a su panel con el enlace que empieza por /u/login?api_key=...</p>
-<table>
-<tr><th>ID</th><th>Nombre</th><th>Email Garmin</th><th>API Key</th><th>Panel</th><th>Creado</th></tr>
-{rows}
-</table>
+    empty_state = (
+        '<div class="card" style="text-align:center;padding:40px 24px">'
+        '<div style="font-size:2.4rem;margin-bottom:10px">🏃</div>'
+        '<h2 style="font-size:1.2rem">Todavía no hay usuarios</h2>'
+        '<p class="card-sub" style="margin:8px auto 0;max-width:34em">'
+        'Crea tu primer usuario con el asistente paso a paso de abajo. Recibirá su API key y su enlace de conexión.</p>'
+        '</div>'
+    ) if not rows else ""
 
-<div class="card">
-<h2 style="color:#60a5fa;margin-bottom:4px">Crear usuario</h2>
-<p class="muted">Genera un usuario nuevo y le asigna una API key automáticamente.</p>
-<form method="POST" action="/admin/users/create" style="margin-top:12px">
-<label>Nombre / alias</label>
-<input class="input" name="display_name" required placeholder="ej. Carlos">
-<label>Email Garmin (opcional)</label>
-<input class="input" name="garmin_email" type="email" placeholder="ej. carlos@gmail.com">
-<button class="btn" type="submit">Crear usuario</button>
-</form>
+    extra_head = (
+        '<style>'
+        'table{{width:100%;border-collapse:collapse;margin-top:8px}}'
+        'th,td{{padding:12px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:.9rem}}'
+        'th{{color:var(--dim);font-weight:500;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em}}'
+        '.steps{{display:flex;flex-direction:column;gap:0;counter-reset:step;margin-top:8px}}'
+        '</style>'
+    )
+
+    body = (
+        '<h1>Usuarios <span class="acc">del club</span></h1>'
+        '<p class="sub">Crea accesos para cada corredor. Cada uno conecta su propio Garmin de forma aislada.</p>'
+        + ('<div class="card"><h2>Usuarios registrados</h2><div style="overflow-x:auto">'
+           '<table><tr><th>ID</th><th>Nombre</th><th>Email Garmin</th><th>API Key</th><th>Estado</th><th>Creado</th><th></th></tr>'
+           f'{rows}</table></div></div>' if rows else empty_state)
+        + _admin_create_wizard_html()
+    )
+    return HTMLResponse(_admin_page_html("Admin · Usuarios", body, extra_head))
+
+
+def _admin_create_wizard_html() -> str:
+    """Multi-step, intuitive create-user wizard (JS-driven single page)."""
+    return """
+<div class="card" id="create-card">
+  <h2>➕ Crear un nuevo corredor</h2>
+  <p class="card-sub">Sigue los 3 pasos. Al terminar te daremos su clave y su enlace.</p>
+
+  <div class="wiz-progress">
+    <div class="wiz-step active" data-s="1"><span>1</span>Datos</div>
+    <div class="wiz-step" data-s="2"><span>2</span>Revisar</div>
+    <div class="wiz-step" data-s="3"><span>3</span>Listo</div>
+  </div>
+
+  <!-- STEP 1 -->
+  <form id="step1">
+    <label for="display_name">¿Quién es?</label>
+    <input type="text" id="display_name" name="display_name" placeholder="ej. Carlos" autocomplete="off" required>
+    <label for="garmin_email">Su email de Garmin <span class="hint">(opcional · lo rellena él later con su cuenta)</span></label>
+    <input type="email" id="garmin_email" name="garmin_email" placeholder="ej. carlos@gmail.com" autocomplete="off">
+    <button class="btn block" type="submit" style="margin-top:22px">Continuar <span class="mono">→</span></button>
+  </form>
+
+  <!-- STEP 2 -->
+  <div id="step2" style="display:none">
+    <div class="confirm-box">
+      <p><span class="k">Nombre</span><span class="v" id="c-name">—</span></p>
+      <p><span class="k">Email Garmin</span><span class="v" id="c-email">—</span></p>
+    </div>
+    <p class="hint" style="margin-top:14px">Pulsando "Crear" se generará una API key única para este usuario.</p>
+    <div style="display:flex;gap:12px;margin-top:20px;flex-wrap:wrap">
+      <button class="btn" type="button" id="wiz-back1">&larr; Atrás</button>
+      <button class="btn" type="button" id="wiz-submit">Crear usuario</button>
+    </div>
+  </div>
+
+  <!-- STEP 3 result injected here -->
+  <div id="step3" style="display:none"></div>
 </div>
-</body></html>"""
-    return HTMLResponse(html)
+
+<style>
+.wiz-progress{display:flex;gap:0;margin:18px 0 8px;list-style:none}
+.wiz-step{flex:1;text-align:center;font-size:.78rem;color:var(--faint);padding-bottom:10px;position:relative;border-bottom:2px solid var(--line)}
+.wiz-step.active{color:var(--acc);border-bottom-color:var(--acc);font-weight:600}
+.wiz-step span{display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--line);color:var(--dim);align-items:center;justify-content:center;font-size:.75rem;margin-right:6px}
+.wiz-step.active span{background:var(--acc);color:#0a0d0b}
+.confirm-box{background:#0d120e;border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.confirm-box p{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dashed var(--line)}
+.confirm-box p:last-child{border-bottom:none}
+.confirm-box .k{color:var(--dim);font-size:.85rem}
+.confirm-box .v{font-family:'IBM Plex Mono',monospace;color:var(--fg);word-break:break-all}
+</style>
+
+<script>
+(function(){
+  var data={};
+  var lastKey='';
+  var s1=document.getElementById('step1'),
+      s2=document.getElementById('step2'),
+      s3=document.getElementById('step3'),
+      prog=document.querySelectorAll('.wiz-step');
+  window.wizCopyKey=function(){
+    if(lastKey){navigator.clipboard.writeText(lastKey).then(function(){alert('Clave copiada ✓')}).catch(function(){prompt('Copia la clave manualmente:',lastKey)})}
+  };
+  function setStep(n){
+    prog.forEach(function(p){p.classList.toggle('active',parseInt(p.getAttribute('data-s'),10)===n)});
+    s1.style.display=n===1?'':'none';
+    s2.style.display=n===2?'':'none';
+    s3.style.display=n===3?'':'none';
+  }
+  s1.addEventListener('submit',function(e){
+    e.preventDefault();
+    data.name=document.getElementById('display_name').value.trim();
+    data.email=document.getElementById('garmin_email').value.trim();
+    if(!data.name)return;
+    document.getElementById('c-name').textContent=data.name;
+    document.getElementById('c-email').textContent=data.email||'—';
+    setStep(2);
+  });
+  document.getElementById('wiz-back1').addEventListener('click',function(){setStep(1)});
+  document.getElementById('wiz-submit').addEventListener('click',function(){
+    var fd=new FormData();
+    fd.append('display_name',data.name);
+    fd.append('garmin_email',data.email||'');
+    fd.append('json','1');
+    fetch('/admin/users/create',{method:'POST',body:fd})
+      .then(function(r){return r.json()})
+      .then(function(res){
+        if(res.ok){
+          lastKey=res.api_key||'';
+          document.getElementById('step3').innerHTML=res.html;
+          setStep(3);
+        } else {
+          alert(res.error||'Error al crear el usuario');
+        }
+      })
+      .catch(function(){alert('Error de red al crear el usuario')});
+  });
+})();
+</script>
+"""
 
 
 @mcp.custom_route("/admin/users/create", methods=["POST"])
 async def admin_users_create(request: Request) -> Response:
-    from starlette.responses import RedirectResponse
+    from starlette.responses import HTMLResponse, RedirectResponse
     key = request.query_params.get("api_key", "")
     admin_key = ADMIN_API_KEY or key
     if ADMIN_API_KEY and key != ADMIN_API_KEY:
@@ -2253,10 +2392,60 @@ async def admin_users_create(request: Request) -> Response:
     form = await request.form()
     display_name = (form.get("display_name") or "").strip()
     garmin_email = (form.get("garmin_email") or "").strip()
+    want_json = (form.get("json") or "").strip() == "1"
     if not display_name:
+        if want_json:
+            return JSONResponse({"ok": False, "error": "El nombre es obligatorio."})
         return RedirectResponse("/admin/users", status_code=303)
-    _create_user(display_name=display_name, garmin_email=garmin_email)
-    return RedirectResponse("/admin/users", status_code=303)
+    user = _create_user(display_name=display_name, garmin_email=garmin_email)
+
+    base_url = _get_public_url(request)
+    api_key = user.get("api_key", "")
+    panel_link = f"{base_url}/u/login?api_key={api_key}"
+    connect_link = f"{base_url}/connect?api_key={api_key}"
+
+    if want_json:
+        # Step-3 success panel rendered server-side for the wizard.
+        success = (
+            '<div style="text-align:center">'
+            '<div style="font-size:2.6rem;margin-bottom:8px">🎉</div>'
+            '<h2 style="font-size:1.3rem;color:var(--acc)">¡Listo! Corredor creado</h2>'
+            '<p class="card-sub" style="margin-top:6px">Envía esto a <strong>' + _html.escape(display_name) + '</strong>:</p>'
+            '</div>'
+            '<div class="code-block" style="background:#0d120e;border:1px solid rgba(200,241,105,.25);border-radius:10px;padding:16px;margin-top:16px;text-align:left">'
+            '<div style="font-size:.72rem;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Su API key</div>'
+            '<div class="mono" style="word-break:break-all;font-size:.85rem;color:var(--acc)">' + _html.escape(api_key) + '</div>'
+            '<button class="btn secondary" style="font-size:.78rem;padding:8px 14px;margin-top:14px" onclick="wizCopyKey()">Copiar clave</button>'
+            '</div>'
+            '<div style="text-align:left;margin-top:20px;display:flex;flex-direction:column;gap:12px">'
+            '<p class="hint" style="margin:0"><strong style="color:var(--fg)">Paso 1 ·</strong> Comparte tu API key.</p>'
+            '<p class="hint" style="margin:0"><strong style="color:var(--fg)">Paso 2 ·</strong> El corredor entra a conectar su Garmin:</p>'
+            '<a href="' + _html.escape(panel_link) + '" class="btn secondary" style="font-size:.85rem;padding:10px 16px;justify-content:flex-start">Panel del corredor &rarr;</a>'
+            '<p class="hint" style="margin:0"><strong style="color:var(--fg)">Paso 3 ·</strong> Y configura la IA con su clave:</p>'
+            '<a href="' + _html.escape(connect_link) + '" class="btn secondary" style="font-size:.85rem;padding:10px 16px;justify-content:flex-start">Asistente para conectar la IA &rarr;</a>'
+            '</div>'
+        )
+        return JSONResponse({"ok": True, "html": success, "api_key": api_key})
+
+    # Non-JS fallback: full success page.
+    body = (
+        '<h1>Corredor <span class="acc">creado</span></h1>'
+        '<p class="sub">Estos son los accesos de <strong>' + _html.escape(display_name) + '</strong>. Guárdalos y compártelos.</p>'
+        '<div class="card"><h2>API key</h2>'
+        '<p class="card-sub">La clave personal del corredor:</p>'
+        '<div class="mono" style="background:#0d120e;border:1px solid var(--line);border-radius:10px;padding:14px;word-break:break-all;color:var(--acc)">' + _html.escape(api_key) + '</div>'
+        '</div>'
+        '<div class="card"><h2>Enlace de su panel</h2>'
+        '<p class="card-sub">Para conectar su Garmin y ver su estado:</p>'
+        '<a class="btn block" href="' + _html.escape(panel_link) + '" style="text-decoration:none">Abrir panel del corredor</a>'
+        '</div>'
+        '<div class="card"><h2>Conectar la IA</h2>'
+        '<p class="card-sub">Para configurar Claude / Cursor / móvil:</p>'
+        '<a class="btn block secondary" href="' + _html.escape(connect_link) + '" style="text-decoration:none">Asistente de conexión</a>'
+        '</div>'
+        '<a href="/admin/users" class="btn secondary" style="margin-top:8px;text-decoration:none">&larr; Volver a usuarios</a>'
+    )
+    return HTMLResponse(_admin_page_html("Usuario creado", body))
 
 
 # ---------------------------------------------------------------------------
