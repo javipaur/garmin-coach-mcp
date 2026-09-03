@@ -1,0 +1,18 @@
+services:
+  garmin-coach:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: garmincoachmcp-garmincoachmcp
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - PORT=8000
+      - USERS_DB_DIR=/data/users
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
+    volumes:
+      - garmincoach_data:/data
+
+volumes:
+  garmincoach_data:
