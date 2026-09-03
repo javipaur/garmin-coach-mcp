@@ -3953,6 +3953,7 @@ def _run_server() -> None:
         transport="http",
         host="0.0.0.0",
         port=PORT,
+        stateless_http=True,
         middleware=[
             Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
             Middleware(_UserAuthMiddleware),
