@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.token
+*.bak
+.venv/
+venv/
+
+# Datos locales (nunca a producción)
+data/
+.debug-data/
+.debug-data
+
+# Herramientas de desarrollo IA (locales, no desplegar)
+.agents/
+.claude/
+agent/
+skills-lock.json
+opencode.json
+
+# Dotenv / secretos
+.env
+.env.example

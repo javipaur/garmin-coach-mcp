@@ -2026,7 +2026,7 @@ def _render_unlock_page(wrong: bool = False) -> str:
         '<h1>Panel protegido</h1>'
         '<p class="muted">Introduce tu contraseña para acceder a la configuración.</p>'
         f'{err}'
-        '<form method="get" action="/">'
+        '<form method="get" action="/admin">'
         '<label for="token">Contraseña</label>'
         + _password_input_html("token", "token", autocomplete="current-password", autofocus=True) +
         '<button type="submit">Entrar</button>'
@@ -2254,18 +2254,39 @@ async def dashboard_deploy_status(request: Request) -> Response:
     return JSONResponse(_railway_deploy_status())
 
 
+def _landing_html() -> str | None:
+    """Look for the landing page close to the app; return its content or None."""
+    for base in (Path(__file__).parent, Path(__file__).parent.parent):
+        candidate = base / "index.html"
+        if candidate.exists():
+            try:
+                return candidate.read_text(encoding="utf-8")
+            except Exception:
+                return None
+    return None
+
+
 @mcp.custom_route("/", methods=["GET"])
 async def root(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
-    index_path = Path(__file__).parent.parent / "index.html"
-    if index_path.exists():
-        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    landing = _landing_html()
+    if landing is not None:
+        # Public marketing landing. Admin dashboard lives at /admin.
+        return HTMLResponse(landing)
+
+    # No landing file shipped → behave as the admin entry point.
+    return await admin_dashboard(request)
+
+
+@mcp.custom_route("/admin", methods=["GET"])
+async def admin_dashboard(request: Request) -> Response:
+    from starlette.responses import HTMLResponse, RedirectResponse
 
     # If a valid token arrives in the URL, remember it as a cookie and clean the
     # URL so the password never lingers in the address bar.
     active = _login_active_token(request)
     if active:
-        resp = RedirectResponse("/", status_code=303)
+        resp = RedirectResponse("/admin", status_code=303)
         _set_auth_cookie(resp, active, request)
         return resp
 
@@ -2288,7 +2309,7 @@ async def root(request: Request) -> Response:
 @mcp.custom_route("/lock", methods=["GET"])
 async def lock_session(request: Request) -> Response:
     from starlette.responses import RedirectResponse
-    resp = RedirectResponse("/", status_code=303)
+    resp = RedirectResponse("/admin", status_code=303)
     resp.delete_cookie("admin_token", samesite="strict")
     return resp
 
@@ -3418,8 +3439,8 @@ async def login_result(request: Request) -> Response:
             body = (
                 '<h1>✅ Configuración completada</h1>'
                 '<p>Tu cuenta Garmin ya está conectada.</p>'
-                '<script>setTimeout(function(){window.location.href="/"},2000)</script>'
-                '<a href="/"><button type="button">Ir al panel</button></a>'
+                '<script>setTimeout(function(){window.location.href="/admin"},2000)</script>'
+                '<a href="/admin"><button type="button">Ir al panel</button></a>'
             )
             return HTMLResponse(_login_render_page("Completado", None, body))
         body = (
@@ -3467,7 +3488,7 @@ async def login_result(request: Request) -> Response:
             '<div class="success">Tokens guardados en Railway automáticamente. '
             'Tu MCP es permanente — sobrevivirá a reinicios.</div>'
         )
-        parts.append('<a href="/" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ir al panel</button></a>')
+        parts.append('<a href="/admin" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ir al panel</button></a>')
     else:
         # Manual persistence path: show ONE copy-paste block formatted for Railway.
         railway_block = f"GARMIN_TOKENS_JSON={tokens_b64}"
@@ -3481,7 +3502,7 @@ async def login_result(request: Request) -> Response:
              '</ol>'
              f'<pre style="max-height:260px;overflow:auto;background:#1c1c22;color:#f2f2f7;padding:14px;border-radius:10px;font-size:13px;line-height:1.5;word-break:break-all;white-space:pre-wrap;border:1px solid #2a2a32" id="env-block">{_html.escape(railway_block)}</pre>'
              '<button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'env-block\').innerText);this.innerText=\'Copiado ✓\'">Copiar bloque</button>'
-             '<a href="/" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ya desplegué, ir al panel</button></a>'
+             '<a href="/admin" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ya desplegué, ir al panel</button></a>'
         )
 
     parts.append('<h2 style="margin-top:32px">Conéctalo a tu IA</h2>')
@@ -3541,7 +3562,7 @@ async def setup_persistence_form(request: Request) -> Response:
         'autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus>'
         '<button type="submit">Activar guardado permanente</button>'
         '</form>'
-        '<a href="/"><button type="button" class="secondary">← Volver al panel</button></a>'
+        '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
     )
     return HTMLResponse(_login_render_page("Guardado permanente", None, body))
 
@@ -3560,7 +3581,7 @@ async def setup_persistence_submit(request: Request) -> Response:
             '<h1>No se pudo activar</h1>'
             f'<div class="error">{_html.escape(msg)}</div>'
             '<a href="/setup/persistencia"><button type="button">Volver a intentar</button></a>'
-            '<a href="/"><button type="button" class="secondary">← Volver al panel</button></a>'
+            '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
         )
         return HTMLResponse(_login_render_page("Error", None, body), status_code=400)
 
@@ -3585,7 +3606,7 @@ async def setup_persistence_submit(request: Request) -> Response:
         'A partir de ahora aguanta reinicios del servidor.</div>'
         '<p class="muted">Railway está aplicando los cambios y reiniciará el servidor en ~1 minuto. '
         'Es normal que el panel tarde un poco en recargar.</p>'
-        '<a href="/"><button type="button">← Volver al panel</button></a>'
+        '<a href="/admin"><button type="button">← Volver al panel</button></a>'
     )
     return HTMLResponse(_login_render_page("Listo", None, body))
 
@@ -3602,7 +3623,7 @@ async def setup_protection_form(request: Request) -> Response:
             '<p>Para poder guardar tu contraseña necesito acceso a Railway, que se configura en '
             '<strong>Guardado permanente</strong>. Actívalo primero.</p>'
             '<a href="/setup/persistencia"><button type="button">Ir a Guardado permanente</button></a>'
-            '<a href="/"><button type="button" class="secondary">← Volver al panel</button></a>'
+            '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
         )
         return HTMLResponse(_login_render_page("Protección con contraseña", None, body))
 
@@ -3628,7 +3649,7 @@ async def setup_protection_form(request: Request) -> Response:
         "document.getElementById('pwd').value=p;"
         '">O genérame una segura al azar</button>'
         '</form>'
-        '<a href="/"><button type="button" class="secondary">← Volver al panel</button></a>'
+        '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
     )
     return HTMLResponse(_login_render_page(title, None, body))
 
@@ -3647,7 +3668,7 @@ async def setup_protection_submit(request: Request) -> Response:
             '<h1>No se pudo activar</h1>'
             f'<div class="error">{_html.escape(msg)}</div>'
             '<a href="/setup/proteccion"><button type="button">Volver a intentar</button></a>'
-            '<a href="/"><button type="button" class="secondary">← Volver al panel</button></a>'
+            '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
         )
         return HTMLResponse(_login_render_page("Error", None, body), status_code=400)
 
@@ -3709,7 +3730,7 @@ async def setup_protection_submit(request: Request) -> Response:
         '<button type="button" onclick="navigator.clipboard.writeText('
         "document.getElementById('login-url').innerText);this.innerText='Copiado ✓'"
         '">Copiar enlace</button>'
-        '<a href="/"><button type="button" class="secondary" style="margin-top:20px">← Volver al panel</button></a>'
+        '<a href="/admin"><button type="button" class="secondary" style="margin-top:20px">← Volver al panel</button></a>'
     )
     resp = HTMLResponse(_login_render_page("Listo", None, body))
     # Keep the current browser logged in with the new password.
@@ -10726,37 +10747,7 @@ def _import_plan_from_pdf_internal(
     except ValueError:
         return {"error": f"Fecha inválida: {start_date}"}
 
-    sessions = []
-    lines = [l.strip() for l in plan_text.strip().splitlines() if l.strip()]
-    current_week = 0
-    for line in lines:
-        week_match = re.match(r'(?:semana|week)\s*(\d+)', line, re.I)
-        if week_match:
-            current_week = int(week_match.group(1)) - 1
-
-        parts = [p.strip() for p in re.split(r'[,;]+', line) if p.strip()]
-        for part in parts:
-            if re.match(r'(?:semana|week)\s*\d+', part, re.I):
-                continue
-            day_match = re.match(r'(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|mon|tue|wed|thu|fri|sat|sun)\s*[:\-]?\s*', part, re.I)
-            day_name = ""
-            clean_part = part
-            if day_match:
-                day_name = day_match.group(1).lower()
-                clean_part = part[day_match.end():]
-            day_map = {"lunes": 0, "mon": 0, "martes": 1, "tue": 1, "miércoles": 2, "miercoles": 2, "wed": 2, "jueves": 3, "thu": 3, "viernes": 4, "fri": 4, "sábado": 5, "sabado": 5, "sat": 5, "domingo": 6, "sun": 6}
-            day_of_week = day_map.get(day_name, len(sessions) % 7)
-            week_offset = current_week * 7 + day_of_week
-
-            if not clean_part.strip():
-                continue
-            sessions.append({
-                "day_offset": week_offset,
-                "sport": "running",
-                "name": clean_part[:50].strip(),
-                "description": clean_part,
-            })
-
+    sessions = _parse_plan_text_to_sessions(plan_text)
     if not sessions:
         return {"error": "No pude detectar sesiones en el PDF. El formato esperado es 'Semana X: Día descripción'."}
 
@@ -10781,6 +10772,203 @@ def _import_plan_from_pdf_internal(
     result["session_overview"] = overview
     result["notes"] = "Cada sesión se ha creado con sus etapas (calentamiento, series, repeticiones, descanso y vuelta a la calma) a partir de la descripción."
     return result
+
+
+def _parse_plan_text_to_sessions(plan_text: str) -> list[dict[str, Any]]:
+    """Convierte el texto de un plan en una lista de sesiones, una por día.
+
+    Cada línea (o segmento con día) es UNA sesión. Las partes separadas por coma
+    dentro de esa sesión son sus ETAPAS (calentamiento, series, repeticiones,
+    descanso, vuelta a la calma) y se conservan juntas en 'description' para que
+    create_training_plan las desglose correctamente.
+    """
+    sessions: list[dict[str, Any]] = []
+    lines = [l.strip() for l in plan_text.strip().splitlines() if l.strip()]
+
+    day_map = {
+        "lunes": 0, "mon": 0, "martes": 1, "tue": 1, "miércoles": 2,
+        "miercoles": 2, "wed": 2, "jueves": 3, "thu": 3, "viernes": 4,
+        "fri": 4, "sábado": 5, "sabado": 5, "sat": 5, "domingo": 6, "sun": 6,
+    }
+    day_names = "|".join(day_map.keys())
+    day_re = re.compile(rf'\b({day_names})\b\s*[:\-]?\s*', re.I)
+
+    current_week = 0
+    seen: dict[int, str] = {}
+
+    def push(day_offset: int, text: str) -> None:
+        text = re.sub(r'\s+', ' ', text).strip(' .,;:-')
+        if not text:
+            return
+        # Merge múltiples fragmentos del mismo día en una única sesión.
+        if day_offset in seen:
+            seen[day_offset] += " " + text
+        else:
+            seen[day_offset] = text
+
+    for line in lines:
+        week_match = re.match(r'(?:semana|week)\s*(\d+)', line, re.I)
+        if week_match:
+            current_week = int(week_match.group(1)) - 1
+
+        # Descarta líneas que son solo cabeceras (título del plan).
+        if not week_match and not day_re.search(line):
+            continue
+
+        # Buscar todos los días que aparezcan en la línea y asignar el texto que
+        # sigue a cada uno. Si la línea empieza por un día, todo lo posterior
+        # (incluidas las partes con coma) pertenece a esa sesión.
+        if week_match:
+            rest = line[week_match.end():]
+            day_match = day_re.search(rest)
+            if day_match:
+                day_of_week = day_map.get(day_match.group(1).lower(), 0)
+                text_after = rest[day_match.end():]
+                push(current_week * 7 + day_of_week, text_after)
+            continue
+
+        # Línea que empieza con día (o contiene un día). Tomamos el primer día.
+        day_match = day_re.search(line)
+        if day_match:
+            day_of_week = day_map.get(day_match.group(1).lower(), 0)
+            text_after = line[day_match.end():]
+            push(current_week * 7 + day_of_week, text_after)
+
+    for day_offset, text in sorted(seen.items()):
+        sessions.append({
+            "day_offset": day_offset,
+            "sport": "running",
+            "name": text[:50].strip(),
+            "description": text,
+        })
+    return sessions
+
+
+def _parse_distance_to_m(text: str) -> float | None:
+    """Convierte una distancia textual (km o m) a metros."""
+    m_km = re.search(r'(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?)', text, re.I)
+    if m_km:
+        return float(m_km.group(1)) * 1000
+    m_m = re.search(r'(\d+(?:\.\d+)?)\s*m\b', text, re.I)
+    if m_m:
+        return float(m_m.group(1))
+    return None
+
+
+def _parse_duration_min(text: str) -> float | None:
+    """Convierte una duración textual (min o ' horizonte) a minutos. Solo 'min'/'m' claros."""
+    m_min = re.search(r'(\d+(?:\.\d+)?)\s*(?:min|mins|minutes?|minutos?)\b', text, re.I)
+    if m_min:
+        return float(m_min.group(1))
+    return None
+
+
+def _parse_workout_steps_text(desc: str) -> list[dict[str, Any]]:
+    """Convierte una descripción de entrenamiento en una lista de pasos normalizados.
+
+    Entiende calentamiento, series con repeticiones (3x800m, 4x1km, 5x200m),
+    descansos, zonas y vuelta a la calma. Cada serie se expande en sus repeticiones
+    (interval + descanso) para que Garmin la registre correctamente.
+    """
+    parts = [p.strip() for p in re.split(r'[,\n;]+', desc) if p.strip()]
+    steps: list[dict[str, Any]] = []
+    pending_zone: int | None = None
+
+    for part in parts:
+        lower = part.lower()
+
+        # Captura un "Z4" suelto (zona de intensidad que se aplica a la serie anterior).
+        zone_match = re.fullmatch(r'\s*z\s*(\d)\s*', lower)
+        if zone_match and steps:
+            pending_zone = int(zone_match.group(1))
+            steps[-1]["target_hr_zone"] = pending_zone
+            continue
+
+        # ---- Series con repeticiones: 3x800m, 4x1km, 5x200m, 3 x 800 m ----
+        series_match = re.search(
+            r'(\d+)\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?|m\b|min(?:uto?s)?\b)',
+            part, re.I,
+        )
+        if series_match:
+            reps = int(series_match.group(1))
+            value = float(series_match.group(2))
+            unit = series_match.group(3).lower()
+            # Zona de intensidad de la serie (puede ir en la misma parte: 4x1km Z4)
+            zone_m_pre = re.search(r'[Zz]\s*(\d)', part)
+            zone = int(zone_m_pre.group(1)) if zone_m_pre else pending_zone
+            # Descanso entre repeticiones: "400m rec", "rec 400m", "descanso 2min"
+            rest_m = None
+            rest_min = None
+            m_rest = re.search(r'(?:rec|rest|descanso|recuperación)\s*(?:de\s*)?(\d+(?:\.\d+)?)\s*(km|m\b|min(?:uto?s)?\b)?', lower) or \
+                     re.search(r'(\d+(?:\.\d+)?)\s*(m\b|km|min(?:uto?s)?\b)?\s*(?:rec|rest|descanso|recuperación)', lower)
+            if m_rest:
+                rest_num = float(m_rest.group(1))
+                rest_unit = (m_rest.group(2) or "m").lower()
+                if rest_unit.startswith("min"):
+                    rest_min = rest_num
+                elif rest_unit == "km":
+                    rest_m = rest_num * 1000
+                else:
+                    rest_m = rest_num
+
+            for _ in range(reps):
+                step: dict[str, Any] = {"type": "interval"}
+                if unit.startswith("min"):
+                    step["duration_min"] = value
+                elif unit == "km":
+                    step["distance_km"] = value
+                else:
+                    step["distance_m"] = value
+                if zone:
+                    step["target_hr_zone"] = zone
+                steps.append(step)
+                if rest_m or rest_min:
+                    rest_step: dict[str, Any] = {"type": "rest"}
+                    if rest_min:
+                        rest_step["duration_min"] = rest_min
+                    else:
+                        rest_step["distance_m"] = rest_m
+                    steps.append(rest_step)
+            pending_zone = None
+            continue
+
+        # ---- Distancia + zona (5km Z2, 800m) ----
+        dist_m = _parse_distance_to_m(part)
+        duration_min = _parse_duration_min(part)
+        zone_m = re.search(r'[Zz]\s*(\d)', part)
+
+        is_warmup = any(w in lower for w in ("calentamiento", "warmup", "warm up", "calentar"))
+        is_cooldown = any(w in lower for w in ("vuelta a la calma", "cooldown", "cool down", "calma", "enfriamiento", "vuelta al ruedo"))
+        is_rest = any(w in lower for w in ("rec", "rest", "descanso", "recuperación"))
+
+        step: dict[str, Any] = {}
+        if is_warmup:
+            step["type"] = "warmup"
+        elif is_cooldown:
+            step["type"] = "cooldown"
+        elif is_rest:
+            step["type"] = "rest"
+        else:
+            step["type"] = "active"
+
+        consumed = False
+        if duration_min is not None:
+            step["duration_min"] = duration_min
+            consumed = True
+        if dist_m is not None:
+            if dist_m >= 1000:
+                step["distance_km"] = dist_m / 1000.0
+            else:
+                step["distance_m"] = dist_m
+            consumed = True
+        if zone_m:
+            step["target_hr_zone"] = int(zone_m.group(1))
+        if not consumed:
+            # Solo texto sin medida explícita → serie genérica de 30 min
+            step["duration_min"] = 30
+        steps.append(step)
+
+    return steps
 
 
 @mcp.tool
@@ -10815,34 +11003,7 @@ def create_workout_from_description(
             pass
 
     if not steps:
-        parts = [p.strip() for p in re.split(r'[,\n]+', desc) if p.strip()]
-        for i, part in enumerate(parts):
-            step: dict[str, Any] = {"type": "active"}
-            m_time = re.search(r'(\d+)\s*(?:min|m|minutes?)', part, re.I)
-            m_dist = re.search(r'(\d+(?:\.\d+)?)\s*(?:km|kilómetros?)', part, re.I)
-            m_zone = re.search(r'[Zz]\s*(\d)', part)
-            m_reps = re.search(r'(\d+)\s*(?:x|rep)', part, re.I)
-            m_rest = re.search(r'(?:rec|rest|descanso|recuperación)\s*(\d+)\s*(?:min|m)?', part, re.I)
-
-            if any(w in part.lower() for w in ("calentamiento", "warmup", "warm up")):
-                step["type"] = "warmup"
-            elif any(w in part.lower() for w in ("vuelta", "cooldown", "cool down", "calma")):
-                step["type"] = "cooldown"
-            elif any(w in part.lower() for w in ("rec", "rest", "descanso", "recuperación")):
-                step["type"] = "rest"
-
-            if m_time:
-                step["duration_min"] = int(m_time.group(1))
-            if m_dist:
-                step["distance_km"] = float(m_dist.group(1))
-            if m_zone:
-                step["target_hr_zone"] = int(m_zone.group(1))
-            if m_rest:
-                step["type"] = "rest"
-                step["duration_min"] = int(m_rest.group(1))
-            if not m_time and not m_dist:
-                step["duration_min"] = 30
-            steps.append(step)
+        steps = _parse_workout_steps_text(desc)
 
     if not steps:
         return {"error": "No pude parsear la descripción del entrenamiento"}
@@ -11480,6 +11641,648 @@ def upload_route_to_garmin(
         return {"ok": True, "result": result, "name": name}
     except Exception as e:
         return {"error": f"Error subiendo ruta: {e}"}
+
+
+@mcp.tool
+def get_gear_list() -> dict:
+    """Equipo deportivo registrado en Garmin (zapatillas, bicis, etc.) con su kilometraje acumulado.
+    Útil para detectar desgaste (p. ej. zapatillas cerca de su vida útil).
+    """
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    with FETCH_LOCK:
+        api = _get_api(user["id"])
+        data, err = _optional_call_first(api, ("get_gear_stats",))
+
+    if data is None:
+        data, err = _optional_call_first(api, ("get_gear",))
+
+    if data is None:
+        return {"error": err or "No se pudo obtener el equipo deportivo"}
+
+    gears = data if isinstance(data, list) else data.get("gearDTOs") or data.get("gear") or []
+    items = []
+    if isinstance(gears, list):
+        for g in gears:
+            if not isinstance(g, dict):
+                continue
+            items.append({
+                "id": g.get("gearPk") or g.get("gearId"),
+                "name": g.get("displayName") or g.get("name"),
+                "type": g.get("type") or g.get("gearType"),
+                "total_distance_km": round(_to_float_or_none(g.get("totalDistance")) / 1000, 1) if g.get("totalDistance") is not None else None,
+                "custom_make": g.get("customMake"),
+                "custom_model": g.get("customModel"),
+                "applicable_activities": g.get("applicableActivities"),
+            })
+    return {"gear_list": items, "count": len(items), "raw": data}
+
+
+@mcp.tool
+def get_sync_status() -> dict:
+    """Estado de la última sincronización del dispositivo Garmin con Garmin Connect."""
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    with FETCH_LOCK:
+        api = _get_api(user["id"])
+        data, err = _optional_call_first(api, ("get_device_last_used",))
+
+    if data is None:
+        return {"error": err or "No se pudo obtener el estado de sincronización"}
+
+    last_used = data
+    if isinstance(last_used, dict):
+        last = last_used.get("lastUsed") or last_used.get("lastUsedTimestamp") or last_used.get("last_exercise_time")
+        return {
+            "sincronizado": last_used,
+            "dispositivo": last_used.get("deviceName") if isinstance(last_used, dict) else None,
+            "last_sync": last_used.get("lastUsedDate") if isinstance(last_used, dict) else None,
+            "raw": data,
+        }
+    return {"synchronization_status": data}
+
+
+@mcp.tool
+def calculate_training_load(target_date: str = None) -> dict:
+    """Carga de entrenamiento: carga aguda (últimos 7 días), crónica y balance, más estado actual y VO2max.
+    Reutiliza los datos de estado de entrenamiento de Garmin.
+    Formato fecha: YYYY-MM-DD (por defecto hoy).
+    """
+    parsed = _parse_date(target_date)
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    with FETCH_LOCK:
+        api = _get_api(user["id"])
+        data, err = _optional_call_first(api, ("get_training_status",), parsed)
+
+    if data is None:
+        return {"error": err or f"No hay estado de entrenamiento para {parsed}."}
+
+    def _climb(mapping, *keys):
+        node = mapping
+        for k in keys:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(k)
+        return node
+
+    load = {
+        "date": parsed,
+        "training_status": None,
+        "dashboard": None,
+    }
+
+    try:
+        dash = _climb(data, "mostRecentTrainingStatus", "dashboardTrainingStatusData") or {}
+        load["dashboard"] = dash
+        load["training_status"] = (dash.get("trainingStatus") or {}).get("typeKey")
+        load["training_load"] = _climb(dash, "trainingLoad", "current") or dash.get("trainingLoad")
+        load["focus"] = _climb(dash, "trainingFocus", "typeKey")
+        load["vo2max_running"] = _climb(dash, "lastRunning", "vo2Max", "value") or _climb(dash, "lastRunning", "vo2Max")
+        load["vo2max_cycling"] = _climb(dash, "lastCycling", "vo2Max", "value") or _climb(dash, "lastCycling", "vo2Max")
+    except Exception:
+        pass
+
+    try:
+        bal = _climb(data, "mostRecentTrainingLoadBalance", "metricsTrainingLoadBalanceDTOMap") or {}
+        if isinstance(bal, dict) and bal:
+            key = next(iter(bal.values()))
+            load["load_balance"] = key
+            load["acute_load"] = key.get("acuteLoad")
+            load["chronic_load"] = key.get("chronicLoad")
+            load["train_load_ratio"] = key.get("trainingLoadRatio")
+            load["load_balance_commentary"] = key.get("loadBalanceCommentary") or key.get("loadBalanceCommentaryShort")
+    except Exception:
+        pass
+
+    load["raw"] = data
+    return load
+
+
+@mcp.tool
+def detect_fatigue_risk(target_date: str = None) -> dict:
+    """Analiza si el usuario está listo para entrenar fuerte o debería descansar.
+    Combina HRV (VFC), preparación para entrenar y calidad del sueño.
+    Formato fecha: YYYY-MM-DD (por defecto hoy). Devuelve un veredicto y recomendación en texto.
+    """
+    parsed = _parse_date(target_date)
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    with FETCH_LOCK:
+        api = _get_api(user["id"])
+        hrv, hrv_err = _optional_call_first(api, ("get_hrv_data",), parsed)
+        ready, ready_err = _optional_call_first(api, ("get_morning_training_readiness",), parsed)
+        sleep, sleep_err = _optional_call_first(api, ("get_sleep_data",), parsed)
+
+    hrv_status = None
+    try:
+        if isinstance(hrv, dict) and hrv.get("hrvSummary"):
+            hrv_status = hrv["hrvSummary"].get("hrvStatus") or hrv["hrvSummary"].get("lastNightStatus")
+        elif isinstance(hrv, dict):
+            hrv_status = hrv.get("hrvStatus")
+    except Exception:
+        pass
+
+    readiness_score = None
+    readiness_short = None
+    try:
+        if isinstance(ready, dict):
+            readiness_score = ready.get("score") or (ready.get("trainingReadinessScore") or {}).get("score")
+            stages = (ready.get("trainingReadiness") or {}).get("trainingReadinessStageEnum") if isinstance(ready.get("trainingReadiness"), dict) else None
+            if stages:
+                other = stages.get("otherStageDTO")
+                if isinstance(other, dict):
+                    readiness_short = other.get("shortDescription")
+    except Exception:
+        pass
+
+    sleep_minutes = None
+    sleep_quality = None
+    try:
+        if isinstance(sleep, dict):
+            sleep_minutes = sleep.get("sleepTime") or sleep.get("sleepingTime")
+            sleep_quality = sleep.get("sleepQuality") or sleep.get("restingHeartRate")
+    except Exception:
+        pass
+
+    # Veredicto sencillo basado en los marcadores disponibles
+    markers = []
+    score = 50
+    if hrv_status:
+        hrv_lower = str(hrv_status).lower()
+        if "good" in hrv_lower or "balanced" in hrv_lower or "equilibr" in hrv_lower:
+            score += 20
+            markers.append(f"HRV: {hrv_status} (bien)")
+        elif "poor" in hrv_lower or "low" in hrv_lower or "deficient" in hrv_lower or "desequilibrado" in hrv_lower:
+            score -= 20
+            markers.append(f"HRV: {hrv_status} (cuidado)")
+        else:
+            markers.append(f"HRV: {hrv_status}")
+    if readiness_score is not None:
+        score = score * 0.5 + int(readiness_score) * 0.5
+        markers.append(f"Preparación: {readiness_score}/100")
+        if readiness_short:
+            markers.append(f"Recomendación Garmin: {readiness_short}")
+
+    if score >= 70:
+        verdict = "listo"
+        advice = "Puedes hacer una sesión exigente hoy."
+    elif score >= 45:
+        verdict = "moderado"
+        advice = "Entrena, pero baja un poco la intensidad o acorta la sesión."
+    else:
+        verdict = "descanso"
+        advice = "Mejor descanso o muy suave. Prioriza dormir y recuperarte."
+
+    return {
+        "date": parsed,
+        "verdict": verdict,
+        "advice": advice,
+        "markers": markers,
+        "hrv_status": hrv_status,
+        "readiness_score": readiness_score,
+        "readiness_short": readiness_short,
+        "sleep_minutes": sleep_minutes,
+        "sleep_quality": sleep_quality,
+    }
+
+
+@mcp.tool
+def summarize_period(start_date: str, end_date: str = None) -> dict:
+    """Resumen de entrenamiento de un rango de fechas: sesiones, distancia, horas, subida y carga.
+    Útil para informes semanales o mensuales.
+    Formato fechas: YYYY-MM-DD. Si no se da end_date, usa un solo día.
+    """
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    try:
+        start = date.fromisoformat(start_date)
+    except ValueError:
+        return {"error": f"Fecha inválida: {start_date}"}
+    if not end_date:
+        end = start
+    else:
+        try:
+            end = date.fromisoformat(end_date)
+        except ValueError:
+            return {"error": f"Fecha inválida: {end_date}"}
+    if end < start:
+        start, end = end, start
+
+    start_ts = start.isoformat()
+    end_ts = end.isoformat()
+
+    with FETCH_LOCK:
+        api = _get_api(user["id"])
+        activities, err = _optional_call_first(api, ("get_activities",), 0, 500)
+
+    if activities is None:
+        if err and "predisposici" in err.lower():
+            activities = []
+        else:
+            return {"error": err or "No se pudieron leer las actividades"}
+
+    total_count = 0
+    total_distance_km = 0.0
+    total_duration_min = 0.0
+    total_elevation_m = 0.0
+    total_calories = 0
+    by_type: dict[str, dict] = {}
+    days: set[str] = set()
+
+    for a in activities if isinstance(activities, list) else []:
+        if not isinstance(a, dict):
+            continue
+        st = a.get("startTimeLocal") or ""
+        day_str = str(st)[:10] if st else ""
+        if not day_str or not (start_ts <= day_str <= end_ts):
+            continue
+        norm = _normalize_activity(a)
+        total_count += 1
+        total_distance_km += norm.get("distance_km") or 0
+        total_duration_min += norm.get("duration_min") or 0
+        total_elevation_m += norm.get("elevation_gain_m") or 0
+        total_calories += norm.get("calories") or 0
+        days.add(day_str)
+        t = norm.get("type") or "otro"
+        if t not in by_type:
+            by_type[t] = {"count": 0, "distance_km": 0.0}
+        by_type[t]["count"] += 1
+        by_type[t]["distance_km"] += norm.get("distance_km") or 0
+
+    return {
+        "period": {"start": start_ts, "end": end_ts, "days": (end - start).days + 1},
+        "active_days": len(days),
+        "sessions": total_count,
+        "total_distance_km": round(total_distance_km, 2),
+        "total_duration_hours": round(total_duration_min / 60, 2),
+        "total_elevation_m": round(total_elevation_m, 1),
+        "total_calories": total_calories,
+        "by_activity_type": by_type,
+    }
+
+
+@mcp.tool
+def calculate_pace_zones(target_date: str = None) -> dict:
+    """Zonas de ritmo personalizadas para entrenamiento, según el VO2max y umbral del usuario.
+    Formato fecha: YYYY-MM-DD (por defecto hoy). Devuelve zonas de 1 a 5 y el ritmo de umbral (km/min).
+    """
+    parsed = _parse_date(target_date)
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    vo2 = None
+    with FETCH_LOCK:
+        api = _get_api(user["id"])
+        ts, ts_err = _optional_call_first(api, ("get_training_status",), parsed)
+
+    try:
+        if isinstance(ts, dict):
+            dash = ts.get("mostRecentTrainingStatus", {}).get("dashboardTrainingStatusData", {}) or {}
+            vo2 = dash.get("lastRunning", {}).get("vo2Max", {}).get("value") or dash.get("lastRunning", {}).get("vo2Max")
+    except Exception:
+        pass
+
+    if not vo2:
+        return {"error": "No se pudo obtener el VO2max para calcular las zonas de ritmo."}
+
+    # Estimación del ritmo de umbral (min/km) a partir del VO2max.
+    # Relación empírica validada: VDOT 40 -> ~4:25/km, VDOT 50 -> ~3:40/km.
+    try:
+        vdot = float(vo2) * 0.85
+        pace_min_per_km = 7.42 - 0.075 * vdot
+    except Exception:
+        pace_min_per_km = 5.5
+
+    def fmt(min_per_km):
+        total = min_per_km * 60
+        mm = int(total // 60)
+        ss = int(round(total % 60))
+        if ss == 60:
+            mm += 1
+            ss = 0
+        return f"{mm}:{ss:02d}"
+
+    return {
+        "date": parsed,
+        "vo2max": vo2,
+        "threshold_pace_min_per_km": round(pace_min_per_km, 2),
+        "threshold_pace_display": fmt(pace_min_per_km),
+        "zones": {
+            "zone1_recuperacion": {"pace": fmt(pace_min_per_km * 1.25), "min_per_km": round(pace_min_per_km * 1.25, 2)},
+            "zone2_rodaje_suave": {"pace": fmt(pace_min_per_km * 1.15), "min_per_km": round(pace_min_per_km * 1.15, 2)},
+            "zone3_aerobic": {"pace": fmt(pace_min_per_km * 1.05), "min_per_km": round(pace_min_per_km * 1.05, 2)},
+            "zone4_umbral": {"pace": fmt(pace_min_per_km), "min_per_km": round(pace_min_per_km, 2)},
+            "zone5_vo2max": {"pace": fmt(pace_min_per_km * 0.92), "min_per_km": round(pace_min_per_km * 0.92, 2)},
+        },
+    }
+
+
+@mcp.tool
+def plan_this_week(
+    target_weekly_km: float = None,
+    sessions_per_week: int = 4,
+    auto_push_to_device: bool = False,
+) -> dict:
+    """Genera automáticamente la semana de entrenamiento, adaptada a la carga reciente para evitar sobreentrenar.
+    Usa la carga y el estado de entrenamiento para proponer días y sesiones equilibrados.
+    """
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    sessions_per_week = max(2, min(6, int(sessions_per_week)))
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    start_date = monday.isoformat()
+
+    # Estimación del volumen semanal reciente
+    recent_summary = {}
+    try:
+        recent_summary = summarize_period((monday - timedelta(days=7)).isoformat(), (monday - timedelta(days=1)).isoformat())
+    except Exception:
+        pass
+    recent_km = recent_summary.get("total_distance_km", 0) or 0
+    if not target_weekly_km:
+        target_weekly_km = round(max(15, recent_km * 1.1), 1)
+
+    load_info = {}
+    try:
+        load_info = calculate_training_load(today.isoformat())
+    except Exception:
+        pass
+
+    per_session = round(target_weekly_km / sessions_per_week, 2)
+    day_names = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
+    sessions = []
+    for i in range(sessions_per_week):
+        day_offset = i * (7 // sessions_per_week) if sessions_per_week > 1 else 0
+        day_offset = min(day_offset, 6)
+        if i == sessions_per_week - 1:
+            # Sesión más larga el fin de semana
+            dist = round(per_session * 1.4, 2)
+            kind = "Larga suave (Z2-Z3)"
+            steps = json.dumps([
+                {"type": "warmup", "duration_min": 10},
+                {"type": "active", "distance_km": dist, "target_hr_zone": 2 if dist > 8 else 3},
+                {"type": "cooldown", "duration_min": 5},
+            ])
+        elif i % 3 == 0:
+            kind = "Ritmo / series"
+            dist = round(per_session * 0.8, 2)
+            steps = json.dumps([
+                {"type": "warmup", "duration_min": 10},
+                {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
+                {"type": "rest", "duration_min": 2},
+                {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
+                {"type": "rest", "duration_min": 2},
+                {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
+                {"type": "cooldown", "duration_min": 5},
+            ])
+        else:
+            kind = "Rodaje suave"
+            steps = json.dumps([
+                {"type": "warmup", "duration_min": 10},
+                {"type": "active", "distance_km": per_session, "target_hr_zone": 2},
+                {"type": "cooldown", "duration_min": 5},
+            ])
+
+        sessions.append({
+            "day_offset": day_offset,
+            "sport": "running",
+            "name": f"{kind} ({day_names[day_offset]})",
+            "steps": json.loads(steps),
+        })
+
+    result = {
+        "ok": True,
+        "week_start": start_date,
+        "target_weekly_km": target_weekly_km,
+        "recent_weekly_km": round(recent_km, 2),
+        "training_load": load_info.get("training_load") or load_info.get("load_balance"),
+        "sessions": sessions,
+        "note": "Revisa la semana propuesta. Si quieres, la genero en Garmin con create_training_plan o create_workout_from_description.",
+    }
+    return result
+
+
+@mcp.tool
+def get_todays_schedule(plan_start_date: str = None) -> dict:
+    """Qu\u00e9 deber\u00edas entrenar hoy: combina el workout programado, tu carga reciente y preparaci\u00f3n.
+    Devuelve una recomendaci\u00f3n accionable.
+    """
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    today = date.today().isoformat()
+
+    scheduled = None
+    try:
+        with FETCH_LOCK:
+            api = _get_api(user["id"])
+            today_parts = today.split("-")
+            sched, sched_err = _optional_call_first(api, ("get_scheduled_workouts",), today_parts[0], today_parts[1])
+        if isinstance(sched, dict):
+            scheduled = sched
+    except Exception:
+        scheduled = None
+
+    fatigue = {}
+    try:
+        fatigue = detect_fatigue_risk(today)
+    except Exception:
+        pass
+
+    verdict = fatigue.get("verdict", "moderado")
+    advice = fatigue.get("advice", "")
+
+    workout_today = None
+    if isinstance(scheduled, dict):
+        for group in (scheduled.get("workoutSchedules") or []):
+            if not isinstance(group, dict):
+                continue
+            if str(group.get("scheduledWorkoutDate") or "")[:10] == today:
+                w = group.get("workout") or {}
+                workout_today = {
+                    "name": w.get("workoutName"),
+                    "sport": (w.get("sport") or {}).get("sportTypeKey") if isinstance(w.get("sport"), dict) else None,
+                }
+
+    plan_hint = ""
+    if plan_start_date:
+        try:
+            base = date.fromisoformat(plan_start_date)
+            delta = (date.today() - base).days
+            day_index = delta % 7
+            names = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+            plan_hint = f"Tu plan empezó el {plan_start_date} (día {delta + 1}). Hoy corresponde un día {names[day_index]}."
+        except ValueError:
+            plan_hint = ""
+
+    return {
+        "date": today,
+        "verdict": verdict,
+        "fatigue_advice": advice,
+        "scheduled_workout_today": workout_today,
+        "plan_hint": plan_hint,
+        "recommendation": (
+            "Sigue tu entrenamiento programado." if workout_today
+            else "Hoy hay entrenamiento propuesto en tu plan/programa."
+        ),
+    }
+
+
+@mcp.tool
+def list_tools_spanish() -> dict:
+    """Catálogo de todas las herramientas MCP disponibles en español, agrupadas por utilidad.
+    Útil para que el asistente conozca qué acciones puede realizar con el usuario.
+    """
+    try:
+        tools = _list_tools_sync()
+    except Exception as exc:
+        return {"error": f"No se pudo listar las herramientas: {exc}"}
+
+    grouped: dict[str, list[str]] = {}
+    for name, doc in tools:
+        first_line = (doc or "").strip().split("\n")[0] if doc else ""
+        category = "otros"
+        lower = (name + " " + first_line).lower()
+        if any(k in lower for k in ("sueño", "sleep", "hrv", "vfc", "body battery", "battery", "respiración", "respiration", "hidratación", "hydration", "salud")):
+            category = "salud y recuperación"
+        elif any(k in lower for k in ("actividad", "activity", "actividades", "entrenamiento", "workout", "plan", "series", "training")):
+            category = "entrenamiento y planes"
+        elif any(k in lower for k in ("ruta", "route", "gpx", "course")):
+            category = "rutas"
+        elif any(k in lower for k in ("usuario", "user", "api key", "perfil")):
+            category = "gestión de usuarios"
+        elif any(k in lower for k in ("preparación", "readiness", "carga", "load", "predisposici")):
+            category = "carga y predisposición"
+        grouped.setdefault(category, []).append(f"{name}: {first_line}")
+
+    return {
+        "total_tools": len(tools),
+        "groups": {k: v for k, v in sorted(grouped.items())},
+    }
+
+
+def _list_tools_sync() -> list[tuple[str, str]]:
+    import asyncio
+    async def _go():
+        mcp_tools = await mcp.list_tools()
+        return [(t.name, t.description) for t in mcp_tools]
+    return asyncio.run(_go())
+
+
+@mcp.tool
+def mcp_health() -> dict:
+    """Estado del servicio MCP: tokens, caché, última conexión y endpoint. Útil para diagnosticar."""
+    user = _get_auth_user()
+    with CACHE_LOCK:
+        status = CACHE.get("status")
+        last_refresh = CACHE.get("last_refresh")
+        last_error = CACHE.get("last_error")
+    with _LAST_MCP_HIT_LOCK:
+        last_mcp = _LAST_MCP_HIT
+        mcp_client = _LAST_MCP_CLIENT
+
+    connected = False
+    tokens_path = None
+    if user:
+        tf = _user_token_file(user["id"])
+        tokens_path = str(tf)
+        connected = tf.exists()
+
+    return {
+        "app": APP_NAME,
+        "mcp_endpoint": "/mcp",
+        "cache_status": status,
+        "last_refresh": last_refresh,
+        "last_error": last_error,
+        "auth_user": user.get("display_name") if user else None,
+        "garmin_connected": connected if user else None,
+        "tokens_path": tokens_path,
+        "last_mcp_connection": last_mcp,
+        "last_mcp_client": mcp_client,
+    }
+
+
+@mcp.tool
+def route_to_poi(
+    place: str,
+    distance_km: float,
+    sport: str = "running",
+    surface: str = "any",
+) -> dict[str, Any]:
+    """Genera una ruta circular desde la ubicación base del usuario hasta un punto de interés (parque, pista...).
+    Geocodifica el lugar y usa la red de calles para crear rutas de ida y vuelta.
+    """
+    user = _get_auth_user()
+    if not user:
+        return {"error": "No autenticado"}
+
+    home_lat = user.get("home_lat")
+    home_lon = user.get("home_lon")
+    if not home_lat or not home_lon:
+        return {"error": "No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon."}
+
+    try:
+        import requests as _req
+        resp = _req.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": place, "format": "json", "limit": 1},
+            headers={"User-Agent": "garmin-coach-mcp/1.0"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+    except Exception as e:
+        return {"error": f"No se pudo geocodificar el lugar '{place}': {e}"}
+
+    if not results:
+        return {"error": f"No encontré el lugar '{place}'."}
+
+    poi_lat = float(results[0]["lat"])
+    poi_lon = float(results[0]["lon"])
+    poi_name = results[0].get("display_name", place)
+
+    network_type = "bike" if sport == "cycling" else "walk"
+    try:
+        routes = _generate_loop_route(
+            lat=home_lat,
+            lon=home_lon,
+            target_distance_km=distance_km,
+            elevation_gain_target=0,
+            network_type=network_type,
+            max_results=3,
+        )
+    except Exception as e:
+        return {"error": f"Error generando rutas: {e}"}
+
+    for i, route in enumerate(routes):
+        route["name"] = f"Ruta hacia {poi_name[:30]} ({i + 1})"
+        route["description"] = f"Ruta circular de {route['distance_km']}km pasando por {poi_name[:60]}"
+        route["destination"] = {"place": poi_name, "lat": poi_lat, "lon": poi_lon}
+
+    return {
+        "query": {"place": place, "distance_km": distance_km, "sport": sport},
+        "destination": {"name": poi_name[:80], "lat": poi_lat, "lon": poi_lon},
+        "routes": routes,
+        "count": len(routes),
+        "hint": "Si una ruta te gusta, usa export_route_gpx o upload_route_to_garmin.",
+    }
 
 
 @mcp.tool

@@ -14,6 +14,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY server.py .
+COPY index.html .
 
 RUN mkdir -p /data/users
 

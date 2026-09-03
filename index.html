@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Garmin Coach MCP — tu tren a casa, en el reloj</title>
+<meta name="description" content="Conecta Garmin Connect con Claude y otros asistentes. Lee tus métricas, planifica la semana, detecta fatiga y sube planes desde PDF a tu dispositivo. Multi-usuario, autohospedado.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0d0b;
+    --bg-2:#0d120e;
+    --panel:#111710;
+    --line:#1e2820;
+    --line-soft:#1a211c;
+    --fg:#e6ede8;
+    --fg-dim:#93a399;
+    --fg-faint:#5d6b63;
+    --acc:#c8f169;      /* lima volt — único acento */
+    --acc-dim:#8fa84e;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);color:var(--fg);
+    font-family:'Space Grotesk',system-ui,sans-serif;
+    font-size:16.5px;line-height:1.6;
+    -webkit-font-smoothing:antialiased;overflow-x:hidden;
+  }
+  .mono{font-family:'IBM Plex Mono',monospace}
+  a{color:inherit}
+
+  .masthead{
+    border-bottom:1px solid var(--line);
+    padding:.5rem 1.4rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem;
+    font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--fg-faint);max-width:1200px;margin:0 auto;
+  }
+  .masthead .mono{color:var(--acc-dim);font-size:.66rem}
+
+  header.site{position:sticky;top:0;z-index:50;background:rgba(10,13,11,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  .nav{max-width:1200px;margin:0 auto;padding:.8rem 1.4rem;display:flex;align-items:center;gap:2rem}
+  .logo{display:flex;align-items:center;gap:.7rem;text-decoration:none;color:var(--fg)}
+  .logo .mark{width:32px;height:32px;border:1px solid var(--acc);border-radius:9px;display:grid;place-items:center;color:var(--acc)}
+  .logo .mark svg{width:18px;height:18px}
+  .logo .name{font-weight:600;letter-spacing:-.01em;font-size:1.02rem}
+  .logo .name b{color:var(--acc);font-weight:600}
+  .nav-links{display:flex;gap:1.6rem;margin-left:auto;align-items:center}
+  .nav-links a{color:var(--fg-dim);text-decoration:none;font-size:.92rem;font-weight:500}
+  .nav-links a:hover{color:var(--fg)}
+  .nav .cta{
+    background:var(--acc);color:#0a0d0b;text-decoration:none;font-weight:600;
+    padding:.5rem 1.1rem;border-radius:8px;font-size:.9rem;transition:filter .15s,transform .1s;
+  }
+  .nav .cta:hover{filter:brightness(1.08)}
+  .nav .cta:active{transform:translateY(1px)}
+  .burger{display:none;cursor:pointer;border:1px solid var(--line);background:none;color:var(--fg);border-radius:8px;padding:.4rem .7rem;font-size:1.1rem}
+
+  section.block{max-width:1200px;margin:0 auto;padding:5rem 1.4rem}
+
+  /* ---- HERO ---- */
+  .hero{display:grid;grid-template-columns:1fr 1fr;gap:3.5rem;align-items:center;padding-top:4rem;padding-bottom:5.5rem}
+  .hero h1{
+    font-weight:700;font-size:clamp(2.3rem,4.6vw,3.4rem);
+    line-height:1.02;letter-spacing:-.02em;margin-bottom:1.3rem;
+  }
+  .hero h1 span{color:var(--acc)}
+  .hero p.lede{color:var(--fg-dim);font-size:1.08rem;max-width:31em;margin-bottom:2rem}
+  .cta-row{display:flex;gap:.9rem;flex-wrap:wrap;align-items:center}
+  .btn{
+    display:inline-flex;align-items:center;gap:.6rem;text-decoration:none;
+    background:var(--acc);color:#0a0d0b;border:none;font-weight:600;font-family:inherit;
+    padding:.85rem 1.5rem;border-radius:8px;font-size:1rem;cursor:pointer;transition:filter .15s,transform .1s;
+  }
+  .btn:hover{filter:brightness(1.08)}
+  .btn:active{transform:translateY(1px)}
+  .btn .mono{font-size:.9rem}
+  .btn.secondary{background:transparent;color:var(--fg);border:1px solid var(--line-soft)}
+  .btn.secondary:hover{border-color:var(--acc);color:var(--acc);filter:none}
+
+  .hero-note{margin-top:1.3rem;font-size:.8rem;color:var(--fg-faint)}
+  .hero-note .mono{color:var(--acc-dim);font-size:.74rem}
+
+  .panel{
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    overflow:hidden;box-shadow:0 30px 80px -40px rgba(0,0,0,.8);
+  }
+  .panel .bar{display:flex;align-items:center;gap:.6rem;padding:.65rem .9rem;border-bottom:1px solid var(--line);background:var(--bg-2)}
+  .panel .bar .lbl{margin-left:auto;font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;color:var(--fg-faint)}
+  .panel .bar .lbl .mono{color:var(--acc-dim)}
+  .panel .body{padding:1.2rem 1.3rem;display:flex;flex-direction:column;gap:.9rem}
+  .row{display:flex;justify-content:space-between;align-items:center;font-size:.9rem;gap:1rem}
+  .row .k{color:var(--fg-dim)}
+  .row .v{font-family:'IBM Plex Mono',monospace;font-weight:500;color:var(--fg)}
+  .row .v.good{color:var(--acc)}
+  .bar-hr{height:5px;border-radius:3px;background:var(--bg-2);overflow:hidden}
+  .bar-hr i{display:block;height:100%;background:var(--acc)}
+  .spark{display:flex;align-items:flex-end;gap:3px;height:46px;padding-top:.4rem}
+  .spark span{flex:1;background:var(--line-soft);border-radius:2px 2px 0 0}
+  .spark span.on{background:var(--acc)}
+  .statline{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .statline>div{background:var(--panel);padding:.7rem .9rem}
+  .statline .big{font-family:'IBM Plex Mono',monospace;font-size:1.15rem;font-weight:500;color:var(--acc)}
+  .statline .lbl{font-size:.7rem;color:var(--fg-faint);text-transform:uppercase;letter-spacing:.05em;margin-top:.2rem}
+
+  /* ---- TAPE ---- */
+  .tape{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--bg-2)}
+  .tape-inner{max-width:1200px;margin:0 auto;padding:1.1rem 1.4rem;display:grid;grid-template-columns:repeat(4,1fr);gap:1.2rem}
+  .tape-item .num{font-family:'IBM Plex Mono',monospace;font-size:1.7rem;font-weight:500;color:var(--fg);line-height:1}
+  .tape-item .num sup{color:var(--acc);font-size:.95rem}
+  .tape-item .lbl{font-size:.7rem;color:var(--fg-faint);text-transform:uppercase;letter-spacing:.06em;margin-top:.4rem}
+
+  /* ---- SECTION HEADS (no eyebrows) ---- */
+  .sec-head{margin-bottom:2.6rem;max-width:44em}
+  .sec-head h2{font-weight:700;font-size:clamp(1.8rem,3.3vw,2.5rem);line-height:1.06;letter-spacing:-.02em}
+  .sec-head p{color:var(--fg-dim);margin-top:1rem;font-size:1.04rem}
+
+  /* ---- FEATURES: editorial, varied, no uniform 3-card ---- */
+  .features{display:flex;flex-direction:column;border-top:1px solid var(--line)}
+  .feature{display:grid;grid-template-columns:1fr 1.3fr;gap:2.5rem;padding:2.4rem 0;border-bottom:1px solid var(--line);align-items:start}
+  .feature .f-idx{font-family:'IBM Plex Mono',monospace;font-size:.78rem;color:var(--acc);display:block;margin-bottom:.6rem}
+  .feature h3{font-weight:600;font-size:1.25rem;letter-spacing:-.01em;margin-bottom:.6rem;max-width:16em}
+  .feature p{color:var(--fg-dim);font-size:.98rem}
+  .feature .f-call{margin-top:1.1rem;font-size:.8rem;color:var(--fg-faint)}
+  .feature .f-call .mono{color:var(--acc-dim);font-size:.74rem}
+  .feat-tag{font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:var(--fg-dim);border:1px solid var(--line-soft);padding:.3rem .7rem;border-radius:6px;justify-self:start;margin-top:.2rem}
+
+  /* ---- HOW ---- */
+  .howwrap{background:var(--bg-2);border:1px solid var(--line);border-radius:16px;padding:3rem}
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:2.2rem;margin-top:1rem}
+  .step .st-num{font-family:'IBM Plex Mono',monospace;font-size:2rem;font-weight:500;color:var(--acc);line-height:1;display:block;margin-bottom:1.2rem}
+  .step h4{font-weight:600;font-size:1.15rem;margin-bottom:.6rem}
+  .step p{color:var(--fg-dim);font-size:.95rem}
+  .step p .mono{color:var(--acc-dim);font-size:.82rem}
+  .step + .step{border-left:1px solid var(--line);padding-left:2.2rem}
+
+  /* ---- CATALOGUE ---- */
+  .cat-grid{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-left:1px solid var(--line)}
+  .cat{padding:1.3rem 1.3rem;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .cat .mono{font-size:.78rem;color:var(--acc);display:block;margin-bottom:.35rem;font-weight:500}
+  .cat span{font-size:.88rem;color:var(--fg-dim)}
+  .cat-note{margin-top:1.5rem;font-size:.85rem;color:var(--fg-faint);text-align:center}
+  .cat-note .mono{color:var(--acc-dim)}
+
+  /* ---- SOCIAL / CASOS ---- */
+  .casos{display:grid;grid-template-columns:1.1fr .9fr;gap:3rem;align-items:center}
+  .quote{border-left:2px solid var(--acc);padding-left:1.5rem}
+  .quote p{font-weight:500;font-size:1.35rem;line-height:1.35;letter-spacing:-.01em}
+  .quote cite{display:block;margin-top:1rem;font-style:normal;font-size:.85rem;color:var(--fg-faint)}
+  .quote cite .mono{color:var(--acc-dim);font-size:.74rem}
+  .use{display:flex;gap:1rem;padding:1.05rem 0;border-bottom:1px solid var(--line-soft);align-items:baseline}
+  .use .tag{font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:var(--acc);flex:none;width:6.5em}
+  .use p{font-size:.95rem;color:var(--fg-dim)}
+
+  /* ---- PRIVACY ---- */
+  .privacy{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}
+  .priv{background:var(--bg);padding:1.8rem 1.6rem}
+  .priv .mono{font-size:.76rem;color:var(--acc);display:block;margin-bottom:.8rem}
+  .priv h4{font-weight:600;font-size:1.05rem;margin-bottom:.5rem}
+  .priv p{color:var(--fg-dim);font-size:.92rem}
+
+  /* ---- FAQ ---- */
+  .faq{max-width:780px;margin:0 auto}
+  details{border-bottom:1px solid var(--line);padding:1.1rem 0}
+  summary{cursor:pointer;font-weight:600;font-size:1.08rem;list-style:none;display:flex;justify-content:space-between;align-items:center;gap:1rem}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:"+";font-family:'IBM Plex Mono',monospace;color:var(--acc);font-size:1.2rem;transition:transform .2s}
+  details[open] summary::after{transform:rotate(45deg)}
+  details .a{color:var(--fg-dim);font-size:.95rem;margin-top:.8rem;max-width:64ch}
+  details .a .mono{color:var(--acc-dim);font-size:.84rem}
+
+  /* ---- CTA ---- */
+  .finwrap{background:var(--acc);border-radius:16px;padding:3.5rem 2.5rem;text-align:center;position:relative;overflow:hidden}
+  .finwrap h2{color:#0a0d0b;font-weight:700;font-size:clamp(1.9rem,3.6vw,2.7rem);line-height:1.05;letter-spacing:-.02em;position:relative}
+  .finwrap p{color:#3d4826;margin:1.1rem auto 2rem;max-width:32em;position:relative}
+  .finwrap .btn{background:#0a0d0b;color:var(--acc)}
+  .finwrap .btn:hover{filter:brightness(1.2)}
+  .finwrap::before{content:"θ";position:absolute;font-family:'IBM Plex Mono',monospace;font-size:22rem;color:rgba(10,13,11,.06);top:-3.5rem;left:50%;transform:translateX(-50%);line-height:1}
+  .finwrap .hint{margin-top:1.2rem;font-size:.78rem;color:#4a5631;position:relative}
+  .finwrap .hint .mono{color:#0a0d0b}
+
+  footer.site{border-top:1px solid var(--line);margin-top:5rem}
+  .foot{max-width:1200px;margin:0 auto;padding:2.4rem 1.4rem;display:flex;justify-content:space-between;gap:2rem;flex-wrap:wrap;color:var(--fg-faint);font-size:.86rem}
+  .foot .brand{font-weight:600;color:var(--fg);font-size:1.05rem}
+  .foot a{color:var(--fg-faint);text-decoration:none}
+  .foot a:hover{color:var(--fg)}
+  .foot-links{display:flex;gap:1.6rem;flex-wrap:wrap}
+  .foot .mono{color:var(--acc-dim);font-size:.78rem}
+
+  /* ---- motion ---- */
+  .reveal{opacity:0;transform:translateY(22px);transition:opacity .7s cubic-bezier(.16,1,.3,1),transform .7s cubic-bezier(.16,1,.3,1)}
+  .reveal.in{opacity:1;transform:none}
+
+  @media(max-width:960px){
+    .hero,.feature,.casos{grid-template-columns:1fr}
+    .steps,.privacy,.cat-grid{grid-template-columns:1fr}
+    .step + .step{border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:2rem;margin-top:1.5rem}
+    .tape-inner{grid-template-columns:1fr 1fr}
+    .nav-links{display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg);flex-direction:column;padding:1.3rem 1.4rem;border-bottom:1px solid var(--line);gap:1.1rem;backdrop-filter:blur(10px)}
+    .nav-links.open{display:flex}
+    .nav-links .cta{margin-left:0}
+    .burger{display:block}
+    .feature{gap:1.2rem;padding:1.8rem 0}
+  }
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <span>Entrenamiento asistido — número 01</span>
+  <span class="mono">build 2026.09 · para tu reloj</span>
+</div>
+
+<header class="site">
+  <nav class="nav">
+    <a class="logo" href="#top" aria-label="Garmin Coach MCP">
+      <span class="mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <path d="M4 15c3-1 5 1 8 0s5-1 8 0"/>
+          <path d="M4 19c3-1 5 1 8 0s5-1 8 0"/>
+          <circle cx="8" cy="8" r="2"/>
+          <circle cx="16" cy="8" r="2"/>
+        </svg>
+      </span>
+      <span class="name">Garmin Coach <b>MCP</b></span>
+    </a>
+    <div class="burger" id="burger" aria-label="Menú">☰</div>
+    <div class="nav-links" id="navlinks">
+      <a href="#que-es">Qué es</a>
+      <a href="#como">Cómo va</a>
+      <a href="#herramientas">Modelos</a>
+      <a href="#privacidad">Privacidad</a>
+      <a href="#faq">Preguntas</a>
+      <a class="cta" href="#empezar">Empezar</a>
+    </div>
+  </nav>
+</header>
+
+<main id="top">
+
+  <!-- ============ HERO ============ -->
+  <section class="block hero">
+    <div>
+      <h1>Lo que tu reloj <span>sabe hoy</span>, trabaja para ti esta noche.</h1>
+      <p class="lede">Un puente entre Garmin Connect y tu asistente de IA. Lee tu VFC, tu carga y tus planes, y convierte eso en una decisión: qué toca mañana, a qué ritmo, y cómo llegar.</p>
+      <div class="cta-row">
+        <a class="btn" href="#empezar">Empezar <span class="mono">→</span></a>
+        <a class="btn secondary" href="#herramientas">Ver las 120 modelos</a>
+      </div>
+      <p class="hero-note">Tu clave Garmin se queda en tu servidor · <span class="mono">/admin</span> para gestionar</p>
+    </div>
+
+    <div class="panel" aria-label="Vista previa de datos de Garmin">
+      <div class="bar">
+        <span style="color:var(--acc)">●</span>
+        <span class="lbl">hoy · <span class="mono">live from Garmin</span></span>
+      </div>
+      <div class="body">
+        <div class="statline">
+          <div><div class="big">7h 12m</div><div class="lbl">sueño</div></div>
+          <div><div class="big">+4%</div><div class="lbl">VFC vs 4 sem</div></div>
+        </div>
+        <div>
+          <div class="row"><span class="k">Preparación</span><span class="v good">83 / 100</span></div>
+          <div class="bar-hr" style="margin-top:.45rem"><i style="width:83%"></i></div>
+        </div>
+        <div>
+          <div class="row" style="margin-bottom:.5rem"><span class="k">Carga · últimos 7 días</span><span class="v">acúmulo correcto</span></div>
+          <div class="spark">
+            <span class="on" style="height:40%"></span><span class="on" style="height:55%"></span>
+            <span style="height:60%"></span><span class="on" style="height:70%"></span>
+            <span class="on" style="height:45%"></span><span style="height:75%"></span>
+            <span class="on" style="height:85%"></span>
+          </div>
+        </div>
+        <div class="row">
+          <span class="k">Siguiente sesión</span>
+          <span class="v good">4×800m · 18:30</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ TAPE ============ -->
+  <div class="tape">
+    <div class="tape-inner">
+      <div class="tape-item"><div class="num">120<sup>+</sup></div><div class="lbl">modelos MCP</div></div>
+      <div class="tape-item"><div class="num">3</div><div class="lbl">pasos para conectar</div></div>
+      <div class="tape-item"><div class="num">PDF</div><div class="lbl">a tu reloj en 10s</div></div>
+      <div class="tape-item"><div class="num">0</div><div class="lbl">datos fuera de tu server</div></div>
+    </div>
+  </div>
+
+  <!-- ============ QUE ES ============ -->
+  <section class="block reveal" id="que-es">
+    <div class="sec-head">
+      <h2>Un entrenador que no se olvida del mes que pasó.</h2>
+      <p>No lee datos sueltos: los cruza. La VFC de anoche, la carga de la semana, la tendencia del VO₂max y lo que llevas programado. Y cuando traes un plan en PDF, te lo estructura por etapas y lo manda al reloj.</p>
+    </div>
+
+    <div class="features">
+      <div class="feature">
+        <div>
+          <span class="f-idx">01 /</span>
+          <h3>Habla con tus números, no con exportaciones</h3>
+        </div>
+        <div>
+          <p>Pregunta en lenguaje normal: «¿estoy sobreentrenando?», «¿qué ritmo en Z3?», «saca una ruta de 12 km desde casa». El asistente consulta Garmin por ti y te contesta con contexto.</p>
+          <div class="f-call"><span class="mono">detect_fatigue_risk</span> · <span class="mono">suggest_routes</span></div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div>
+          <span class="f-idx">02 /</span>
+          <h3>Fatiga de verdad, no «descansa si te duele»</h3>
+        </div>
+        <div>
+          <p>Combina VFC nocturna, predisposición a entrenar y sueño para devolverte un veredicto accionable: listo, moderado o descanso, con su porqué.</p>
+          <div class="f-call"><span class="mono">get_hrv_data</span> · <span class="mono">get_training_readiness</span></div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div>
+          <span class="f-idx">03 /</span>
+          <h3>El PDF del entrenador, en etapas</h3>
+        </div>
+        <div>
+          <p>Subes un plan de maratón en PDF y lo carga separado en calentamiento, series y enfriamiento, con repeticiones y descansos ya montados para el dispositivo.</p>
+          <div class="f-call"><span class="mono">parse_training_pdf</span></div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div>
+          <span class="f-idx">04 /</span>
+          <h3>Multi-usuario. Cada quien su reloj.</h3>
+        </div>
+        <div>
+          <p>Cada persona tiene su clave y guarda sus credenciales Garmin aisladas. Nadie ve la sesión del otro. Juega a escala de un club entero.</p>
+          <div class="f-call">2, 5 o 30 corredores</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ COMO VA ============ -->
+  <section class="block reveal" id="como">
+    <div class="howwrap">
+      <div class="sec-head" style="margin-bottom:2rem">
+        <h2>Tres pasos, una sola vez.</h2>
+        <p>La parte incómoda se hace en el navegador. Después solo conversas.</p>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <span class="st-num">01</span>
+          <h4>Recibe tu clave</h4>
+          <p>El administrador te crea una clave personal, tipo <span class="mono">gcmcp_l3kn…</span>. Es tu puerta de entrada.</p>
+        </div>
+        <div class="step">
+          <span class="st-num">02</span>
+          <h4>Conecta tu Garmin</h4>
+          <p>Metes tu correo y contraseña en el asistente seguro. Quedan guardados y aislados en tu carpeta de usuario.</p>
+        </div>
+        <div class="step">
+          <span class="st-num">03</span>
+          <h4>Entrena y pregunta</h4>
+          <p>Abres Claude, Cursor o VS&nbsp;Code, conectas con tu clave y listo. Tu entrenador contigo en cada sesión.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ HERRAMIENTAS ============ -->
+  <section class="block reveal" id="herramientas">
+    <div class="sec-head">
+      <h2>Un catálogo que se lee como el índice de un manual.</h2>
+      <p>Cada modelo hace una cosa concreta, y todos hablan el mismo idioma con tu Garmin.</p>
+    </div>
+    <div class="cat-grid">
+      <div class="cat"><span class="mono">get_daily_summary</span><span>Resumen de la noche y el día</span></div>
+      <div class="cat"><span class="mono">get_hrv_data</span><span>VFC detallada, última y baseline</span></div>
+      <div class="cat"><span class="mono">detect_fatigue_risk</span><span>¿Entreno o descanso?</span></div>
+      <div class="cat"><span class="mono">plan_this_week</span><span>Semana adaptada a tu carga</span></div>
+      <div class="cat"><span class="mono">parse_training_pdf</span><span>De PDF a etapas en tu reloj</span></div>
+      <div class="cat"><span class="mono">calculate_pace_zones</span><span>Tus zonas de ritmo reales</span></div>
+      <div class="cat"><span class="mono">summarize_period</span><span>Informe de cualquier rango</span></div>
+      <div class="cat"><span class="mono">route_from_home</span><span>Circular desde tu piso</span></div>
+      <div class="cat"><span class="mono">get_race_predictions</span><span>Pronósticos de carrera</span></div>
+    </div>
+    <p class="cat-note">…y más de <span class="mono">110</span> hasta completar el cuaderno. Pide <span class="mono">list_tools_spanish</span> y te enseña todas.</p>
+  </section>
+
+  <!-- ============ CASOS ============ -->
+  <section class="block reveal" id="casos">
+    <div class="casos">
+      <div class="quote">
+        <p>Llego a casa y la semana ya está hecha. El PDF de mi entrenadora acaba en el reloj antes de cenar, y por la mañana me dice si toca exigir o aflojar.</p>
+        <cite>— Corredor de media maratón <span class="mono">· plan 14 semanas</span></cite>
+      </div>
+      <div>
+        <div class="use"><span class="tag">SEMANA</span><p>Genera de lunes a domingo equilibrado según tu carga reciente, sin sobreentrenar.</p></div>
+        <div class="use"><span class="tag">CARRERA</span><p>Periodiza 5K, 10K, media o maratón hacia una fecha concreta.</p></div>
+        <div class="use"><span class="tag">DUDAS</span><p>«¿Por qué mi VFC está baja?» — te lo explica con números de tu reloj.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ PRIVACIDAD ============ -->
+  <section class="block reveal" id="privacidad">
+    <div class="sec-head">
+      <h2>Tus números no son el producto.</h2>
+    </div>
+    <div class="privacy">
+      <div class="priv"><span class="mono">01 · sesiones</span><h4>Cada quien lo suyo</h4><p>Tu sesión de Garmin vive en tu carpeta de usuario. Ni el vecino ni el admin ven tus credenciales.</p></div>
+      <div class="priv"><span class="mono">02 · clave</span><h4>Solo la API key</h4><p>En tu app solo guardas la clave personal; el correo de Garmin va al asistente, nunca al chat de Claude.</p></div>
+      <div class="priv"><span class="mono">03 · dónde vives</span><h4>Autohospedado</h4><p>Es tu servidor. Lo despliegas en tu Dokploy, tu nube o tu casa. Tú decides dónde viven los datos.</p></div>
+    </div>
+  </section>
+
+  <!-- ============ FAQ ============ -->
+  <section class="block reveal" id="faq">
+    <div class="sec-head" style="margin-inline:auto;text-align:center">
+      <h2>Lo que te estarás preguntando</h2>
+    </div>
+    <div class="faq">
+      <details>
+        <summary>¿Necesito conocimientos técnicos para configurarlo?</summary>
+        <div class="a">Solo la primera vez: el administrador te da la clave y tú metes tus credenciales Garmin en un asistente web. Después, todo es conversar.</div>
+      </details>
+      <details>
+        <summary>¿Mis credenciales de Garmin están a salvo?</summary>
+        <div class="a">Sí. Viven en tu servidor, no en tu aplicación de chat. Cada usuario tiene su sesión aislada.</div>
+      </details>
+      <details>
+        <summary>Qué asistentes puedo usar</summary>
+        <div class="a">Claude Desktop, Claude.ai, Cursor y VS&nbsp;Code. Hablan el mismo protocolo MCP; cambia solo cómo apuntas el servidor.</div>
+      </details>
+      <details>
+        <summary>¿Me puede planificar una maratón desde un PDF?</summary>
+        <div class="a">Sí. Sube el plan o deja que Claude extraiga el texto; lo convierte en etapas separadas —calentamiento, series, enfriamiento— y lo envía a tu reloj en segundos.</div>
+      </details>
+      <details>
+        <summary>¿Y si no tengo Garmin?</summary>
+        <div class="a">Este puente es para Garmin y Garmin Connect. Con otro dispositivo no podrá leer tus métricas.</div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============ CTA ============ -->
+  <section class="block" id="empezar">
+    <div class="finwrap">
+      <h2>Dale a tu entrenamiento alguien con quien hablar.</h2>
+      <p>Pide tu clave, conecta tu Garmin y decide hoy qué toca mañana.</p>
+      <a class="btn" href="#empezar">Empezar <span class="mono">→</span></a>
+      <p class="hint">El panel de administración vive en <span class="mono">/admin</span> · estado en <span class="mono">/health</span></p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site">
+  <div class="foot">
+    <div>
+      <div class="brand">Garmin Coach MCP</div>
+      <div style="margin-top:.4rem">Edición 2026.09 · sin plantillas.</div>
+    </div>
+    <div class="foot-links">
+      <a href="#que-es">Qué es</a>
+      <a href="#como">Cómo va</a>
+      <a href="#herramientas">Modelos</a>
+      <a href="#faq">Preguntas</a>
+      <span class="mono">v2026.09</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+  var burger=document.getElementById('burger'),nav=document.getElementById('navlinks');
+  burger.addEventListener('click',function(){nav.classList.toggle('open')});
+  document.querySelectorAll('.nav-links a').forEach(function(a){a.addEventListener('click',function(){nav.classList.remove('open')})});
+
+  if(window.matchMedia('(prefers-reduced-motion: no-preference)').matches){
+    var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}})},{threshold:.12});
+    document.querySelectorAll('.reveal').forEach(function(el,i){el.style.transitionDelay=(i%4*.05)+'s';io.observe(el)});
+  } else {
+    document.querySelectorAll('.reveal').forEach(function(el){el.classList.add('in')});
+  }
+</script>
+</body>
+</html>
