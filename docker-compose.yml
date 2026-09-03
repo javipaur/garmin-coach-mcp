@@ -6,13 +6,25 @@ services:
     image: garmincoachmcp-garminmcp
     restart: unless-stopped
     ports:
-      - "${PORT:-8000}:8000"
+      - "8000:8000"
     environment:
       - PORT=8000
+      - DATA_DIR=/data
       - USERS_DB_DIR=/data/users
-      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
+      # Opcional: URL pública de tu servicio en Dokploy (ej: https://garmin.tudominio.com)
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - GARMIN_LANGUAGE=es
+      - GARMIN_TIMEZONE=Europe/Madrid
     volumes:
       - garmincoach_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 volumes:
+  # Volumen nombrado que persiste entre despliegues en Dokploy.
+  # Aquí se guardan los tokens de Garmin (/data/garmin) y la BBDD de usuarios (/data/users).
   garmincoach_data:

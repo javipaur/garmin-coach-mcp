@@ -409,8 +409,7 @@ def _translate_garmin(obj: Any) -> Any:
         return _GARMIN_ES[obj]
     return obj
 
-RAILWAY_VOLUME_ROOT = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
-VOLUME_ROOT = RAILWAY_VOLUME_ROOT  # backward compatibility for legacy references
+DATA_ROOT = Path(os.getenv("DATA_DIR", "/data"))
 LOCAL_GARMINCONNECT_DIR = Path.home() / ".garminconnect"
 LOCAL_DEBUG_TOKEN_DIR = Path.cwd() / ".debug-data" / "garmin"
 
@@ -422,8 +421,8 @@ def _resolve_token_dir() -> Path:
     if LOCAL_GARMINCONNECT_DIR.exists():
         return LOCAL_GARMINCONNECT_DIR
 
-    if RAILWAY_VOLUME_ROOT.exists() and os.access(RAILWAY_VOLUME_ROOT, os.W_OK):
-        return RAILWAY_VOLUME_ROOT / "garmin"
+    if DATA_ROOT.exists() and os.access(DATA_ROOT, os.W_OK):
+        return DATA_ROOT / "garmin"
 
     return LOCAL_DEBUG_TOKEN_DIR
 
@@ -435,10 +434,6 @@ RESET_GARMIN_TOKENS = os.getenv("RESET_GARMIN_TOKENS", "0").lower() in {"1", "tr
 
 # Re-login web flow (mobile-friendly wizard at /login)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN", "").strip()
-RAILWAY_PROJECT_ID = os.getenv("RAILWAY_PROJECT_ID", "").strip()
-RAILWAY_ENVIRONMENT_ID = os.getenv("RAILWAY_ENVIRONMENT_ID", "").strip()
-RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID", "").strip()
 LOGIN_SESSION_TTL_SECONDS = 600
 LOGIN_MFA_TIMEOUT_SECONDS = 300
 # Auth cookie lifetime. Refreshed on each visit (sliding), so in practice you stay
@@ -774,7 +769,7 @@ def _login_worker(session_id: str, email: str, password: str, user_id: str | Non
 
 
 def _persist_new_tokens(tokens_text: str, user_id: str | None = None) -> dict[str, Any]:
-    """Write tokens to disk + push to Railway env var. Returns a report dict for the UI.
+    """Write tokens to disk. Returns a report dict for the UI.
 
     If user_id is given, tokens are written to that user's token dir (multi-user
     mode). Otherwise they go to the legacy TOKEN_FILE (single-user mode).
@@ -784,7 +779,6 @@ def _persist_new_tokens(tokens_text: str, user_id: str | None = None) -> dict[st
 
     report: dict[str, Any] = {
         "disk": {"ok": False, "path": str(TOKEN_FILE), "error": None},
-        "railway": {"ok": False, "configured": False, "error": None},
         "tokens_b64": base64.b64encode(tokens_text.encode("utf-8")).decode("ascii"),
     }
 
@@ -816,161 +810,6 @@ def _persist_new_tokens_for_user(tokens_text: str, user_id: str) -> dict[str, An
     except Exception as exc:  # noqa: BLE001
         report["disk"]["error"] = str(exc)
     return report
-
-
-def _railway_graphql_call(token: str, payload: dict, *, project_header: bool) -> tuple[int, str]:
-    """One GraphQL call to Railway. Returns (http_status, raw_body).
-
-    Railway's API sits behind Cloudflare, which blocks plain Python clients with
-    'error code: 1010' (bot TLS fingerprint). We use curl_cffi impersonating
-    Chrome — the same trick garminconnect uses against Garmin's Cloudflare — so
-    the request is allowed through.
-    """
-    headers = {"Content-Type": "application/json"}
-    if project_header:
-        headers["Project-Access-Token"] = token
-    else:
-        headers["Authorization"] = f"Bearer {token}"
-
-    body = json.dumps(payload).encode("utf-8")
-    url = "https://backboard.railway.app/graphql/v2"
-
-    try:
-        from curl_cffi import requests as _cffi_requests
-    except ImportError:
-        _cffi_requests = None
-
-    if _cffi_requests is not None:
-        try:
-            resp = _cffi_requests.post(
-                url, data=body, headers=headers, impersonate="chrome", timeout=20
-            )
-            return resp.status_code, resp.text
-        except Exception as exc:  # noqa: BLE001 — fall through to urllib as a last resort
-            last = exc
-    # Fallback (likely Cloudflare-blocked, but better than nothing if curl_cffi missing)
-    req = _urllib_request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with _urllib_request.urlopen(req, timeout=20) as resp:
-            return resp.status, resp.read().decode("utf-8")
-    except _urllib_error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        return exc.code, detail
-    except _urllib_error.URLError as exc:
-        raise RuntimeError(f"Railway API inalcanzable: {exc.reason}") from exc
-
-
-def _update_railway_variable_with_token(token: str, name: str, value: str) -> None:
-    """Upsert a service variable in Railway via the public GraphQL API.
-
-    Tries account-token auth (Authorization: Bearer) first and falls back to
-    project-token auth (Project-Access-Token) so it works whichever token type
-    the user pasted. Uses the explicitly-passed token rather than the global, so
-    the setup wizard can run before RAILWAY_API_TOKEN is stored as an env var.
-    """
-    if not (RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID and RAILWAY_SERVICE_ID):
-        raise RuntimeError(
-            "Faltan los IDs de Railway (PROJECT/ENVIRONMENT/SERVICE). "
-            "Railway los inyecta solo; si no están, este servicio no corre en Railway."
-        )
-    # Reject tokens that aren't header-safe (e.g. user pasted '→' or stray text).
-    try:
-        token.encode("latin-1")
-    except UnicodeEncodeError as exc:
-        raise RuntimeError(
-            "El token tiene caracteres no válidos (¿copiaste texto de más, como flechas '→'?). "
-            "Crea el token de nuevo y pega SOLO el token."
-        ) from exc
-    mutation = (
-        "mutation VariableUpsert($input: VariableUpsertInput!) {\n"
-        "  variableUpsert(input: $input)\n"
-        "}"
-    )
-    payload = {
-        "query": mutation,
-        "variables": {
-            "input": {
-                "projectId": RAILWAY_PROJECT_ID,
-                "environmentId": RAILWAY_ENVIRONMENT_ID,
-                "serviceId": RAILWAY_SERVICE_ID,
-                "name": name,
-                "value": value,
-            }
-        },
-    }
-
-    last_problem = ""
-    for project_header in (False, True):
-        status, raw = _railway_graphql_call(token, payload, project_header=project_header)
-        if status in (401, 403):
-            last_problem = f"HTTP {status}: {raw[:200]}"
-            continue  # try the other auth style
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            last_problem = f"HTTP {status}: respuesta no-JSON: {raw[:200]}"
-            continue
-
-        # Railway sometimes returns the mutation result AND a secondary 'errors'
-        # entry at the same time (the upsert actually happened). So if the
-        # mutation field came back with a value, treat it as a real success.
-        data_field = data.get("data") if isinstance(data, dict) else None
-        if isinstance(data_field, dict) and data_field.get("variableUpsert") is not None:
-            return
-
-        errors = data.get("errors") if isinstance(data, dict) else None
-        if errors:
-            msg = "; ".join(str(e.get("message", e)) for e in errors) if isinstance(errors, list) else str(errors)
-            low = msg.lower()
-            if "not authorized" in low or "unauthorized" in low or "forbidden" in low:
-                last_problem = f"sin permisos: {msg}"
-                continue  # token valid but maybe wrong scope; try other style
-            raise RuntimeError(f"Railway API: {msg}")
-        return  # success (no errors)
-
-    # The upsert response was confusing (Railway sometimes errors even when the
-    # write lands). Before giving up, read the variable back and check directly.
-    if _railway_variable_equals(token, name, value):
-        return
-
-    raise RuntimeError(
-        "El Railway API token no funcionó. "
-        f"Respuesta de Railway: {last_problem or 'desconocida'}"
-    )
-
-
-def _railway_variable_equals(token: str, name: str, expected: str) -> bool:
-    """Read the service variables back and check whether `name` already equals `expected`."""
-    query = (
-        "query Vars($p: String!, $e: String!, $s: String!) {\n"
-        "  variables(projectId: $p, environmentId: $e, serviceId: $s)\n"
-        "}"
-    )
-    payload = {
-        "query": query,
-        "variables": {"p": RAILWAY_PROJECT_ID, "e": RAILWAY_ENVIRONMENT_ID, "s": RAILWAY_SERVICE_ID},
-    }
-    for project_header in (False, True):
-        try:
-            status, raw = _railway_graphql_call(token, payload, project_header=project_header)
-        except Exception:
-            continue
-        if status != 200:
-            continue
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        data_field = data.get("data") if isinstance(data, dict) else None
-        vars_map = data_field.get("variables") if isinstance(data_field, dict) else None
-        if isinstance(vars_map, dict) and vars_map.get(name) == expected:
-            return True
-    return False
-
-
-def _update_railway_variable(name: str, value: str) -> None:
-    """Upsert a variable using the globally-configured RAILWAY_API_TOKEN."""
-    _update_railway_variable_with_token(RAILWAY_API_TOKEN, name, value)
 
 
 def _login_render_page(
@@ -1798,10 +1637,7 @@ def _dashboard_status() -> dict[str, Any]:
     server_ok = True
 
     # 2. Garmin connected: tokens exist on disk or in env var, and last refresh worked.
-    # Try real-time check via Railway API first.
-    live_tokens = _railway_check_variable("GARMIN_TOKENS_JSON")
-    if live_tokens is None:
-        live_tokens = os.getenv("GARMIN_TOKENS_JSON", "").strip()
+    live_tokens = os.getenv("GARMIN_TOKENS_JSON", "").strip()
     has_tokens = TOKEN_FILE.exists() or bool(live_tokens)
     garmin_email = os.getenv("GARMIN_EMAIL", "").strip() or None
     with CACHE_LOCK:
@@ -1810,10 +1646,8 @@ def _dashboard_status() -> dict[str, Any]:
         last_error = CACHE.get("last_error")
     garmin_ok = bool(has_tokens)
 
-    # 3. Persistence: Railway API config available (auto-sync on token change).
-    persistence_ok = bool(
-        RAILWAY_API_TOKEN and RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID and RAILWAY_SERVICE_ID
-    )
+    # 3. Persistence: tokens saved to disk (survives restarts if /data volume is mounted).
+    persistence_ok = TOKEN_FILE.exists()
 
     # 4. Admin lock: a user-defined password protects /login after setup.
     admin_lock_ok = bool(_current_admin_token())
@@ -1846,11 +1680,12 @@ def _dashboard_status() -> dict[str, Any]:
 
 
 def _public_base_url(request: "Request") -> str:
-    """Build the externally-visible base URL, honoring Railway's proxy headers.
+    """Build the externally-visible base URL, honoring reverse-proxy headers.
 
-    Railway terminates TLS and forwards requests internally as plain http, so
-    request.url.scheme is 'http'. We must trust X-Forwarded-Proto / -Host to
-    reconstruct the real https URL that Claude and the user actually use.
+    Reverse proxies (Dokploy, Nginx, etc.) terminate TLS and forward requests
+    internally as plain http, so request.url.scheme may be 'http'. We trust
+    X-Forwarded-Proto / -Host to reconstruct the real https URL that Claude and
+    the user actually use.
     """
     proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
     host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
@@ -1859,16 +1694,6 @@ def _public_base_url(request: "Request") -> str:
     if not host:
         host = request.url.netloc
     return f"{proto}://{host}"
-
-
-def _railway_variables_deep_link() -> str | None:
-    """Build a deep link to this service's Variables tab in Railway, if we know our IDs."""
-    if not (RAILWAY_PROJECT_ID and RAILWAY_SERVICE_ID):
-        return None
-    url = f"https://railway.com/project/{RAILWAY_PROJECT_ID}/service/{RAILWAY_SERVICE_ID}/variables"
-    if RAILWAY_ENVIRONMENT_ID:
-        url += f"?environmentId={RAILWAY_ENVIRONMENT_ID}"
-    return url
 
 
 def _human_time_ago(minutes: int | None) -> str:
@@ -1890,7 +1715,6 @@ def _render_dashboard(request: "Request") -> str:
     s = _dashboard_status()
     public_url = _public_base_url(request)
     mcp_url = f"{public_url}/mcp"
-    rw_vars_url = _railway_variables_deep_link()
 
     # ------ Status rows ------
     rows = _render_status_rows(s)
@@ -1903,9 +1727,6 @@ def _render_dashboard(request: "Request") -> str:
     actions.append(
         f'<button type="button" onclick="navigator.clipboard.writeText({_html.escape(json.dumps(mcp_url))});this.innerText=\'Copiado ✓\'">Copiar URL del conector</button>'
     )
-
-    if rw_vars_url:
-        actions.append(f'<a href="{_html.escape(rw_vars_url)}" target="_blank" rel="noopener"><button type="button" class="secondary">Abrir Railway Variables</button></a>')
 
     if s["admin_lock_ok"]:
         actions.append('<a href="/lock"><button type="button" class="secondary">Bloquear sesión</button></a>')
@@ -2014,14 +1835,6 @@ def _render_dashboard(request: "Request") -> str:
 
 def _render_unlock_page(wrong: bool = False) -> str:
     err = '<div class="error">Contraseña incorrecta.</div>' if wrong else ''
-    rw_vars_url = _railway_variables_deep_link()
-    if rw_vars_url:
-        recovery_step = (
-            f'<li><a href="{_html.escape(rw_vars_url)}" target="_blank" rel="noopener">'
-            'Abre las Variables de tu servicio en Railway</a></li>'
-        )
-    else:
-        recovery_step = '<li>Abre Railway → tu servicio → pestaña <strong>Variables</strong></li>'
     body = (
         '<h1>Panel protegido</h1>'
         '<p class="muted">Introduce tu contraseña para acceder a la configuración.</p>'
@@ -2034,13 +1847,7 @@ def _render_unlock_page(wrong: bool = False) -> str:
         '<details style="margin-top:28px">'
         '<summary>¿No recuerdas la contraseña?</summary>'
         '<p class="muted" style="margin-top:10px">Tu contraseña es el valor de la variable '
-        '<code>ADMIN_TOKEN</code> en Railway. Ahí puedes verla o cambiarla por la que quieras:</p>'
-        '<ol>'
-        f'{recovery_step}'
-        '<li>Busca <code>ADMIN_TOKEN</code> — ese valor es tu contraseña actual</li>'
-        '<li>Si quieres, edítalo por una nueva (mínimo 8 caracteres) y guarda</li>'
-        '<li>Railway redesplegará y podrás entrar con la nueva</li>'
-        '</ol>'
+        '<code>ADMIN_TOKEN</code> definida al desplegar el servidor.</p>'
         '</details>'
     )
     return _login_render_page("Panel protegido", None, body)
@@ -2114,15 +1921,14 @@ def _render_status_rows(s: dict[str, Any]) -> list[str]:
                         "Necesitas hacer login con tus credenciales Garmin",
                         '<a href="/login"><button type="button">Conectar</button></a>'))
     if s["persistence_ok"] and s["garmin_has_tokens"]:
-        rows.append(row(True, "Guardado permanente",
-                        "Activado: tu conexión con Garmin se guarda sola y aguanta reinicios."))
+        rows.append(row(True, "Guardado permanente en disco",
+                        "Activado: tus tokens se guardan en el volumen de datos y aguantan reinicios."))
     elif s["persistence_ok"] and not s["garmin_has_tokens"]:
-        rows.append(row(False, "Guardado permanente",
-                        "Railway API configurado, pero no hay tokens de Garmin que persistir. Conecta Garmin primero."))
+        rows.append(row(False, "Guardado permanente en disco",
+                        "Volumen de datos listo, pero aún no hay tokens de Garmin que persistir. Conecta Garmin primero."))
     else:
-        rows.append(row(False, "Guardado permanente",
-                        "No configurado. Si Railway reinicia el servidor perderás la conexión con Garmin.",
-                        '<a href="/setup/persistencia"><button type="button" class="secondary">Activar</button></a>'))
+        rows.append(row(False, "Guardado permanente en disco",
+                        "No hay volumen de datos montado: si el servidor reinicia perderás la conexión con Garmin."))
     rows.append(row(s["admin_lock_ok"], "Protección con contraseña",
                     ("Activado: solo tú, con tu contraseña, puedes abrir el wizard de login."
                      if s["admin_lock_ok"]
@@ -2146,112 +1952,6 @@ def _render_status_rows(s: dict[str, Any]) -> list[str]:
         rows.append(row(True, "IA lista para conectar",
                         "El servidor MCP está esperando conexiones."))
     return rows
-
-
-def _railway_deploy_status() -> dict[str, str]:
-    """Query Railway API for the latest deployment status."""
-    if not (RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID):
-        return {"status": "unknown", "label": "API no configurada"}
-    query = (
-        "query ServiceStatus($serviceId: String!, $environmentId: String!) {\n"
-        "  service(id: $serviceId) {\n"
-        "    instances(environmentId: $environmentId) {\n"
-        "      edges {\n"
-        "        node {\n"
-        "          latestDeployment {\n"
-        "            id\n"
-        "            status\n"
-        "            createdAt\n"
-        "          }\n"
-        "        }\n"
-        "      }\n"
-        "    }\n"
-        "  }\n"
-        "}"
-    )
-    payload = {
-        "query": query,
-        "variables": {"serviceId": RAILWAY_SERVICE_ID, "environmentId": RAILWAY_ENVIRONMENT_ID},
-    }
-    last_raw = ""
-    for use_project_header in (False, True):
-        status, raw = _railway_graphql_call(RAILWAY_API_TOKEN, payload, project_header=use_project_header)
-        last_raw = raw
-        if status in (401, 403):
-            continue
-        if status != 200:
-            continue
-        try:
-            data = json.loads(raw)
-            # Check for GraphQL errors
-            if "errors" in data:
-                msg = data["errors"][0].get("message", "Error GraphQL")[:100]
-                continue
-            deploy = (
-                data.get("data", {})
-                .get("service", {})
-                .get("instances", {})
-                .get("edges", [None])[0]
-                .get("node", {})
-                .get("latestDeployment")
-            )
-            if not deploy:
-                continue
-            s = deploy.get("status", "unknown")
-            labels = {
-                "QUEUED": "En cola",
-                "BUILDING": "Compilando…",
-                "DEPLOYING": "Desplegando…",
-                "SUCCESS": "Activo ✅",
-                "FAILED": "Falló ❌",
-                "CRASHED": "Caído 💥",
-                "CANCELLED": "Cancelado",
-                "REMOVED": "Eliminado",
-            }
-            return {"status": s, "label": labels.get(s, s), "id": deploy.get("id", "")}
-        except Exception:
-            continue
-    return {"status": "error", "label": "Error al obtener estado", "raw": last_raw[:500]}
-
-
-def _railway_check_variable(name: str) -> str | None:
-    """Query Railway API for a variable value. Returns None on failure (fallback to env)."""
-    if not (RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID and RAILWAY_PROJECT_ID):
-        return None
-    query = (
-        "query Variables($projectId: String!, $environmentId: String!, $serviceId: String!) {\n"
-        "  variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) {\n"
-        "    name\n"
-        "    value\n"
-        "  }\n"
-        "}"
-    )
-    payload = {
-        "query": query,
-        "variables": {
-            "projectId": RAILWAY_PROJECT_ID,
-            "environmentId": RAILWAY_ENVIRONMENT_ID,
-            "serviceId": RAILWAY_SERVICE_ID,
-        },
-    }
-    for use_project_header in (False, True):
-        status, raw = _railway_graphql_call(RAILWAY_API_TOKEN, payload, project_header=use_project_header)
-        if status != 200:
-            continue
-        try:
-            data = json.loads(raw)
-            for var in data.get("data", {}).get("variables", []):
-                if var.get("name") == name:
-                    return var.get("value", "")
-        except Exception:
-            continue
-    return None
-
-
-@mcp.custom_route("/dashboard/deploy-status", methods=["GET"])
-async def dashboard_deploy_status(request: Request) -> Response:
-    from starlette.responses import JSONResponse
-    return JSONResponse(_railway_deploy_status())
 
 
 def _landing_html() -> str | None:
@@ -2326,7 +2026,7 @@ async def health(_: Request) -> JSONResponse:
             "last_refresh_local": _isoish_to_local(CACHE["last_refresh"]),
             "last_error": CACHE["last_error"],
             "token_file_exists": TOKEN_FILE.exists(),
-            "volume_path": str(VOLUME_ROOT),
+            "volume_path": str(DATA_ROOT),
         }
     return JSONResponse(payload)
 
@@ -2905,35 +2605,17 @@ async def download_activity_fit(request: Request) -> Response:
     except Exception:
         pass
 
-    # Optional fallback: proxy the download to another instance, if configured.
-    if RAILWAY_FALLBACK_URL:
-        try:
-            proxy_url = f"{RAILWAY_FALLBACK_URL}/download/{activity_id}"
-            with _urllib.urlopen(proxy_url, timeout=30) as resp:
-                data = resp.read()
-            content_disp = resp.headers.get("Content-Disposition", f'attachment; filename="activity_{activity_id}.zip"')
-            return Response(
-                content=data,
-                media_type="application/octet-stream",
-                headers={"Content-Disposition": content_disp},
-            )
-        except Exception as exc:
-            return JSONResponse({"error": f"No se pudo descargar: {exc}"}, status_code=503)
     panel_url_dl = SELF_PUBLIC_URL or "el panel del servidor"
     return JSONResponse({"error": "Sesión de Garmin caducada", "fix": f"Abre {panel_url_dl} en tu navegador y entra en 'Re-loguear Garmin' (tarda 1 minuto)."}, status_code=503)
 
 
 # Optional fallback to another running instance when local tokens fail. Empty by
-# default — open-source deployments must NOT proxy to anyone else's server.
-RAILWAY_FALLBACK_URL = os.getenv("RAILWAY_FALLBACK_URL", "").rstrip("/")
+# default — deployments must NOT proxy to anyone else's server.
+SELF_PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 
-# This service's own public URL, injected by Railway as RAILWAY_PUBLIC_DOMAIN.
-RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
-SELF_PUBLIC_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}" if RAILWAY_PUBLIC_DOMAIN else ""
-
-_WEB_CONFIG_FILE = RAILWAY_VOLUME_ROOT / "web_config.json"
+_WEB_CONFIG_FILE = DATA_ROOT / "web_config.json"
 _WEB_CONFIG_ALLOWED_KEYS = {"driveUrl"}
-_CONFIG_SHARES_DIR = RAILWAY_VOLUME_ROOT / "config_shares"
+_CONFIG_SHARES_DIR = DATA_ROOT / "config_shares"
 
 
 @mcp.custom_route("/config", methods=["GET"])
@@ -2993,12 +2675,12 @@ async def get_config_share(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Error al leer"}, status_code=500)
 
 
-_ADJ_DIR = RAILWAY_VOLUME_ROOT / "adj"
+_ADJ_DIR = DATA_ROOT / "adj"
 
 def _disk_usage():
     try:
         import shutil
-        du = shutil.disk_usage(_ADJ_DIR if _ADJ_DIR.exists() else RAILWAY_VOLUME_ROOT)
+        du = shutil.disk_usage(_ADJ_DIR if _ADJ_DIR.exists() else DATA_ROOT)
         return {"total": du.total, "used": du.used, "free": du.free}
     except Exception:
         return None
@@ -3112,21 +2794,6 @@ async def list_activities_web(request: Request) -> JSONResponse:
     except Exception:
         pass
 
-    # Optional fallback: proxy to another instance, if configured.
-    if RAILWAY_FALLBACK_URL:
-        try:
-            proxy_url = f"{RAILWAY_FALLBACK_URL}/debug/activities"
-            with _urllib.urlopen(proxy_url, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            acts = data.get("activities") or []
-            # debug/activities devuelve menos campos; rellenamos con 0 los que faltan
-            for a in acts:
-                a.setdefault("distanceKm", 0)
-                a.setdefault("durationMin", 0)
-                a.setdefault("avgHr", None)
-            return JSONResponse({"activities": acts, "source": "fallback"})
-        except Exception as exc:
-            return JSONResponse({"error": "Sesión de Garmin caducada", "fix": "Para seguir usando la web necesitas volver a conectar tu cuenta. Abre " + SELF_PUBLIC_URL + " y entra en 'Re-loguear Garmin' (tarda 1 minuto)."}, status_code=503)
     panel_url = SELF_PUBLIC_URL or "el panel del servidor"
     return JSONResponse({"error": "Sesión de Garmin caducada", "fix": f"Abre {panel_url} en tu navegador y entra en 'Re-loguear Garmin' (tarda 1 minuto)."}, status_code=503)
 
@@ -3475,7 +3142,6 @@ async def login_result(request: Request) -> Response:
 
     # success
     report = session.get("persist_report") or {}
-    railway = report.get("railway") or {}
     tokens_b64 = report.get("tokens_b64") or ""
 
     public_url = _public_base_url(request)
@@ -3483,26 +3149,20 @@ async def login_result(request: Request) -> Response:
 
     parts = ['<h1>¡Listo!</h1>']
 
-    if railway.get("ok"):
+    if report.get("disk", {}).get("ok"):
         parts.append(
-            '<div class="success">Tokens guardados en Railway automáticamente. '
-            'Tu MCP es permanente — sobrevivirá a reinicios.</div>'
+            '<div class="success">Tokens guardados en el volumen persistente. '
+            'Tu MCP aguanta reinicios del servidor.</div>'
         )
-        parts.append('<a href="/admin" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ir al panel</button></a>')
     else:
-        # Manual persistence path: show ONE copy-paste block formatted for Railway.
-        railway_block = f"GARMIN_TOKENS_JSON={tokens_b64}"
+        # Manual persistence path: show ONE copy-paste block with the tokens.
+        env_block = f"GARMIN_TOKENS_JSON={tokens_b64}"
         parts.append(
-            '<p>Tu MCP está activo <strong>durante esta sesión</strong>. Para hacerlo permanente:</p>'
-            '<ol style="padding-left:20px;line-height:1.8">'
-             '<li>Copia el bloque de abajo</li>'
-             '<li>Abre Railway → tu servicio → pestaña <strong>Variables</strong> → <strong>Raw Editor</strong></li>'
-             '<li>Pega y pulsa <strong>Save</strong></li>'
-             '<li>Railway te preguntará si quieres redesplegar — dile que <strong>sí</strong></li>'
-             '</ol>'
-             f'<pre style="max-height:260px;overflow:auto;background:#1c1c22;color:#f2f2f7;padding:14px;border-radius:10px;font-size:13px;line-height:1.5;word-break:break-all;white-space:pre-wrap;border:1px solid #2a2a32" id="env-block">{_html.escape(railway_block)}</pre>'
-             '<button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'env-block\').innerText);this.innerText=\'Copiado ✓\'">Copiar bloque</button>'
-             '<a href="/admin" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ya desplegué, ir al panel</button></a>'
+            '<p>Tu MCP está activo <strong>durante esta sesión</strong>. Para hacerlo permanente, '
+            'define la variable de entorno <code>GARMIN_TOKENS_JSON</code> de tu servidor con este valor:</p>'
+            f'<pre style="max-height:260px;overflow:auto;background:#1c1c22;color:#f2f2f7;padding:14px;border-radius:10px;font-size:13px;line-height:1.5;word-break:break-all;white-space:pre-wrap;border:1px solid #2a2a32" id="env-block">{_html.escape(env_block)}</pre>'
+            '<button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'env-block\').innerText);this.innerText=\'Copiado ✓\'">Copiar bloque</button>'
+            '<a href="/admin" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ir al panel</button></a>'
         )
 
     parts.append('<h2 style="margin-top:32px">Conéctalo a tu IA</h2>')
@@ -3517,98 +3177,8 @@ async def login_result(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
-# Guided setup wizards: persistence (Railway API token) and password lock
+# Guided setup wizards: password lock
 # ---------------------------------------------------------------------------
-
-
-def _read_current_tokens_text() -> str | None:
-    """Return the current Garmin tokens JSON (from disk, else env var seed)."""
-    try:
-        if TOKEN_FILE.exists():
-            return TOKEN_FILE.read_text(encoding="utf-8")
-    except Exception:
-        pass
-    if GARMIN_TOKENS_JSON:
-        try:
-            parsed = _json_loads_maybe_base64(GARMIN_TOKENS_JSON)
-            return json.dumps(parsed)
-        except Exception:
-            return None
-    return None
-
-
-@mcp.custom_route("/setup/persistencia", methods=["GET"])
-async def setup_persistence_form(request: Request) -> Response:
-    from starlette.responses import HTMLResponse
-    if not _login_admin_ok(request):
-        return HTMLResponse(_login_unauthorized_html(), status_code=404)
-
-    rw_token_url = "https://railway.com/account/tokens"
-    body = (
-        '<h1>Guardado permanente</h1>'
-        '<p>Esto hace que tu conexión con Garmin se guarde sola y aguante reinicios del servidor, '
-        'sin que tengas que volver a hacer login.</p>'
-        '<p class="muted">Solo necesitas pegar un "Railway API token". Te explico cómo conseguirlo:</p>'
-        '<ol>'
-        f'<li>Abre <a href="{rw_token_url}" target="_blank" rel="noopener">Railway → Account → Tokens</a> '
-        '(se abre en otra pestaña)</li>'
-        '<li>Pulsa <strong>Create New Token</strong>, ponle un nombre cualquiera (ej. "garmin") y créalo</li>'
-        '<li>Copia el token que te muestra (solo se ve una vez)</li>'
-        '<li>Vuelve aquí y pégalo abajo</li>'
-        '</ol>'
-        '<form method="POST" action="/setup/persistencia">'
-        '<label for="rwtoken">Railway API token</label>'
-        '<input id="rwtoken" name="rwtoken" type="text" autocomplete="off" '
-        'autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus>'
-        '<button type="submit">Activar guardado permanente</button>'
-        '</form>'
-        '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
-    )
-    return HTMLResponse(_login_render_page("Guardado permanente", None, body))
-
-
-@mcp.custom_route("/setup/persistencia", methods=["POST"])
-async def setup_persistence_submit(request: Request) -> Response:
-    from starlette.responses import HTMLResponse
-    if not _login_admin_ok(request):
-        return HTMLResponse(_login_unauthorized_html(), status_code=404)
-
-    form = await request.form()
-    rw_token = (form.get("rwtoken") or "").strip()
-
-    def _err(msg: str) -> Response:
-        body = (
-            '<h1>No se pudo activar</h1>'
-            f'<div class="error">{_html.escape(msg)}</div>'
-            '<a href="/setup/persistencia"><button type="button">Volver a intentar</button></a>'
-            '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
-        )
-        return HTMLResponse(_login_render_page("Error", None, body), status_code=400)
-
-    if not rw_token:
-        return _err("No pegaste ningún token.")
-
-    tokens_text = _read_current_tokens_text()
-    if not tokens_text:
-        return _err("No hay tokens de Garmin que guardar todavía. Conecta Garmin primero.")
-
-    # Save the Garmin tokens AND the Railway token itself, so the next restart is
-    # fully self-sufficient. Setting GARMIN_TOKENS_JSON first validates the token.
-    try:
-        _update_railway_variable_with_token(rw_token, "GARMIN_TOKENS_JSON", tokens_text)
-        _update_railway_variable_with_token(rw_token, "RAILWAY_API_TOKEN", rw_token)
-    except Exception as exc:  # noqa: BLE001
-        return _err(str(exc))
-
-    body = (
-        '<h1>✅ Guardado permanente activado</h1>'
-        '<div class="success">Tu conexión con Garmin ya se guarda sola. '
-        'A partir de ahora aguanta reinicios del servidor.</div>'
-        '<p class="muted">Railway está aplicando los cambios y reiniciará el servidor en ~1 minuto. '
-        'Es normal que el panel tarde un poco en recargar.</p>'
-        '<a href="/admin"><button type="button">← Volver al panel</button></a>'
-    )
-    return HTMLResponse(_login_render_page("Listo", None, body))
 
 
 @mcp.custom_route("/setup/proteccion", methods=["GET"])
@@ -3616,16 +3186,6 @@ async def setup_protection_form(request: Request) -> Response:
     from starlette.responses import HTMLResponse
     if not _login_admin_ok(request):
         return HTMLResponse(_login_unauthorized_html(), status_code=404)
-
-    if not (RAILWAY_API_TOKEN and RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID and RAILWAY_SERVICE_ID):
-        body = (
-            '<h1>Protección con contraseña</h1>'
-            '<p>Para poder guardar tu contraseña necesito acceso a Railway, que se configura en '
-            '<strong>Guardado permanente</strong>. Actívalo primero.</p>'
-            '<a href="/setup/persistencia"><button type="button">Ir a Guardado permanente</button></a>'
-            '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
-        )
-        return HTMLResponse(_login_render_page("Protección con contraseña", None, body))
 
     already = bool(_current_admin_token())
     title = "Cambiar contraseña" if already else "Protección con contraseña"
@@ -3683,34 +3243,14 @@ async def setup_protection_submit(request: Request) -> Response:
     except Exception as exc:  # noqa: BLE001
         return _err(f"No se pudo guardar la contraseña: {exc}")
 
-    # 2. Persist to Railway so it survives container restarts (best effort).
-    persisted = False
-    persist_err = None
-    if RAILWAY_API_TOKEN:
-        try:
-            _update_railway_variable_with_token(RAILWAY_API_TOKEN, "ADMIN_TOKEN", pwd)
-            persisted = True
-        except Exception as exc:  # noqa: BLE001
-            persist_err = str(exc)
-
     heading = "✅ Contraseña actualizada" if changed else "✅ Protección activada"
     public_url = _public_base_url(request)
     login_url = f"{public_url}/login?token={pwd}"
 
-    if persisted:
-        persist_note = '<div class="success">Ya está activa y guardada de forma permanente.</div>'
-    elif RAILWAY_API_TOKEN:
-        persist_note = (
-            '<div class="success">Ya está activa.</div>'
-            f'<div class="error">Aviso: no se pudo guardar en Railway ({_html.escape(persist_err or "")}), '
-            'así que si el servidor reinicia volverá a la anterior. Reinténtalo más tarde.</div>'
-        )
-    else:
-        persist_note = (
-            '<div class="success">Ya está activa.</div>'
-            '<div class="error">Aviso: sin "Guardado permanente" activo, esta contraseña se perderá '
-            'si el servidor reinicia.</div>'
-        )
+    persist_note = (
+        '<div class="success">Ya está activa y guardada de forma permanente '
+        '(se conserva en el volumen de datos).</div>'
+    )
 
     body = (
         f'<h1>{heading}</h1>'
@@ -3820,7 +3360,7 @@ def get_activity_fit_download(activity_id: str) -> str:
     Solo decí "dame el fit de [nombre o ID]" y te da el link para descargar.
     Ejemplo: get_activity_fit_download("22621731390")
     Returns clickable URL."""
-    base = SELF_PUBLIC_URL or RAILWAY_FALLBACK_URL
+    base = SELF_PUBLIC_URL
     if base:
         return f"👉 Descarga el .fit aquí: {base}/download/{activity_id}"
     return f"Ruta de descarga: /download/{activity_id} (añade el dominio público de tu servidor)"
@@ -3837,52 +3377,6 @@ def get_window_rollup(days: int = 7) -> list[dict[str, Any]]:
         results.append(_collect_day_snapshot(target, include_recent_activities=False))
         time.sleep(0.4)
     return results
-
-
-AUTO_SYNC_TOKENS = os.getenv("AUTO_SYNC_TOKENS", "0").lower() in {"1", "true", "yes"}
-AUTO_SYNC_INTERVAL_SECONDS = max(3600, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "43200")))
-
-
-def _extract_oauth1_signature(tokens_text: str) -> str | None:
-    """Return a stable identifier for the OAuth1 portion, to detect master-token rotations."""
-    try:
-        parsed = json.loads(tokens_text)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    # garth stores oauth1_token as a base64 string or as a nested object with oauth_token/oauth_token_secret.
-    oauth1 = parsed.get("oauth1_token")
-    if isinstance(oauth1, str):
-        return oauth1
-    if isinstance(oauth1, dict):
-        token = oauth1.get("oauth_token") or ""
-        secret = oauth1.get("oauth_token_secret") or ""
-        if token or secret:
-            return f"{token}:{secret}"
-    return None
-
-
-def _auto_sync_tokens_loop() -> None:
-    """Detect rotations of the OAuth1 master token and push them to Railway."""
-    last_synced_signature: str | None = _extract_oauth1_signature(GARMIN_TOKENS_JSON) if GARMIN_TOKENS_JSON else None
-    while True:
-        try:
-            time.sleep(AUTO_SYNC_INTERVAL_SECONDS)
-            if not TOKEN_FILE.exists():
-                continue
-            disk_text = TOKEN_FILE.read_text(encoding="utf-8")
-            disk_sig = _extract_oauth1_signature(disk_text)
-            if not disk_sig or disk_sig == last_synced_signature:
-                continue
-            if not (RAILWAY_API_TOKEN and RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID and RAILWAY_SERVICE_ID):
-                continue
-            _update_railway_variable("GARMIN_TOKENS_JSON", disk_text)
-            last_synced_signature = disk_sig
-        except Exception:
-            # Never crash the loop; we'll retry on the next interval.
-            continue
-
 
 class _UserAuthMiddleware:
     """ASGI middleware that authenticates MCP requests via X-User-API-Key header."""
@@ -3937,11 +3431,8 @@ def _run_server() -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     thread = threading.Thread(target=_background_refresh_loop, daemon=True)
     thread.start()
-    if AUTO_SYNC_TOKENS:
-        sync_thread = threading.Thread(target=_auto_sync_tokens_loop, daemon=True, name="auto-sync-tokens")
-        sync_thread.start()
 
-    # First-run banner so the user finds the setup wizard quickly from Railway logs.
+    # First-run banner so the user finds the setup wizard quickly from logs.
     if _is_first_run():
         print("=" * 60, flush=True)
         print("Garmin Coach MCP — PRIMER ARRANQUE", flush=True)
