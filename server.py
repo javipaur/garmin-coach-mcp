@@ -848,54 +848,54 @@ def _login_render_page(
 *{{box-sizing:border-box}}
 html,body{{margin:0;padding:0}}
 body{{
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
-  background:#0d0d12;color:#f2f2f7;-webkit-font-smoothing:antialiased;
+  font-family:system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  background:#0a0d0b;color:#e6ede8;-webkit-font-smoothing:antialiased;
   line-height:1.5;min-height:100vh;font-size:16px;
 }}
 .wrap{{width:100%;max-width:640px;margin:0 auto;padding:28px 18px 72px}}
 .card{{background:transparent;padding:0}}
-h1{{margin:0 0 6px;font-size:26px;font-weight:700;letter-spacing:-.02em;color:#fff}}
-h2{{margin:24px 0 10px;font-size:18px;font-weight:600;color:#fff}}
+h1{{margin:0 0 6px;font-size:26px;font-weight:700;letter-spacing:-.02em;color:#e6ede8}}
+h2{{margin:24px 0 10px;font-size:18px;font-weight:600;color:#e6ede8}}
 p{{margin:0 0 14px}}
-.muted{{color:#9a9aa2;font-size:14px}}
+.muted{{color:#93a399;font-size:14px}}
 .small{{font-size:12px}}
-label{{display:block;font-size:14px;font-weight:600;margin:18px 0 6px;color:#e5e5ea}}
+label{{display:block;font-size:14px;font-weight:600;margin:18px 0 6px;color:#e6ede8}}
 input{{
-  width:100%;padding:15px 14px;font-size:17px;border:1px solid #3a3a44;border-radius:12px;
-  background:#1c1c22;color:#fff;-webkit-appearance:none;appearance:none;
+  width:100%;padding:15px 14px;font-size:17px;border:1px solid #1e2820;border-radius:12px;
+  background:#0d120e;color:#e6ede8;-webkit-appearance:none;appearance:none;
 }}
-input::placeholder{{color:#7a7a82}}
-input:focus{{outline:none;border-color:#0a84ff;box-shadow:0 0 0 3px rgba(10,132,255,.25)}}
+input::placeholder{{color:#5d6b63}}
+input:focus{{outline:none;border-color:#c8f169;box-shadow:0 0 0 3px rgba(200,241,105,.18)}}
 button{{
-  width:100%;padding:15px;font-size:17px;font-weight:600;background:#0a84ff;color:#fff;border:0;border-radius:12px;
+  width:100%;padding:15px;font-size:17px;font-weight:600;background:#c8f169;color:#0a0d0b;border:0;border-radius:12px;
   margin-top:20px;cursor:pointer;-webkit-tap-highlight-color:transparent;
 }}
-button:active{{background:#0066cc}}
-button.secondary{{background:#26262e;color:#0a84ff}}
-button.secondary:active{{background:#33333d}}
+button:active{{background:#a8cf4e}}
+button.secondary{{background:transparent;color:#e6ede8;border:1px solid #1e2820}}
+button.secondary:active{{background:#111710}}
 .pw-wrap{{position:relative}}
 .pw-wrap input{{padding-right:52px}}
 .pw-toggle{{position:absolute;right:5px;top:5px;bottom:5px;width:42px;margin:0;padding:0;
-  background:transparent;border:0;color:#9a9aa2;font-size:20px;line-height:1;cursor:pointer;
+  background:transparent;border:0;color:#93a399;font-size:20px;line-height:1;cursor:pointer;
   display:flex;align-items:center;justify-content:center}}
 .pw-toggle:active{{background:transparent}}
 ol,ul{{padding-left:20px;line-height:1.7}}
 li{{margin:5px 0}}
-code{{background:rgba(255,255,255,.1);padding:2px 6px;border-radius:5px;font-size:.9em;word-break:break-word}}
+code{{background:rgba(200,241,105,.1);padding:2px 6px;border-radius:5px;font-size:.9em;word-break:break-word;color:#d6e6a0}}
 .progress{{display:flex;justify-content:center;gap:8px;margin-bottom:24px}}
-.dot{{width:8px;height:8px;border-radius:50%;background:#3a3a44;transition:all .2s}}
-.dot-active{{background:#0a84ff;transform:scale(1.4)}}
-.dot-done{{background:#30d158}}
-.error{{background:rgba(255,69,58,.15);color:#ff6961;padding:12px 14px;border-radius:10px;margin:12px 0;font-size:14px;border:1px solid rgba(255,69,58,.3)}}
-.success{{background:rgba(48,209,88,.15);color:#4cd964;padding:12px 14px;border-radius:10px;margin:12px 0;font-size:14px;border:1px solid rgba(48,209,88,.3)}}
-.spinner{{width:36px;height:36px;border:3px solid #2a2a32;border-top-color:#0a84ff;border-radius:50%;
+.dot{{width:8px;height:8px;border-radius:50%;background:#1e2820;transition:all .2s}}
+.dot-active{{background:#c8f169;transform:scale(1.4)}}
+.dot-done{{background:#8fa84e}}
+.error{{background:rgba(255,69,58,.12);color:#ff6961;padding:12px 14px;border-radius:10px;margin:12px 0;font-size:14px;border:1px solid rgba(255,69,58,.3)}}
+.success{{background:rgba(200,241,105,.1);color:#c8f169;padding:12px 14px;border-radius:10px;margin:12px 0;font-size:14px;border:1px solid rgba(200,241,105,.3)}}
+.spinner{{width:36px;height:36px;border:3px solid #1e2820;border-top-color:#c8f169;border-radius:50%;
   animation:spin 1s linear infinite;margin:28px auto}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
-pre{{background:#1c1c22;color:#f2f2f7;padding:14px;border-radius:10px;font-size:12px;
-  overflow-x:auto;word-break:break-all;white-space:pre-wrap;border:1px solid #2a2a32}}
+pre{{background:#0d120e;color:#e6ede8;padding:14px;border-radius:10px;font-size:12px;
+  overflow-x:auto;word-break:break-all;white-space:pre-wrap;border:1px solid #1e2820}}
 details{{margin:10px 0}}
 summary{{cursor:pointer}}
-a{{color:#0a84ff;text-decoration:none}}
+a{{color:#c8f169;text-decoration:none}}
 a:active{{opacity:.7}}
 </style>
 </head>
@@ -2231,53 +2231,59 @@ async def admin_users_list(request: Request) -> Response:
     db = _load_users_db()
     users = db.get("users", {})
 
-    # Build table with real base_url
+    # Build table with real base_url — solo mostramos el nombre por protección de datos.
+    # El email y la API key solo son visibles para el propio corredor dentro de su perfil.
     rows = ""
     for uid, u in users.items():
         u_key = u.get("api_key", "")
         login_link = f"{base_url}/u/login?api_key={u_key}"
-        key_display = u_key[:24] + "…"
-        email = u.get("garmin_email", "")
+        name = u.get("display_name", "") or "Sin nombre"
+        initial = (name[:1].upper() or uid[:1].upper())
         created = (u.get("created_at", "") or "")[:10]
         has_token = (u.get("garmin_tokens_json") or "").strip() != "" or (USERS_DB_DIR / uid / "garmin_tokens.json").exists()
-        dot = "<span style=\"color:var(--acc)\">●</span>" if has_token else "<span style=\"color:var(--faint)\">○</span>"
+        status_lbl = "Conectado" if has_token else "Pendiente"
+        status_cls = "ok" if has_token else "none"
         rows += f"""<tr>
-<td><span class="mono" style="font-size:.8rem">{_html.escape(uid[:6])}</span></td>
-<td>{_html.escape(u.get('display_name',''))}</td>
-<td>{_html.escape(email) or '—'}</td>
-<td><code style="font-size:.74rem;color:var(--acc-dim)">{_html.escape(key_display)}</code></td>
-<td>{dot}</td>
-<td style="font-size:.82rem;color:var(--dim)">{created}</td>
-<td style="text-align:right"><a href="{_html.escape(login_link)}" class="btn secondary" style="font-size:.76rem;padding:6px 12px">Panel</a></td>
+<td><div class="avatar">{_html.escape(initial)}</div></td>
+<td><div class="user-name">{_html.escape(name)}</div></td>
+<td><span class="st {status_cls}"></span><span class="st-lbl">{status_lbl}</span></td>
+<td style="font-size:.82rem;color:var(--dim)">{created if created else '—'}</td>
+<td style="text-align:right"><a href="{_html.escape(login_link)}" class="btn secondary" style="font-size:.76rem;padding:6px 12px">Abrir perfil</a></td>
 </tr>"""
 
     empty_state = (
         '<div class="card" style="text-align:center;padding:40px 24px">'
         '<div style="font-size:2.4rem;margin-bottom:10px">🏃</div>'
-        '<h2 style="font-size:1.2rem">Todavía no hay usuarios</h2>'
+        '<h2 style="font-size:1.2rem">Todavía no hay corredores</h2>'
         '<p class="card-sub" style="margin:8px auto 0;max-width:34em">'
-        'Crea tu primer usuario con el asistente paso a paso de abajo. Recibirá su API key y su enlace de conexión.</p>'
+        'Crea un corredor con el asistente paso a paso de abajo. Recibirá su enlace personal para conectar su Garmin.</p>'
         '</div>'
     ) if not rows else ""
 
     extra_head = (
         '<style>'
         'table{{width:100%;border-collapse:collapse;margin-top:8px}}'
-        'th,td{{padding:12px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:.9rem}}'
+        'th,td{{padding:14px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:.9rem;vertical-align:middle}}'
         'th{{color:var(--dim);font-weight:500;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em}}'
+        '.avatar{{width:36px;height:36px;border-radius:50%;background:rgba(200,241,105,.12);border:1px solid rgba(200,241,105,.25);color:var(--acc);display:grid;place-items:center;font-weight:600;font-family:\'IBM Plex Mono\',monospace;font-size:.9rem}}'
+        '.user-name{{font-weight:600}}'
+        '.st{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}}'
+        '.st.ok{{background:var(--acc);box-shadow:0 0 8px rgba(200,241,105,.6)}}'
+        '.st.none{{background:var(--faint)}}'
+        '.st-lbl{{font-size:.8rem;color:var(--dim)}}'
         '.steps{{display:flex;flex-direction:column;gap:0;counter-reset:step;margin-top:8px}}'
         '</style>'
     )
 
     body = (
-        '<h1>Usuarios <span class="acc">del club</span></h1>'
-        '<p class="sub">Crea accesos para cada corredor. Cada uno conecta su propio Garmin de forma aislada.</p>'
-        + ('<div class="card"><h2>Usuarios registrados</h2><div style="overflow-x:auto">'
-           '<table><tr><th>ID</th><th>Nombre</th><th>Email Garmin</th><th>API Key</th><th>Estado</th><th>Creado</th><th></th></tr>'
+        '<h1>Corredores <span class="acc">del club</span></h1>'
+        '<p class="sub">Solo se muestra el nombre. Cada corredor accede a su email y su clave desde su perfil personal.</p>'
+        + ('<div class="card"><h2>Miembros</h2><div style="overflow-x:auto">'
+           '<table><tr><th></th><th>Nombre</th><th>Estado</th><th>Alta</th><th></th></tr>'
            f'{rows}</table></div></div>' if rows else empty_state)
         + _admin_create_wizard_html()
     )
-    return HTMLResponse(_admin_page_html("Admin · Usuarios", body, extra_head))
+    return HTMLResponse(_admin_page_html("Admin · Corredores", body, extra_head))
 
 
 def _admin_create_wizard_html() -> str:
@@ -2492,51 +2498,108 @@ async def user_panel(request: Request) -> Response:
     api_key = user.get("api_key", "")
     display_name = user.get("display_name", "") or user_id
     garmin_email = user.get("garmin_email", "")
+    initial = (display_name[:1].upper() or "?")
 
     token_file = _user_token_file(user_id)
     connected = token_file.exists()
     public_url = _public_base_url(request)
     connect_url = f"{public_url}/connect?api_key={api_key}"
 
-    garmin_status = (
-        ('<div class="success">✅ Garmin conectado</div>'
-         f'<p class="muted">Cuenta: {_html.escape(garmin_email or "—")}</p>')
+    status_html = (
+        ('<div class="p-status ok">'
+         '<span class="p-dot"></span>'
+         '<div><div class="p-st-title">Garmin conectado</div>'
+         '<div class="p-st-sub">' + _html.escape(garmin_email or "—") + '</div></div>'
+         '</div>')
         if connected
-        else ('<div class="pending">⚠️ Garmin NO conectado</div>'
-              '<p class="muted">Conecta tu cuenta de Garmin para que la IA pueda leer tus datos.</p>')
+        else ('<div class="p-status none">'
+              '<span class="p-dot"></span>'
+              '<div><div class="p-st-title">Garmin sin conectar</div>'
+              '<div class="p-st-sub">Conecta tu cuenta para que la IA pueda leer tus datos.</div></div>'
+              '</div>')
     )
 
     connect_btn = (
-        '<a href="/garmin-connect"><button type="button">Conectar Garmin</button></a>'
+        '<a href="/garmin-connect" class="p-btn">Conectar Garmin</a>'
         if not connected
-        else '<a href="/garmin-connect"><button type="button" class="secondary">Re-conectar Garmin</button></a>'
+        else '<a href="/garmin-connect" class="p-btn p-btn-dull">Re-conectar Garmin</a>'
     )
 
     body = (
-        '<h1>Hola, ' + _html.escape(display_name) + '</h1>'
-        '<p class="muted">Tu panel personal de Garmin Coach MCP</p>'
-        '<h2 style="margin-top:24px">Estado de Garmin</h2>'
-        + garmin_status
-        + '<div style="margin-top:12px">' + connect_btn + '</div>'
-        '<h2 style="margin-top:32px">Tu API Key</h2>'
-        '<div class="api-key-box" style="background:#1c1c22;padding:12px;border-radius:10px;border:1px solid #3a3a44;word-break:break-all;display:flex;justify-content:space-between;align-items:center">'
-        f'<code id="apikey">{_html.escape(api_key)}</code>'
-        '<button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'apikey\').innerText);this.innerText=\'Copiada ✓\'">Copiar</button>'
+        '<div class="p-head">'
+        f'<div class="p-avatar">{_html.escape(initial)}</div>'
+        '<div><div class="p-hi">Hola,</div>'
+        f'<h1 class="p-name">{_html.escape(display_name)}</h1></div>'
         '</div>'
-        '<h2 style="margin-top:32px">Conectar la IA</h2>'
-        '<p class="muted">Abre el asistente de conexión para configurar Claude Desktop, el móvil o Cursor.</p>'
-        '<div style="margin-top:12px">'
-        f'<a href="{_html.escape(connect_url)}"><button type="button">Abrir asistente de conexión</button></a> '
-        f'<button type="button" class="secondary" onclick="navigator.clipboard.writeText({_html.escape(json.dumps(connect_url))});this.innerText=\'Copiado ✓\'">Copiar link</button>'
+
+        '<div class="p-section-label">Tu cuenta Garmin</div>'
+        + status_html
+        + '<div style="margin-top:14px">' + connect_btn + '</div>'
+
+        '<div class="p-section-label">Tu credencial de acceso</div>'
+        '<div class="p-card">'
+        '<p class="p-card-sub">Esta API key es personal y es tuya. Solo se muestra aquí, '
+        'para tu acceso; no la compartas.</p>'
+        '<div class="p-key-row">'
+        '<code class="p-key" id="apikey">••••••••••••••••••••</code>'
+        '<button type="button" class="p-btn p-btn-sm" id="showKey" '
+        'onclick="toggleKey()">Ver clave</button>'
+        '<button type="button" class="p-btn p-btn-sm p-btn-dull" id="copyKey" '
+        'onclick="copyKey()" style="display:none">Copiar</button>'
         '</div>'
-        '<p style="margin-top:24px"><a href="/logout"><button type="button" class="secondary">Cerrar sesión</button></a></p>'
+        '</div>'
+
+        '<div class="p-section-label">Conectar la IA</div>'
+        '<div class="p-card">'
+        '<p class="p-card-sub">Abre el asistente para configurar Claude Desktop, el móvil o Cursor '
+        'con tu cuenta.</p>'
+        f'<a href="{_html.escape(connect_url)}" class="p-btn">Abrir asistente de conexión</a>'
+        '<button type="button" class="p-btn p-btn-dull" id="copyLink" '
+        'onclick="copyLink()">Copiar link de conexión</button>'
+        '</div>'
+
+        '<div style="margin-top:28px;text-align:center">'
+        '<a href="/logout" class="p-link">Cerrar sesión</a>'
+        '</div>'
     )
 
     extra_head = (
         '<style>'
-        '.api-key-box button{margin-top:0;padding:8px 14px;font-size:13px}'
-        '.pending{background:rgba(255,159,10,.12);border-radius:10px;padding:12px 14px;border:1px solid rgba(255,159,10,.3)}'
+        ':root{--acc:#c8f169;--acc-dim:#8fa84e;--bg:#0a0d0b;--panel:#111710;--line:#1e2820;--fg:#e6ede8;--dim:#93a399;--faint:#5d6b63}'
+        '.wrap{max-width:560px}'
+        '.p-head{display:flex;align-items:center;gap:16px;margin-bottom:8px}'
+        '.p-avatar{width:52px;height:52px;border-radius:14px;background:rgba(200,241,105,.12);border:1px solid rgba(200,241,105,.28);color:var(--acc);display:grid;place-items:center;font-weight:700;font-family:\'IBM Plex Mono\',monospace;font-size:1.3rem;flex:none}'
+        '.p-hi{color:var(--dim);font-size:.85rem;margin-bottom:2px}'
+        '.p-name{margin:0;font-size:1.6rem}'
+        '.p-section-label{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);font-weight:600;margin:30px 0 10px}'
+        '.p-status{display:flex;align-items:center;gap:12px;border-radius:12px;padding:14px 16px;border:1px solid var(--line);background:var(--panel)}'
+        '.p-status .p-dot{width:11px;height:11px;border-radius:50%;flex:none}'
+        '.p-status.ok .p-dot{background:var(--acc);box-shadow:0 0 10px rgba(200,241,105,.6)}'
+        '.p-status.none .p-dot{background:#5d6b63}'
+        '.p-st-title{font-weight:600;font-size:.98rem;color:var(--fg)}'
+        '.p-st-sub{color:var(--dim);font-size:.8rem;margin-top:2px;word-break:break-word}'
+        '.p-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}'
+        '.p-card-sub{color:var(--dim);font-size:.82rem;margin:0 0 14px;line-height:1.5}'
+        '.p-key-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}'
+        '.p-key{background:#0d120e;border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-family:\'IBM Plex Mono\',monospace;font-size:.82rem;color:var(--acc);flex:1;min-width:150px;word-break:break-all}'
+        '.p-btn{display:inline-block;background:var(--acc);color:#0a0d0b;text-decoration:none;font-weight:600;border:none;border-radius:10px;padding:12px 18px;font-size:.95rem;cursor:pointer;font-family:inherit;margin:0 6px 8px 0;transition:filter .15s;width:auto;line-height:1.4}'
+        '.p-btn:hover{filter:brightness(1.08)}'
+        '.p-btn-sm{padding:9px 14px;font-size:.82rem;margin-top:0}'
+        '.p-btn-dull{background:transparent;color:var(--fg);border:1px solid var(--line);margin-top:2px}'
+        '.p-btn-dull:hover{border-color:var(--acc);color:var(--acc);filter:none}'
+        '.p-link{color:var(--dim);font-size:.88rem;text-decoration:none}'
+        '.p-link:hover{color:var(--acc)}'
         '</style>'
+        '<script>'
+        'var _key=' + _html.escape(json.dumps(api_key)) + ';'
+        'var _shown=false;'
+        'function toggleKey(){var el=document.getElementById(\'apikey\');var copyBtn=document.getElementById(\'copyKey\');'
+        '_shown=!_shown;el.textContent=_shown?_key:\'••••••••••••••••••••\';'
+        'document.getElementById(\'showKey\').textContent=_shown?\'Ocultar\':\'Ver clave\';'
+        'copyBtn.style.display=_shown?\'inline-block\':\'none\';}'
+        'function copyKey(){navigator.clipboard.writeText(_key).then(function(){document.getElementById(\'copyKey\').textContent=\'Copiada ✓\';setTimeout(function(){document.getElementById(\'copyKey\').textContent=\'Copiar\'},1500)}).catch(function(){prompt(\'Copia tu clave manualmente:\',_key)})}'
+        'function copyLink(){navigator.clipboard.writeText(' + _html.escape(json.dumps(connect_url)) + ').then(function(){var b=document.getElementById(\'copyLink\');b.textContent=\'Copiado ✓\';setTimeout(function(){b.textContent=\'Copiar link de conexión\'},1500)}).catch(function(){prompt(\'Copia el enlace:\',' + _html.escape(json.dumps(connect_url)) + ')})}'
+        '</script>'
     )
     return HTMLResponse(_login_render_page("Mi panel", None, body, extra_head=extra_head))
 
@@ -2546,6 +2609,74 @@ async def user_logout(request: Request) -> Response:
     from starlette.responses import RedirectResponse
     resp = RedirectResponse("/u/login", status_code=303)
     resp.delete_cookie("user_api_key", samesite="strict")
+    return resp
+
+
+def _find_user_by_email(email: str) -> dict[str, Any] | None:
+    """Return the user whose Garmin email matches, case-insensitive."""
+    needle = (email or "").strip().lower()
+    if not needle:
+        return None
+    db = _load_users_db()
+    for u in db.get("users", {}).values():
+        if (u.get("garmin_email") or "").strip().lower() == needle:
+            return u
+    return None
+
+
+@mcp.custom_route("/login-usuario", methods=["GET"])
+async def user_email_login(request: Request) -> Response:
+    from starlette.responses import HTMLResponse, RedirectResponse
+    already = _request_user(request)
+    if already:
+        return RedirectResponse("/panel", status_code=303)
+    error = ""
+    body = (
+        '<h1>Entrar con tu email</h1>'
+        '<p class="p-sub">Si ya tienes cuenta en el club, escribe el email con el que '
+        'conectaste tu Garmin y accede a tu perfil.</p>'
+        + ('<div class="p-alert">' + _html.escape(error) + '</div>' if error else '')
+        + '<form method="POST" action="/login-usuario">'
+        '<label for="lemail">Tu email</label>'
+        '<input id="lemail" name="email" type="email" autocomplete="email" required autofocus>'
+        '<button type="submit" class="p-btn p-btn-block" style="margin-top:24px">Entrar en mi perfil</button>'
+        '</form>'
+        '<p style="margin-top:20px;text-align:center" class="p-hint">'
+        '¿No recuerdas tu email? Pide al administrador tu enlace de acceso personal.</p>'
+    )
+    extra_head = (
+        '<style>'
+        ':root{--acc:#c8f169;--bg:#0a0d0b;--panel:#111710;--line:#1e2820;--dim:#93a399;--faint:#5d6b63}'
+        '.wrap{max-width:460px}'
+        '.p-sub{color:var(--dim);font-size:.9rem;margin:0 0 6px}'
+        '.p-alert{background:rgba(255,69,58,.12);color:#ff6961;border:1px solid rgba(255,69,58,.3);border-radius:10px;padding:12px 14px;font-size:.85rem;margin:12px 0}'
+        '.p-btn-block{display:block;width:100%;text-align:center}'
+        '.p-hint{color:var(--faint);font-size:.8rem}'
+        '</style>'
+    )
+    return HTMLResponse(_login_render_page("Entrar en mi perfil", None, body, extra_head=extra_head))
+
+
+@mcp.custom_route("/login-usuario", methods=["POST"])
+async def user_email_login_post(request: Request) -> Response:
+    from starlette.responses import HTMLResponse, RedirectResponse
+    form = await request.form()
+    email = (form.get("email") or "").strip()
+    user = _find_user_by_email(email)
+    if not user:
+        body = (
+            '<h1>No encontramos ese email</h1>'
+            '<p class="muted">No hay ningún corredor del club registrado con '
+            '<code>' + _html.escape(email) + '</code>.</p>'
+            '<div style="margin-top:16px">'
+            '<a href="/login-usuario"><button type="button">Probar otro email</button></a> '
+            '<a href="/" style="color:#60a5fa">← Volver a la página principal</a>'
+            '</div>'
+        )
+        return HTMLResponse(_login_render_page("Email no encontrado", None, body), status_code=404)
+
+    resp = RedirectResponse("/panel", status_code=303)
+    _set_user_cookie(resp, user.get("api_key", ""), request)
     return resp
 
 
@@ -2601,6 +2732,7 @@ async def garmin_connect_submit(request: Request) -> Response:
         "mfa_event": mfa_event,
         "mfa_holder": mfa_holder,
         "user_id": user["id"],
+        "email": email,
         "created_at": time.time(),
     }
     _login_set_session(session_id, session)
@@ -2751,6 +2883,9 @@ async def garmin_connect_result(request: Request) -> Response:
         _login_drop_session(session_id)
         return HTMLResponse(_login_render_page("Error", 3, body), status_code=400)
 
+    connected_email = (session.get("email") or "").strip()
+    if connected_email and connected_email != user.get("garmin_email"):
+        _update_user(user["id"], garmin_email=connected_email)
     _login_drop_session(session_id)
     body = (
         '<h1>✅ ¡Garmin conectado!</h1>'
