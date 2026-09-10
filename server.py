@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import functools
 import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -11071,7 +11073,12 @@ def create_workout_from_description(
         "strength_training": 6, "cardio": 6, "hiking": 7, "multi_sport": 5,
     }
     sport_key = sport.lower().replace(" ", "_")
-    sport_type_id = sport_type_id_map.get(sport_key, 1)
+    if sport_key not in sport_type_id_map:
+        supported = ", ".join(sorted(sport_type_id_map))
+        raise RuntimeError(
+            f"Deporte no soportado: {sport!r}. Usa uno de: {supported}."
+        )
+    sport_type_id = sport_type_id_map[sport_key]
     sport_type = {"sportTypeId": sport_type_id, "sportTypeKey": sport_key, "displayOrder": 1}
 
     workout_json = {
@@ -11439,11 +11446,32 @@ def predict_race_distance(distance_km: float) -> dict[str, Any]:
 
 # === ROUTE GENERATION TOOLS ===
 
+ROUTE_GEN_TIMEOUT_SECONDS = 60
+_route_gen_executor = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="route-gen"
+)
 _route_graph_cache_data: dict[str, Any] = {}
 _route_graph_cache_lock = threading.Lock()
 
 
-def _get_route_graph(lat: float, lon: float, radius_m: int = 15000, network_type: str = "walk") -> Any:
+def _run_with_timeout(fn, timeout_s: float = ROUTE_GEN_TIMEOUT_SECONDS, *args, **kwargs):
+    """Ejecuta fn en el pool dedicado de generación de rutas con timeout duro.
+
+    Evita que una descarga de OSM sin límite sature el threadpool de FastMCP y
+    tumbe /health. Si se excede el timeout, devuelve un error limpio; el worker
+    dedicado queda acotado a este pool y no bloquea al resto del servidor.
+    """
+    future = _route_gen_executor.submit(fn, *args, **kwargs)
+    try:
+        return future.result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        raise RuntimeError(
+            f"La generación de ruta tardó más de {int(timeout_s)}s (descarga de red OSM lenta). "
+            "Inténtalo más tarde o con una distancia menor."
+        )
+
+
+def _get_route_graph(lat: float, lon: float, radius_m: int = 5000, network_type: str = "walk") -> Any:
     """Descarga y cachea el grafo de caminos de OpenStreetMap."""
     import osmnx as ox
     import networkx as nx
@@ -11454,13 +11482,13 @@ def _get_route_graph(lat: float, lon: float, radius_m: int = 15000, network_type
         if cached and time.time() - cached.get("ts", 0) < 3600:
             return cached["graph"]
 
-    try:
+    def _download() -> Any:
         G = ox.graph_from_point((lat, lon), dist=radius_m, network_type=network_type)
         G = ox.add_edge_speeds(G)
         G = ox.add_edge_travel_times(G)
-    except Exception as e:
-        raise RuntimeError(f"Error descargando grafo OSM: {e}")
+        return G
 
+    G = _download()
     with _route_graph_cache_lock:
         _route_graph_cache_data[cache_key] = {"graph": G, "ts": time.time()}
 
@@ -11573,7 +11601,8 @@ def suggest_routes(
     network_type = "bike" if sport == "cycling" else "walk"
 
     try:
-        routes = _generate_loop_route(
+        routes = _run_with_timeout(
+            _generate_loop_route,
             lat=lat,
             lon=lon,
             target_distance_km=distance_km,
@@ -11601,7 +11630,7 @@ def suggest_routes(
     }
 
 
-@mcp.tool
+@mcp.tool(timeout=45)
 def suggest_routes_from_profile(
     distance_km: float,
     elevation_gain_m: int = 0,
@@ -12316,7 +12345,7 @@ def mcp_health() -> dict:
     }
 
 
-@mcp.tool
+@mcp.tool(timeout=45)
 def route_to_poi(
     place: str,
     distance_km: float,
@@ -12357,7 +12386,8 @@ def route_to_poi(
 
     network_type = "bike" if sport == "cycling" else "walk"
     try:
-        routes = _generate_loop_route(
+        routes = _run_with_timeout(
+            _generate_loop_route,
             lat=home_lat,
             lon=home_lon,
             target_distance_km=distance_km,
@@ -12382,7 +12412,7 @@ def route_to_poi(
     }
 
 
-@mcp.tool
+@mcp.tool(timeout=120)
 def generate_periodized_plan(
     race_distance_km: float,
     race_date: str,
