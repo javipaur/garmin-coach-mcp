@@ -397,14 +397,16 @@ _GARMIN_ES: dict[str, str] = {
 }
 
 
-def _translate_garmin(obj: Any) -> Any:
+def _translate_garmin(obj: Any, _depth: int = 0) -> Any:
     """Traduce recursivamente los enums de Garmin al español de Garmin Connect."""
     if not GARMIN_LANGUAGE.startswith("es"):
         return obj
+    if _depth > 50:
+        return obj
     if isinstance(obj, dict):
-        return {k: _translate_garmin(v) for k, v in obj.items()}
+        return {k: _translate_garmin(v, _depth + 1) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_translate_garmin(i) for i in obj]
+        return [_translate_garmin(i, _depth + 1) for i in obj]
     if isinstance(obj, str) and obj in _GARMIN_ES:
         return _GARMIN_ES[obj]
     return obj
@@ -957,16 +959,21 @@ def _get_api(user_id: str | None = None) -> Garmin:
         user = _get_auth_user()
         if user:
             user_id = user["id"]
-    if user_id:
-        token_dir = _user_token_dir(user_id)
-        _seed_user_token_file(user_id, token_dir)
+    try:
+        if user_id:
+            token_dir = _user_token_dir(user_id)
+            _seed_user_token_file(user_id, token_dir)
+            api = Garmin()
+            api.login(str(token_dir))
+            return api
+        _seed_token_file_if_needed()
         api = Garmin()
-        api.login(str(token_dir))
+        api.login(str(TOKEN_DIR))
         return api
-    _seed_token_file_if_needed()
-    api = Garmin()
-    api.login(str(TOKEN_DIR))
-    return api
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Error de conexión con Garmin: {exc}") from exc
 
 
 def _optional_call_first(api: Garmin, methods: tuple[str, ...], *args: Any) -> tuple[Any, str | None]:
