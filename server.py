@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import functools
+import inspect
 import json
 import os
 import threading
@@ -977,14 +978,17 @@ def _get_api(user_id: str | None = None) -> Garmin:
     try:
         retry_attempts = os.environ.get("GARMIN_RETRY_ATTEMPTS")
         retry_attempts = int(retry_attempts) if retry_attempts else 1
+        api_kwargs: dict[str, Any] = {}
+        if "retry_attempts" in inspect.signature(Garmin.__init__).parameters:
+            api_kwargs["retry_attempts"] = retry_attempts
         if user_id:
             token_dir = _user_token_dir(user_id)
             _seed_user_token_file(user_id, token_dir)
-            api = Garmin(retry_attempts=retry_attempts)
+            api = Garmin(**api_kwargs)
             api.login(str(token_dir))
             return api
         _seed_token_file_if_needed()
-        api = Garmin(retry_attempts=retry_attempts)
+        api = Garmin(**api_kwargs)
         api.login(str(TOKEN_DIR))
         return api
     except RuntimeError:
