@@ -9323,6 +9323,17 @@ def get_activity_evaluation(activity_id: str) -> dict:
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_evaluation",), activity_id)
+        if data is None and hasattr(api, "connectapi"):
+            try:
+                data = api.connectapi(f"/activity-service/activity/{activity_id}/evaluation")
+            except Exception as e:
+                err = str(e)
+            if data is None:
+                try:
+                    full = api.connectapi(f"/activity-service/activity/{activity_id}")
+                    data = full
+                except Exception as e:
+                    err = str(e)
 
     if data is None:
         raise RuntimeError(err or f"No se pudo obtener la evaluación de la actividad {activity_id}")
@@ -9363,15 +9374,15 @@ def add_weigh_in(
     target_date: fecha en formato YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_date(target_date) if target_date else _today_local().isoformat()
-    weight_int = round(weight_kg * 1000)
 
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(
-            api, ("add_weigh_in",), weight_int, "kg", parsed
+            api, ("add_weigh_in",), weight_kg, "kg", parsed
         )
 
-    if data is None:
+    # Garmin responde 204 (sin cuerpo) en éxito; la librería devuelve None en ese caso.
+    if data is None and err:
         raise RuntimeError(err or "No se pudo registrar el pesaje")
 
     return {"ok": True, "weight_kg": weight_kg, "date": parsed, "response": data}
@@ -10149,6 +10160,29 @@ def unschedule_workout(schedule_id: str) -> dict:
     return {"ok": True, "schedule_id": schedule_id, "response": data}
 
 
+def _push_workout(api: Any, workout_id: str) -> Any:
+    """Envía un workout a un dispositivo Garmin, compatible con garminconnect 0.3.2."""
+    if hasattr(api, "push_workout_to_device"):
+        return api.push_workout_to_device(workout_id)
+    device = api.get_device_last_used()
+    device_id = device.get("userDeviceId")
+    if not device_id:
+        raise RuntimeError("No se pudo determinar el dispositivo Garmin del usuario")
+    detail = api.get_workout_by_id(workout_id)
+    workout_name = detail.get("workoutName", f"Workout {workout_id}")
+    payload = [{
+        "deviceId": int(device_id),
+        "messageUrl": f"workout-service/workout/FIT/{workout_id}",
+        "messageType": "workouts",
+        "groupName": None,
+        "messageName": workout_name,
+        "priority": 1,
+        "fileType": "FIT",
+        "metaDataId": workout_id,
+    }]
+    return api.client.post("connectapi", "/device-service/devicemessage/messages", json=payload, api=True)
+
+
 @mcp.tool
 def push_workout_to_device(workout_id: str) -> dict:
     """Envía un entrenamiento de la biblioteca al reloj Garmin conectado.
@@ -10158,26 +10192,7 @@ def push_workout_to_device(workout_id: str) -> dict:
     with FETCH_LOCK:
         api = _get_api()
         try:
-            if hasattr(api, "push_workout_to_device"):
-                result = api.push_workout_to_device(workout_id)
-            else:
-                device = api.get_device_last_used()
-                device_id = device.get("userDeviceId")
-                if not device_id:
-                    raise RuntimeError("No se pudo determinar el dispositivo Garmin del usuario")
-                detail = api.get_workout_by_id(workout_id)
-                workout_name = detail.get("workoutName", f"Workout {workout_id}")
-                payload = [{
-                    "deviceId": int(device_id),
-                    "messageUrl": f"workout-service/workout/FIT/{workout_id}",
-                    "messageType": "workouts",
-                    "groupName": None,
-                    "messageName": workout_name,
-                    "priority": 1,
-                    "fileType": "FIT",
-                    "metaDataId": workout_id,
-                }]
-                result = api.client.post("connectapi", "/device-service/devicemessage/messages", json=payload, api=True)
+            result = _push_workout(api, workout_id)
         except Exception as e:
             raise RuntimeError(f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}")
     return {"ok": True, "workout_id": workout_id, "pushed": True, "response": result}
@@ -11046,7 +11061,7 @@ def create_workout_from_description(
         with FETCH_LOCK:
             api = _get_api(user["id"])
             try:
-                push_result = api.push_workout_to_device(workout_id)
+                push_result = _push_workout(api, workout_id)
             except Exception as e:
                 push_result = {"error": str(e)}
 
@@ -11659,10 +11674,19 @@ def get_gear_list() -> dict:
 
     with FETCH_LOCK:
         api = _get_api(user["id"])
-        data, err = _optional_call_first(api, ("get_gear_stats",))
+        profile, _ = _optional_call_first(api, ("get_user_profile",))
+        profile_number = None
+        if isinstance(profile, dict):
+            profile_number = (
+                (profile.get("userData") or {}).get("profileNumber")
+                or (profile.get("userData") or {}).get("id")
+                or profile.get("profileNumber")
+                or profile.get("id")
+            )
+        if profile_number is None:
+            raise RuntimeError("No se pudo obtener el número de perfil de usuario")
 
-    if data is None:
-        data, err = _optional_call_first(api, ("get_gear",))
+        data, err = _optional_call_first(api, ("get_gear",), profile_number)
 
     if data is None:
         raise RuntimeError(err or "No se pudo obtener el equipo deportivo")
