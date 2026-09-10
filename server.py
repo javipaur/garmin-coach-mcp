@@ -10157,19 +10157,27 @@ def push_workout_to_device(workout_id: str) -> dict:
     """
     with FETCH_LOCK:
         api = _get_api()
-        push_path = f"/workout-service/workout/{workout_id}/push"
-
-        def _push() -> Any:
-            if hasattr(api, "push_workout_to_device"):
-                return api.push_workout_to_device(workout_id)
-            resp = api.client.post("connectapi", push_path, json={}, api=True)
-            try:
-                return resp.json()
-            except Exception:
-                return {"pushed": True}
-
         try:
-            result = _push()
+            if hasattr(api, "push_workout_to_device"):
+                result = api.push_workout_to_device(workout_id)
+            else:
+                device = api.get_device_last_used()
+                device_id = device.get("userDeviceId")
+                if not device_id:
+                    raise RuntimeError("No se pudo determinar el dispositivo Garmin del usuario")
+                detail = api.get_workout_by_id(workout_id)
+                workout_name = detail.get("workoutName", f"Workout {workout_id}")
+                payload = [{
+                    "deviceId": int(device_id),
+                    "messageUrl": f"workout-service/workout/FIT/{workout_id}",
+                    "messageType": "workouts",
+                    "groupName": None,
+                    "messageName": workout_name,
+                    "priority": 1,
+                    "fileType": "FIT",
+                    "metaDataId": workout_id,
+                }]
+                result = api.client.post("connectapi", "/device-service/devicemessage/messages", json=payload, api=True)
         except Exception as e:
             raise RuntimeError(f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}")
     return {"ok": True, "workout_id": workout_id, "pushed": True, "response": result}
