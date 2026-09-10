@@ -638,6 +638,15 @@ import urllib.request as _urllib_request
 import urllib.error as _urllib_error
 
 
+def _js_json(value: Any) -> str:
+    """Serialize a value safely for embedding inside a <script> block.
+
+    HTML entities are NOT decoded inside <script>, so _html.escape(json.dumps(...))
+    would corrupt the JS. Only '</script>' is dangerous; neutralize the slash.
+    """
+    return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
+
+
 def _is_first_run() -> bool:
     """True when there are no Garmin tokens persisted anywhere yet."""
     return not GARMIN_TOKENS_JSON and not TOKEN_FILE.exists()
@@ -2598,14 +2607,14 @@ async def user_panel(request: Request) -> Response:
         '.p-link:hover{color:var(--acc)}'
         '</style>'
         '<script>'
-        'var _key=' + _html.escape(json.dumps(api_key)) + ';'
+        'var _key=' + _js_json(api_key) + ';'
         'var _shown=false;'
         'function toggleKey(){var el=document.getElementById(\'apikey\');var copyBtn=document.getElementById(\'copyKey\');'
         '_shown=!_shown;el.textContent=_shown?_key:\'••••••••••••••••••••\';'
         'document.getElementById(\'showKey\').textContent=_shown?\'Ocultar\':\'Ver clave\';'
         'copyBtn.style.display=_shown?\'inline-block\':\'none\';}'
         'function copyKey(){navigator.clipboard.writeText(_key).then(function(){document.getElementById(\'copyKey\').textContent=\'Copiada ✓\';setTimeout(function(){document.getElementById(\'copyKey\').textContent=\'Copiar\'},1500)}).catch(function(){prompt(\'Copia tu clave manualmente:\',_key)})}'
-        'function copyLink(){navigator.clipboard.writeText(' + _html.escape(json.dumps(connect_url)) + ').then(function(){var b=document.getElementById(\'copyLink\');b.textContent=\'Copiado ✓\';setTimeout(function(){b.textContent=\'Copiar link de conexión\'},1500)}).catch(function(){prompt(\'Copia el enlace:\',' + _html.escape(json.dumps(connect_url)) + ')})}'
+        'function copyLink(){navigator.clipboard.writeText(' + _js_json(connect_url) + ').then(function(){var b=document.getElementById(\'copyLink\');b.textContent=\'Copiado ✓\';setTimeout(function(){b.textContent=\'Copiar link de conexión\'},1500)}).catch(function(){prompt(\'Copia el enlace:\',' + _js_json(connect_url) + ')})}'
         '</script>'
     )
     return HTMLResponse(_login_render_page("Mi panel", None, body, extra_head=extra_head))
