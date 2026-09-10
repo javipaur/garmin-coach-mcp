@@ -10538,53 +10538,74 @@ def update_user_profile(
 # === TRAINING PLAN IMPORT TOOLS ===
 
 def _garmin_workout_step_from_desc(step: dict[str, Any], step_order: int) -> dict[str, Any]:
-    """Convierte un paso normalizado al formato JSON de workout de Garmin."""
+    """Convierte un paso normalizado al formato JSON de workout actual de Garmin.
+
+    Produce pasos del tipo ExecutableStepDTO con endCondition/endConditionValue y
+    targetType, agrupables dentro de workoutSegments.
+    """
     step_type = step.get("type", "active").lower()
     intensity_map = {
         "warmup": "warmup", "calentamiento": "warmup",
-        "active": "active", "interval": "interval", "intervalo": "interval",
-        "rest": "rest", "recovery": "recovery", "recuperación": "recovery", "recuperacion": "recovery",
+        "active": "interval", "interval": "interval", "intervalo": "interval",
+        "rest": "recovery", "recovery": "recovery", "recuperación": "recovery", "recuperacion": "recovery",
         "cooldown": "cooldown", "vuelta a la calma": "cooldown",
     }
-    intensity = intensity_map.get(step_type, "active")
+    intensity = intensity_map.get(step_type, "interval")
 
+    # stepTypeId y displayOrder coinciden con los enums de Garmin.
+    step_type_id = {"warmup": 1, "cooldown": 2, "interval": 3, "recovery": 4, "repeat": 6}.get(intensity, 3)
+
+    duration_value: float | None = None
     duration_type = "time"
-    duration_value = 0
     if "duration_sec" in step and step["duration_sec"]:
-        duration_type = "time"
-        duration_value = int(step["duration_sec"])
+        duration_value = float(step["duration_sec"])
     elif "duration_min" in step and step["duration_min"]:
-        duration_type = "time"
-        duration_value = int(step["duration_min"]) * 60
+        duration_value = float(step["duration_min"]) * 60
     elif "distance_m" in step and step["distance_m"]:
         duration_type = "distance"
-        duration_value = int(step["distance_m"])
+        duration_value = float(step["distance_m"])
     elif "distance_km" in step and step["distance_km"]:
         duration_type = "distance"
-        duration_value = int(float(step["distance_km"]) * 1000)
-
-    target_type = "open"
-    target_value = 0
-    if "target_hr_zone" in step and step["target_hr_zone"]:
-        target_type = "heart_rate"
-        target_value = int(step["target_hr_zone"])
-    elif "target_pace_mps" in step and step["target_pace_mps"]:
-        target_type = "speed"
-        target_value = float(step["target_pace_mps"])
+        duration_value = float(step["distance_km"]) * 1000
 
     result: dict[str, Any] = {
-        "stepName": step.get("name", step_type.capitalize()),
-        "stepType": {"typeId": {"warmup": 3, "cooldown": 4, "rest": 1, "recovery": 5, "interval": 6, "active": 0}.get(intensity, 0), "typeKey": intensity},
-        "durationType": {"typeId": {"time": 0, "distance": 1}.get(duration_type, 0), "typeKey": duration_type},
-        "durationValue": duration_value,
+        "type": "ExecutableStepDTO",
+        "stepOrder": step_order,
+        "stepType": {"stepTypeId": step_type_id, "stepTypeKey": intensity, "displayOrder": step_type_id},
     }
-    if target_type != "open":
-        result["targetType"] = {"typeId": {"heart_rate": 1, "speed": 0}.get(target_type, 2), "typeKey": target_type}
-        result["targetValue"] = target_value
-        if target_type == "heart_rate":
-            result["targetHRZone"] = target_value
-    if step_order is not None:
-        result["stepOrder"] = step_order
+
+    if duration_value is not None:
+        result["endCondition"] = {
+            "conditionTypeId": 2 if duration_type == "time" else 1,
+            "conditionTypeKey": duration_type,
+            "displayOrder": 2 if duration_type == "time" else 1,
+            "displayable": True,
+        }
+        result["endConditionValue"] = duration_value
+
+    hr_zone = step.get("target_hr_zone")
+    target_pace = step.get("target_pace_mps")
+    if hr_zone:
+        result["targetType"] = {
+            "workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone", "displayOrder": 3,
+        }
+        result["targetValueOne"] = 0.0
+        result["targetValueTwo"] = 0.0
+        result["zoneNumber"] = int(hr_zone)
+    elif target_pace:
+        result["targetType"] = {
+            "workoutTargetTypeId": 5, "workoutTargetTypeKey": "speed.zone", "displayOrder": 4,
+        }
+        result["targetValueOne"] = float(target_pace)
+        result["targetValueTwo"] = 0.0
+    else:
+        result["targetType"] = {
+            "workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1,
+        }
+        result["targetValueTwo"] = 0.0
+
+    if step.get("name"):
+        result["stepName"] = str(step["name"])
     return result
 
 
@@ -10961,20 +10982,32 @@ def create_workout_from_description(
         raise RuntimeError("No pude parsear la descripción del entrenamiento")
 
     workout_steps = []
+    total_seconds = 0.0
     for i, s in enumerate(steps):
-        workout_steps.append(_garmin_workout_step_from_desc(s, i + 1))
+        gs = _garmin_workout_step_from_desc(s, i + 1)
+        workout_steps.append(gs)
+        if gs.get("endConditionValue") is not None and gs.get("endCondition", {}).get("conditionTypeKey") == "time":
+            total_seconds += float(gs["endConditionValue"])
 
     sport_type_id_map = {
-        "running": 1, "cycling": 2, "swimming": 4,
-        "strength_training": 5, "cardio": 6, "walking": 17, "hiking": 18,
+        "running": 1, "cycling": 2, "swimming": 3, "walking": 4,
+        "strength_training": 6, "cardio": 6, "hiking": 7, "multi_sport": 5,
     }
     sport_key = sport.lower().replace(" ", "_")
     sport_type_id = sport_type_id_map.get(sport_key, 1)
+    sport_type = {"sportTypeId": sport_type_id, "sportTypeKey": sport_key, "displayOrder": 1}
 
     workout_json = {
         "workoutName": name,
-        "sport": {"typeId": sport_type_id, "typeKey": sport_key},
-        "workoutSteps": workout_steps,
+        "sportType": sport_type,
+        "estimatedDurationInSecs": int(total_seconds) or 3600,
+        "workoutSegments": [
+            {
+                "segmentOrder": 1,
+                "sportType": sport_type,
+                "workoutSteps": workout_steps,
+            }
+        ],
     }
 
     with FETCH_LOCK:
