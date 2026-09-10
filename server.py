@@ -1732,6 +1732,12 @@ def _render_dashboard(request: "Request") -> str:
     public_url = _public_base_url(request)
     mcp_url = f"{public_url}/mcp"
 
+    # Si el usuario está autenticado, la URL del conector incluye su API key como
+    # query param para que pueda copiarla y pegarla tal cual (sin cabeceras).
+    _panel_user = _get_auth_user()
+    if _panel_user and _panel_user.get("api_key"):
+        mcp_url = f"{public_url}/mcp?api_key={_panel_user['api_key']}"
+
     # ------ Status rows ------
     rows = _render_status_rows(s)
 
@@ -2110,15 +2116,15 @@ async def connect_wizard(request: Request) -> Response:
         '<ol class="steps">\n'
         '<li>Abre <a href="https://claude.ai" style="color:#60a5fa">claude.ai</a> &gt; Settings &gt; Connectors</li>\n'
         '<li>Click "Add custom connector"</li>\n'
-        '<li>URL del servidor:</li>\n</ol>\n'
-        '<div class="api-key-box"><code>' + base_url + '/mcp</code>\n'
+        '<li>Pegar URL (incluye tu API key, no hace falta configurar cabeceras):</li>\n</ol>\n'
+        '<div class="api-key-box"><code>' + base_url + '/mcp?api_key=' + api_key + '</code>\n'
         '<button class="btn btn-sm" onclick="copyText(this.previousElementSibling, this)">Copiar URL</button></div>\n'
-        '<p style="margin-top:12px">Headers: <code>X-User-API-Key</code> = tu API key</p>\n'
+        '<p style="margin-top:12px;color:#888;font-size:12px">La API key viaja en la URL, así que No necesitas añadir la cabecera X-User-API-Key manualmente.</p>\n'
         '<p style="color:#888;font-size:12px;margin-top:4px">Una vez configurado, funciona en Desktop, web y movil.</p>\n'
         '</div>\n'
 
         '<h2>3. Claude Code CLI</h2>\n<div class="card">\n'
-        '<pre>claude mcp add --transport http garmin-coach ' + base_url + '/mcp --header "X-User-API-Key: TU_API_KEY"</pre>\n'
+        '<pre>claude mcp add --transport http garmin-coach "' + base_url + '/mcp?api_key=' + api_key + '"</pre>\n'
         '<button class="btn" onclick="copyEl(this.previousElementSibling, this)">Copiar comando</button>\n'
         '</div>\n'
 
