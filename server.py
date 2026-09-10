@@ -8973,8 +8973,8 @@ def get_activities_paged(limit: int = 100, offset: int = 0) -> dict:
 @mcp.tool
 def get_activities_in_range(
     start_date: str,
-    end_date: str = None,
-    activity_type: str = None,
+    end_date: str | None = None,
+    activity_type: str | None = None,
 ) -> dict:
     """Actividades entre dos fechas (formato YYYY-MM-DD).
     activity_type es opcional: running, strength_training, cycling, etc.
@@ -9075,7 +9075,7 @@ def get_daily_wellness(target_date: str) -> dict:
 @mcp.tool
 def get_wellness_range(
     start_date: str,
-    end_date: str = None,
+    end_date: str | None = None,
 ) -> dict:
     """Resumen wellness diario compacto para un rango de fechas.
     Incluye pasos, distancia, calorías, FC en reposo, estrés, Body Battery, sueño y VFC.
@@ -9132,8 +9132,8 @@ def get_wellness_range(
 
 @mcp.tool
 def get_race_predictions(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Predicciones de tiempo de carrera de Garmin para 5K, 10K, media maratón y maratón.
     Sin fechas devuelve las predicciones actuales.
@@ -9171,7 +9171,7 @@ def get_personal_records() -> dict:
 
 
 @mcp.tool
-def get_fitness_age(target_date: str = None) -> dict:
+def get_fitness_age(target_date: str | None = None) -> dict:
     """Edad física (Fitness Age) calculada por Garmin.
     Compara tu condición física con tu edad cronológica.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9192,8 +9192,8 @@ def get_fitness_age(target_date: str = None) -> dict:
 
 @mcp.tool
 def get_endurance_score(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Puntuación de resistencia aeróbica (Endurance Score) de Garmin.
     Rango de fechas para ver la evolución. Sin fechas usa los últimos 28 días.
@@ -9216,8 +9216,8 @@ def get_endurance_score(
 
 @mcp.tool
 def get_hill_score(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Puntuación de rendimiento en montaña/desnivel (Hill Score) de Garmin.
     Evalúa tu capacidad en subidas. Sin fechas usa los últimos 28 días.
@@ -9310,8 +9310,8 @@ def get_activity_evaluation(activity_id: str) -> dict:
 
 @mcp.tool
 def get_weigh_ins(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Historial de pesajes registrados en Garmin Connect.
     Sin fechas devuelve los últimos 30 días. Formato: YYYY-MM-DD.
@@ -9334,7 +9334,7 @@ def get_weigh_ins(
 @mcp.tool
 def add_weigh_in(
     weight_kg: float,
-    target_date: str = None,
+    target_date: str | None = None,
 ) -> dict:
     """Registra un nuevo pesaje en Garmin Connect.
     weight_kg: peso en kilogramos (puede ser decimal, ej: 75.5).
@@ -9468,7 +9468,7 @@ def get_activity_types() -> dict:
 
 
 @mcp.tool
-def get_all_day_stress(target_date: str = None) -> dict:
+def get_all_day_stress(target_date: str | None = None) -> dict:
     """Curva de estrés minuto a minuto durante todo el día.
     Permite ver picos y valles de estrés a lo largo del día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9483,7 +9483,7 @@ def get_all_day_stress(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_steps_data(target_date: str = None) -> dict:
+def get_steps_data(target_date: str | None = None) -> dict:
     """Serie temporal de pasos a lo largo del día (intervalos de 15 min).
     Permite ver la distribución de actividad durante el día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9499,8 +9499,8 @@ def get_steps_data(target_date: str = None) -> dict:
 
 @mcp.tool
 def get_daily_steps(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Pasos diarios totales en un rango de fechas.
     Sin fechas usa los últimos 7 días. Formato: YYYY-MM-DD.
@@ -9518,7 +9518,7 @@ def get_daily_steps(
 
 
 @mcp.tool
-def get_floors(target_date: str = None) -> dict:
+def get_floors(target_date: str | None = None) -> dict:
     """Pisos subidos y bajados durante el día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -9533,8 +9533,8 @@ def get_floors(target_date: str = None) -> dict:
 
 @mcp.tool
 def get_blood_pressure(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Registros de presión arterial en un rango de fechas.
     Solo disponible si el dispositivo o la app registra tensión arterial.
@@ -9555,7 +9555,7 @@ def get_blood_pressure(
 
 
 @mcp.tool
-def get_stats_and_body(target_date: str = None) -> dict:
+def get_stats_and_body(target_date: str | None = None) -> dict:
     """Resumen combinado de actividad diaria y composición corporal.
     Combina pasos, calorías, distancia y peso en una sola llamada.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9571,8 +9571,8 @@ def get_stats_and_body(target_date: str = None) -> dict:
 
 @mcp.tool
 def get_progress_summary(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     metric: str = "distance",
 ) -> dict:
     """Progresión de una métrica entre dos fechas.
@@ -9701,7 +9701,7 @@ def get_gear_defaults() -> dict:
 
 
 @mcp.tool
-def get_daily_weigh_ins(target_date: str = None) -> dict:
+def get_daily_weigh_ins(target_date: str | None = None) -> dict:
     """Todos los pesajes registrados en un día concreto.
     Útil cuando hay varios registros en el mismo día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9817,7 +9817,7 @@ def set_gear_default(activity_type: str, gear_uuid: str, is_default: bool = True
 
 
 @mcp.tool
-def get_spo2_data(target_date: str = None) -> dict:
+def get_spo2_data(target_date: str | None = None) -> dict:
     """Datos de oximetría de pulso (SpO2) del día.
     Muestra el nivel de saturación de oxígeno en sangre registrado por el sensor del reloj.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9832,7 +9832,7 @@ def get_spo2_data(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_respiration_data(target_date: str = None) -> dict:
+def get_respiration_data(target_date: str | None = None) -> dict:
     """Frecuencia respiratoria registrada durante el día y el sueño.
     Útil para detectar tendencias de recuperación y estado de forma aeróbica.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9847,7 +9847,7 @@ def get_respiration_data(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_hydration_data(target_date: str = None) -> dict:
+def get_hydration_data(target_date: str | None = None) -> dict:
     """Registro de hidratación del día (vasos de agua u oz registrados manualmente).
     Muestra el objetivo diario y el progreso hasta ese momento.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -9863,8 +9863,8 @@ def get_hydration_data(target_date: str = None) -> dict:
 
 @mcp.tool
 def get_body_composition(
-    start_date: str = None,
-    end_date: str = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Composición corporal en un rango de fechas: peso, IMC y porcentaje de grasa.
     Sin fechas devuelve los últimos 30 días. Formato: YYYY-MM-DD.
@@ -9886,7 +9886,7 @@ def get_body_composition(
 # === WORKOUT & CALENDAR TOOLS ===
 
 @mcp.tool
-def get_scheduled_workouts(year: int = None, month: int = None) -> dict:
+def get_scheduled_workouts(year: int | None = None, month: int | None = None) -> dict:
     """Entrenamientos planificados en el calendario de Garmin Connect para un mes.
     Por defecto usa el mes actual. month: 1-12 (enero=1).
     Incluye el deporte, nombre, fecha y ID para obtener el detalle completo.
@@ -10148,7 +10148,7 @@ def push_workout_to_device(workout_id: str) -> dict:
 
 
 @mcp.tool
-def get_nutrition_log(target_date: str = None) -> dict:
+def get_nutrition_log(target_date: str | None = None) -> dict:
     """Registro de alimentación del día: alimentos, macronutrientes y calorías.
     Requiere que el usuario registre alimentos en Garmin Connect o la app.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -10275,7 +10275,7 @@ def get_device_settings(device_id: str) -> dict:
 
 
 @mcp.tool
-def get_max_metrics(target_date: str = None) -> dict:
+def get_max_metrics(target_date: str | None = None) -> dict:
     """Métricas máximas: VO2max, umbral de lactato, capacidad anaeróbica, potencia máxima.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10289,7 +10289,7 @@ def get_max_metrics(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_body_battery(target_date: str = None) -> dict:
+def get_body_battery(target_date: str | None = None) -> dict:
     """Serie temporal del Body Battery a lo largo de un día concreto.
     Devuelve los valores horarios, no solo el resumen.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -10304,7 +10304,7 @@ def get_body_battery(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_heart_rates(target_date: str = None) -> dict:
+def get_heart_rates(target_date: str | None = None) -> dict:
     """Serie temporal de frecuencia cardíaca durante un día (lecturas cada ~2 min).
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10318,7 +10318,7 @@ def get_heart_rates(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_sleep_data(target_date: str = None) -> dict:
+def get_sleep_data(target_date: str | None = None) -> dict:
     """Datos completos de sueño: fases, duración, puntuación, respiración nocturna, SpO2.
     Formato fecha: YYYY-MM-DD de la noche (por defecto ayer).
     """
@@ -10332,7 +10332,7 @@ def get_sleep_data(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_hrv_data(target_date: str = None) -> dict:
+def get_hrv_data(target_date: str | None = None) -> dict:
     """Datos detallados de VFC (variabilidad de FC): valores nocturnos, estado, baseline, últimas 5 noches.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10346,7 +10346,7 @@ def get_hrv_data(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_training_status(target_date: str = None) -> dict:
+def get_training_status(target_date: str | None = None) -> dict:
     """Estado de entrenamiento detallado: carga aguda, carga crónica, estado actual y VO2max.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10360,7 +10360,7 @@ def get_training_status(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_training_readiness(target_date: str = None) -> dict:
+def get_training_readiness(target_date: str | None = None) -> dict:
     """Predisposición para entrenar detallada: puntuación, factores, recomendación de carga.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10374,7 +10374,7 @@ def get_training_readiness(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_rhr_day(target_date: str = None) -> dict:
+def get_rhr_day(target_date: str | None = None) -> dict:
     """FC en reposo medida un día concreto.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10388,7 +10388,7 @@ def get_rhr_day(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_stress_data(target_date: str = None) -> dict:
+def get_stress_data(target_date: str | None = None) -> dict:
     """Serie temporal del nivel de estrés durante el día (0-100, lectura cada ~3 min).
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10402,7 +10402,7 @@ def get_stress_data(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_user_summary(target_date: str = None) -> dict:
+def get_user_summary(target_date: str | None = None) -> dict:
     """Resumen diario del usuario: pasos, calorías, distancia total, minutos intensidad, pisos.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -10416,7 +10416,7 @@ def get_user_summary(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def get_stats(target_date: str = None) -> dict:
+def get_stats(target_date: str | None = None) -> dict:
     """Estadísticas diarias crudas: pasos, calorías activas y en reposo, minutos intensidad, pisos.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
@@ -11643,7 +11643,7 @@ def get_sync_status() -> dict:
 
 
 @mcp.tool
-def calculate_training_load(target_date: str = None) -> dict:
+def calculate_training_load(target_date: str | None = None) -> dict:
     """Carga de entrenamiento: carga aguda (últimos 7 días), crónica y balance, más estado actual y VO2max.
     Reutiliza los datos de estado de entrenamiento de Garmin.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
@@ -11702,7 +11702,7 @@ def calculate_training_load(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def detect_fatigue_risk(target_date: str = None) -> dict:
+def detect_fatigue_risk(target_date: str | None = None) -> dict:
     """Analiza si el usuario está listo para entrenar fuerte o debería descansar.
     Combina HRV (VFC), preparación para entrenar y calidad del sueño.
     Formato fecha: YYYY-MM-DD (por defecto hoy). Devuelve un veredicto y recomendación en texto.
@@ -11792,7 +11792,7 @@ def detect_fatigue_risk(target_date: str = None) -> dict:
 
 
 @mcp.tool
-def summarize_period(start_date: str, end_date: str = None) -> dict:
+def summarize_period(start_date: str, end_date: str | None = None) -> dict:
     """Resumen de entrenamiento de un rango de fechas: sesiones, distancia, horas, subida y carga.
     Útil para informes semanales o mensuales.
     Formato fechas: YYYY-MM-DD. Si no se da end_date, usa un solo día.
@@ -11869,7 +11869,7 @@ def summarize_period(start_date: str, end_date: str = None) -> dict:
 
 
 @mcp.tool
-def calculate_pace_zones(target_date: str = None) -> dict:
+def calculate_pace_zones(target_date: str | None = None) -> dict:
     """Zonas de ritmo personalizadas para entrenamiento, según el VO2max y umbral del usuario.
     Formato fecha: YYYY-MM-DD (por defecto hoy). Devuelve zonas de 1 a 5 y el ritmo de umbral (km/min).
     """
@@ -11927,7 +11927,7 @@ def calculate_pace_zones(target_date: str = None) -> dict:
 
 @mcp.tool
 def plan_this_week(
-    target_weekly_km: float = None,
+    target_weekly_km: float | None = None,
     sessions_per_week: int = 4,
     auto_push_to_device: bool = False,
 ) -> dict:
@@ -12015,7 +12015,7 @@ def plan_this_week(
 
 
 @mcp.tool
-def get_todays_schedule(plan_start_date: str = None) -> dict:
+def get_todays_schedule(plan_start_date: str | None = None) -> dict:
     """Qu\u00e9 deber\u00edas entrenar hoy: combina el workout programado, tu carga reciente y preparaci\u00f3n.
     Devuelve una recomendaci\u00f3n accionable.
     """
