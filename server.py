@@ -3663,12 +3663,38 @@ def get_primary_device_info(target_date: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool
-def get_recent_activities(limit: int = 100) -> list[dict[str, Any]]:
+def get_recent_activities(limit: int = 100, days: int | None = None) -> list[dict[str, Any]]:
     """Actividades recientes normalizadas. Por defecto hasta 100.
     Usa limit=-1 para obtener TODAS las actividades (historico completo desde 2016).
+    Usa days=N para filtrar solo actividades de los últimos N días.
+    Si se especifica days, limit actúa como máximo de resultados por día.
     Advertencia: obtener todo puede tardar varios minutos."""
     if limit < 0:
         limit = 9999
+
+    if days is not None and days > 0:
+        # Fetch more to cover the date range, then filter
+        fetch_limit = max(limit * days, 200)
+        fetch_limit = min(fetch_limit, 9999)
+        with FETCH_LOCK:
+            api = _get_api()
+            activities, err = _optional_call_first(api, ("get_activities",), 0, fetch_limit)
+            if activities is None:
+                raise RuntimeError(err or "No pude leer las actividades recientes")
+            cutoff = _today_local() - timedelta(days=days)
+            filtered = []
+            for a in activities:
+                if not isinstance(a, dict):
+                    continue
+                start = a.get("startTimeLocal") or a.get("startTimeGMT") or ""
+                try:
+                    act_date = datetime.fromisoformat(start.replace("Z", "+00:00")).date()
+                    if act_date >= cutoff:
+                        filtered.append(a)
+                except Exception:
+                    filtered.append(a)  # keep if we can't parse
+            return [_normalize_activity(a) for a in filtered[:limit]]
+
     limit = max(1, min(200, int(limit)))
     with FETCH_LOCK:
         api = _get_api()
@@ -9918,6 +9944,80 @@ def get_todays_workout() -> dict:
 
 
 @mcp.tool
+def get_workout_for_date(target_date: str) -> dict:
+    """Obtiene el entrenamiento planificado para una fecha concreta, incluyendo el detalle completo (pasos, series, zonas).
+    target_date: fecha en formato YYYY-MM-DD.
+    Devuelve el entrenamiento del calendario Y su definición completa si existe un workout asociado.
+    """
+    parsed = _parse_date(target_date)
+    target = date.fromisoformat(parsed)
+
+    with FETCH_LOCK:
+        api = _get_api()
+        try:
+            if hasattr(api, "get_workouts_calendar"):
+                data = api.get_workouts_calendar(target.year, target.month)
+            else:
+                data = api.connectapi(f"/calendar-service/year/{target.year}/month/{target.month - 1}")
+        except Exception as e:
+            raise RuntimeError(f"No se pudo obtener el calendario para {parsed}: {e}")
+
+    items = data if isinstance(data, list) else (data.get("calendarItems") or data.get("items") or [])
+    target_iso = target.isoformat()
+    matching = [i for i in items if isinstance(i, dict) and str(i.get("date", "")).startswith(target_iso)]
+
+    workout_detail = None
+    workout_id = None
+    for item in matching:
+        wid = item.get("workoutId") or item.get("scheduledWorkoutId") or item.get("id")
+        if wid:
+            workout_id = str(wid)
+            try:
+                if hasattr(api, "get_workout_by_id"):
+                    workout_detail = api.get_workout_by_id(workout_id)
+                else:
+                    workout_detail = api.connectapi(f"/workout-service/workout/{workout_id}")
+            except Exception:
+                pass
+            break
+
+    steps_summary = None
+    if workout_detail and isinstance(workout_detail, dict):
+        raw_steps = workout_detail.get("workoutSteps") or workout_detail.get("steps") or []
+        if isinstance(raw_steps, list):
+            steps_summary = []
+            for s in raw_steps:
+                if not isinstance(s, dict):
+                    continue
+                step_type = s.get("stepType") or s.get("type") or s.get("stepTypeId") or ""
+                step_name = s.get("stepName") or s.get("name") or ""
+                duration = s.get("duration") or s.get("durationType") or ""
+                target_val = s.get("targetValue") or s.get("target") or ""
+                target_type = s.get("targetType") or s.get("targetValueUnit") or ""
+                distance = s.get("distance") or ""
+                hr_zone = s.get("heartRateZone") or s.get("targetHRZone") or ""
+                steps_summary.append({
+                    "type": _translate_garmin(step_type) if isinstance(step_type, str) else step_type,
+                    "name": step_name,
+                    "duration": duration,
+                    "distance": distance,
+                    "target": target_val,
+                    "target_type": target_type,
+                    "hr_zone": hr_zone,
+                })
+
+    return {
+        "date": parsed,
+        "calendar_items": matching,
+        "has_workout": any(i.get("itemType", "").lower() in ("workout", "garmincoach") for i in matching),
+        "workout_id": workout_id,
+        "workout_detail": workout_detail,
+        "steps_summary": steps_summary,
+        "calendar_raw": data,
+    }
+
+
+@mcp.tool
 def get_workout_library(start: int = 0, limit: int = 20) -> dict:
     """Biblioteca de entrenamientos guardados en Garmin Connect.
     Devuelve nombre, deporte e ID de cada entrenamiento guardado.
@@ -10025,6 +10125,26 @@ def unschedule_workout(schedule_id: str) -> dict:
         except Exception as e:
             raise RuntimeError(f"No se pudo eliminar el workout planificado {schedule_id}: {e}")
     return {"ok": True, "schedule_id": schedule_id, "response": data}
+
+
+@mcp.tool
+def push_workout_to_device(workout_id: str) -> dict:
+    """Envía un entrenamiento de la biblioteca al reloj Garmin conectado.
+    workout_id: ID del entrenamiento (obtenible con get_workout_library o get_workout_for_date).
+    El reloj debe estar emparejado y encendido para recibir el entrenamiento.
+    """
+    with FETCH_LOCK:
+        api = _get_api()
+        try:
+            result = api.push_workout_to_device(workout_id)
+        except AttributeError:
+            try:
+                result = api.garth.post("connectapi", f"/workout-service/workout/{workout_id}/push", json={})
+            except Exception as e:
+                raise RuntimeError(f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}")
+        except Exception as e:
+            raise RuntimeError(f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}")
+    return {"ok": True, "workout_id": workout_id, "pushed": True, "response": result}
 
 
 @mcp.tool
