@@ -9841,9 +9841,41 @@ def set_gear_default(activity_type: str, gear_uuid: str, is_default: bool = True
     gear_uuid: UUID del material (obtenible con get_gear).
     is_default: True para asignar como predeterminado, False para quitar esa asignación.
     """
+    user = _get_auth_user()
+    if not user:
+        raise RuntimeError("No autenticado")
+
     with FETCH_LOCK:
-        api = _get_api()
-        data, err = _optional_call_first(api, ("set_gear_default",), activity_type, gear_uuid, is_default)
+        api = _get_api(user["id"])
+        profile, _ = _optional_call_first(api, ("get_user_profile",))
+        profile_number = None
+        if isinstance(profile, dict):
+            profile_number = (
+                (profile.get("userData") or {}).get("profileNumber")
+                or (profile.get("userData") or {}).get("id")
+                or profile.get("profileNumber")
+                or profile.get("id")
+            )
+
+        default_suffix = "/default/true" if is_default else ""
+        method = "PUT" if is_default else "DELETE"
+        url = (
+            f"{api.garmin_connect_gear_baseurl}/{gear_uuid}/"
+            f"activityType/{activity_type}{default_suffix}"
+        )
+        try:
+            data = api.client.request(
+                method,
+                "connectapi",
+                url,
+                api=True,
+                params={"userProfilePK": profile_number} if profile_number else None,
+            )
+            err = None
+        except Exception as exc:
+            data = None
+            err = str(exc)
+
     if data is None and err:
         raise RuntimeError(err)
     return {"ok": True, "activity_type": activity_type, "gear_uuid": gear_uuid, "is_default": is_default, "response": data}
@@ -11336,11 +11368,21 @@ def predict_race_distance(distance_km: float) -> dict[str, Any]:
     with FETCH_LOCK:
         api = _get_api(user["id"])
         max_metrics, _ = _optional_call_first(api, ("get_max_metrics",), _today_local().isoformat())
+        ts, _ = _optional_call_first(api, ("get_training_status",), _today_local().isoformat())
         activities, _ = _optional_call_first(api, ("get_activities",), 0, 20)
 
     vo2max = None
     if isinstance(max_metrics, dict):
         vo2max = max_metrics.get("vo2MaxValue") or max_metrics.get("vo2max")
+    if not vo2max and isinstance(ts, dict):
+        dash = ts.get("mostRecentVO2Max") or {}
+        if isinstance(dash, dict):
+            generic = dash.get("generic") or {}
+            vo2max = (
+                generic.get("vo2MaxPreciseValue")
+                or generic.get("vo2MaxValue")
+                or dash.get("vo2MaxValue")
+            )
 
     recent_runs = []
     if isinstance(activities, list):
