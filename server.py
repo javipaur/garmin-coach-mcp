@@ -11978,8 +11978,17 @@ def calculate_pace_zones(target_date: str | None = None) -> dict:
 
     try:
         if isinstance(ts, dict):
-            dash = ts.get("mostRecentTrainingStatus", {}).get("dashboardTrainingStatusData", {}) or {}
-            vo2 = dash.get("lastRunning", {}).get("vo2Max", {}).get("value") or dash.get("lastRunning", {}).get("vo2Max")
+            dash = ts.get("mostRecentVO2Max") or {}
+            if isinstance(dash, dict):
+                generic = dash.get("generic") or {}
+                vo2 = (
+                    generic.get("vo2MaxPreciseValue")
+                    or generic.get("vo2MaxValue")
+                    or dash.get("vo2MaxValue")
+                )
+            if not vo2:
+                status = ts.get("mostRecentTrainingStatus", {}).get("dashboardTrainingStatusData", {}) or {}
+                vo2 = status.get("lastRunning", {}).get("vo2Max", {}).get("value")
     except Exception:
         pass
 
@@ -12388,9 +12397,6 @@ def generate_periodized_plan(
 
 # === MULTI-USER & COACHING TOOLS END ===
 
-if __name__ == "__main__":
-    _run_server()
-
 
 # === FRONTEND GARMIN CONNECT ES OUTPUT PATCH START ===
 _FRONTEND_EXTRA_ES_INSTRUCTIONS = (
@@ -12619,3 +12625,7 @@ try:
 except Exception:
     pass
 # === STRICT GARMIN CONNECT ES TERMINOLOGY PATCH END ===
+
+
+if __name__ == "__main__":
+    _run_server()
