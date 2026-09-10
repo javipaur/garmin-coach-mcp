@@ -10157,13 +10157,19 @@ def push_workout_to_device(workout_id: str) -> dict:
     """
     with FETCH_LOCK:
         api = _get_api()
-        try:
-            result = api.push_workout_to_device(workout_id)
-        except AttributeError:
+        push_path = f"/workout-service/workout/{workout_id}/push"
+
+        def _push() -> Any:
+            if hasattr(api, "push_workout_to_device"):
+                return api.push_workout_to_device(workout_id)
+            resp = api.client.post("connectapi", push_path, json={}, api=True)
             try:
-                result = api.garth.post("connectapi", f"/workout-service/workout/{workout_id}/push", json={})
-            except Exception as e:
-                raise RuntimeError(f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}")
+                return resp.json()
+            except Exception:
+                return {"pushed": True}
+
+        try:
+            result = _push()
         except Exception as e:
             raise RuntimeError(f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}")
     return {"ok": True, "workout_id": workout_id, "pushed": True, "response": result}
