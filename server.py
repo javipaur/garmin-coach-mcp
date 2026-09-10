@@ -487,11 +487,15 @@ mcp = FastMCP(
 if GARMIN_LANGUAGE.startswith("es"):
     _orig_mcp_tool = mcp.tool
 
-    def _translating_tool(fn):
-        @functools.wraps(fn)
-        def _wrapped(*args, **kwargs):
-            return _translate_garmin(fn(*args, **kwargs))
-        return _orig_mcp_tool(_wrapped)
+    def _translating_tool(fn=None, **tool_kwargs):
+        def _decorator(f):
+            @functools.wraps(f)
+            def _wrapped(*args, **kwargs):
+                return _translate_garmin(f(*args, **kwargs))
+            return _orig_mcp_tool(_wrapped, **tool_kwargs)
+        if fn is not None:
+            return _decorator(fn)
+        return _decorator
 
     mcp.tool = _translating_tool
 
