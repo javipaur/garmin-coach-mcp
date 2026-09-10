@@ -10437,7 +10437,7 @@ def list_users() -> dict[str, Any]:
     """Lista todos los usuarios registrados. Solo el admin puede usar esta función."""
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
     db = _load_users_db()
     users_list = []
     for uid, u in db.get("users", {}).items():
@@ -10455,7 +10455,7 @@ def create_user(display_name: str, garmin_email: str = "") -> dict[str, Any]:
     """Crea un nuevo usuario con su API key. Devuelve la API key para que el usuario la guarde."""
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
     new_user = _create_user(display_name, garmin_email)
     return {
         "ok": True,
@@ -10471,7 +10471,7 @@ def delete_user(user_id: str) -> dict[str, Any]:
     """Elimina un usuario y todos sus datos."""
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
     ok = _delete_user(user_id)
     return {"ok": ok, "deleted": user_id}
 
@@ -10481,7 +10481,7 @@ def get_user_profile() -> dict[str, Any]:
     """Devuelve el perfil del usuario actual."""
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
     return {
         "id": user.get("id"),
         "display_name": user.get("display_name", ""),
@@ -10503,7 +10503,7 @@ def update_user_profile(
     """Actualiza el perfil del usuario actual. Solo actualiza los campos que se proporcionen."""
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
     fields = {}
     if display_name is not None:
         fields["display_name"] = display_name
@@ -10592,17 +10592,17 @@ def extract_pdf_text(
         import base64 as _b64
         import pypdf
     except ImportError:
-        return {"error": "La librería pypdf no está instalada en el servidor."}
+        raise RuntimeError("La librería pypdf no está instalada en el servidor.")
 
     try:
         raw = _b64.b64decode(pdf_base64, validate=True)
     except Exception as exc:
-        return {"error": f"El base64 del PDF no es válido: {exc}"}
+        raise RuntimeError(f"El base64 del PDF no es válido: {exc}")
 
     try:
         reader = pypdf.PdfReader(io.BytesIO(raw))
     except Exception as exc:
-        return {"error": f"No se pudo leer el PDF: {exc}"}
+        raise RuntimeError(f"No se pudo leer el PDF: {exc}")
 
     pages = []
     full_text = []
@@ -10657,7 +10657,7 @@ def parse_training_pdf(
         )
         return result
     except Exception as exc:
-        return {"error": f"Error procesando el PDF: {exc}"}
+        raise RuntimeError(f"Error procesando el PDF: {exc}")
 
 
 def _import_plan_from_pdf_internal(
@@ -10928,7 +10928,7 @@ def create_workout_from_description(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     steps = []
     desc = description.strip()
@@ -10942,7 +10942,7 @@ def create_workout_from_description(
         steps = _parse_workout_steps_text(desc)
 
     if not steps:
-        return {"error": "No pude parsear la descripción del entrenamiento"}
+        raise RuntimeError("No pude parsear la descripción del entrenamiento")
 
     workout_steps = []
     for i, s in enumerate(steps):
@@ -11022,12 +11022,12 @@ def create_training_plan(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     try:
         base_date = date.fromisoformat(start_date)
     except ValueError:
-        return {"error": f"Fecha inválida: {start_date}. Usa formato YYYY-MM-DD."}
+        raise RuntimeError(f"Fecha inválida: {start_date}. Usa formato YYYY-MM-DD.")
 
     results = []
     errors = []
@@ -11091,12 +11091,12 @@ def import_natural_language_plan(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     try:
         base_date = date.fromisoformat(start_date)
     except ValueError:
-        return {"error": f"Fecha inválida: {start_date}"}
+        raise RuntimeError(f"Fecha inválida: {start_date}")
 
     sessions = []
     lines = [l.strip() for l in plan_text.strip().splitlines() if l.strip()]
@@ -11129,7 +11129,7 @@ def import_natural_language_plan(
             })
 
     if not sessions:
-        return {"error": "No pude parsear el plan de entrenamiento. Asegúrate de usar el formato 'Semana X: Día descripción'."}
+        raise RuntimeError("No pude parsear el plan de entrenamiento. Asegúrate de usar el formato 'Semana X: Día descripción'.")
 
     return create_training_plan(
         plan_name=plan_name,
@@ -11152,7 +11152,7 @@ def check_plan_adherence(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     if not end_date:
         end_date = start_date
@@ -11164,7 +11164,7 @@ def check_plan_adherence(
             end_parts = end_date.split("-")
             scheduled = api.get_scheduled_workouts(start_parts[0], start_parts[1])
         except Exception as e:
-            return {"error": f"Error obteniendo workouts programados: {e}"}
+            raise RuntimeError(f"Error obteniendo workouts programados: {e}")
 
     scheduled_list = []
     if isinstance(scheduled, dict):
@@ -11197,7 +11197,7 @@ def get_weekly_report() -> dict[str, Any]:
     """Genera un informe resumen de la semana actual (lunes-domingo)."""
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     today = _today_local()
     monday = today - timedelta(days=today.weekday())
@@ -11247,7 +11247,7 @@ def predict_race_distance(distance_km: float) -> dict[str, Any]:
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     with FETCH_LOCK:
         api = _get_api(user["id"])
@@ -11425,7 +11425,7 @@ def suggest_routes(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     network_type = "bike" if sport == "cycling" else "walk"
 
@@ -11439,7 +11439,7 @@ def suggest_routes(
             max_results=max_results,
         )
     except Exception as e:
-        return {"error": f"Error generando rutas: {e}"}
+        raise RuntimeError(f"Error generando rutas: {e}")
 
     for i, route in enumerate(routes):
         route["name"] = f"Ruta {i + 1}: {route['distance_km']}km"
@@ -11471,12 +11471,12 @@ def suggest_routes_from_profile(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     home_lat = user.get("home_lat")
     home_lon = user.get("home_lon")
     if not home_lat or not home_lon:
-        return {"error": "No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon."}
+        raise RuntimeError("No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon.")
 
     return suggest_routes(
         distance_km=distance_km,
@@ -11501,7 +11501,7 @@ def export_route_gpx(route_data: dict) -> dict[str, Any]:
 
     points = route_data.get("points", [])
     if not points:
-        return {"error": "La ruta no tiene puntos GPS"}
+        raise RuntimeError("La ruta no tiene puntos GPS")
 
     gpx = gpxpy.gpx.GPX()
     gpx.name = route_data.get("name", "Ruta Garmin Coach")
@@ -11541,11 +11541,11 @@ def upload_route_to_garmin(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     points = route_data.get("points", [])
     if not points:
-        return {"error": "La ruta no tiene puntos GPS"}
+        raise RuntimeError("La ruta no tiene puntos GPS")
 
     try:
         import gpxpy
@@ -11576,7 +11576,7 @@ def upload_route_to_garmin(
 
         return {"ok": True, "result": result, "name": name}
     except Exception as e:
-        return {"error": f"Error subiendo ruta: {e}"}
+        raise RuntimeError(f"Error subiendo ruta: {e}")
 
 
 @mcp.tool
@@ -11586,7 +11586,7 @@ def get_gear_list() -> dict:
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     with FETCH_LOCK:
         api = _get_api(user["id"])
@@ -11596,7 +11596,7 @@ def get_gear_list() -> dict:
         data, err = _optional_call_first(api, ("get_gear",))
 
     if data is None:
-        return {"error": err or "No se pudo obtener el equipo deportivo"}
+        raise RuntimeError(err or "No se pudo obtener el equipo deportivo")
 
     gears = data if isinstance(data, list) else data.get("gearDTOs") or data.get("gear") or []
     items = []
@@ -11621,14 +11621,14 @@ def get_sync_status() -> dict:
     """Estado de la última sincronización del dispositivo Garmin con Garmin Connect."""
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     with FETCH_LOCK:
         api = _get_api(user["id"])
         data, err = _optional_call_first(api, ("get_device_last_used",))
 
     if data is None:
-        return {"error": err or "No se pudo obtener el estado de sincronización"}
+        raise RuntimeError(err or "No se pudo obtener el estado de sincronización")
 
     last_used = data
     if isinstance(last_used, dict):
@@ -11651,14 +11651,14 @@ def calculate_training_load(target_date: str | None = None) -> dict:
     parsed = _parse_date(target_date)
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     with FETCH_LOCK:
         api = _get_api(user["id"])
         data, err = _optional_call_first(api, ("get_training_status",), parsed)
 
     if data is None:
-        return {"error": err or f"No hay estado de entrenamiento para {parsed}."}
+        raise RuntimeError(err or f"No hay estado de entrenamiento para {parsed}.")
 
     def _climb(mapping, *keys):
         node = mapping
@@ -11710,7 +11710,7 @@ def detect_fatigue_risk(target_date: str | None = None) -> dict:
     parsed = _parse_date(target_date)
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     with FETCH_LOCK:
         api = _get_api(user["id"])
@@ -11799,19 +11799,19 @@ def summarize_period(start_date: str, end_date: str | None = None) -> dict:
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     try:
         start = date.fromisoformat(start_date)
     except ValueError:
-        return {"error": f"Fecha inválida: {start_date}"}
+        raise RuntimeError(f"Fecha inválida: {start_date}")
     if not end_date:
         end = start
     else:
         try:
             end = date.fromisoformat(end_date)
         except ValueError:
-            return {"error": f"Fecha inválida: {end_date}"}
+            raise RuntimeError(f"Fecha inválida: {end_date}")
     if end < start:
         start, end = end, start
 
@@ -11826,7 +11826,7 @@ def summarize_period(start_date: str, end_date: str | None = None) -> dict:
         if err and "predisposici" in err.lower():
             activities = []
         else:
-            return {"error": err or "No se pudieron leer las actividades"}
+            raise RuntimeError(err or "No se pudieron leer las actividades")
 
     total_count = 0
     total_distance_km = 0.0
@@ -11876,7 +11876,7 @@ def calculate_pace_zones(target_date: str | None = None) -> dict:
     parsed = _parse_date(target_date)
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     vo2 = None
     with FETCH_LOCK:
@@ -11891,7 +11891,7 @@ def calculate_pace_zones(target_date: str | None = None) -> dict:
         pass
 
     if not vo2:
-        return {"error": "No se pudo obtener el VO2max para calcular las zonas de ritmo."}
+        raise RuntimeError("No se pudo obtener el VO2max para calcular las zonas de ritmo.")
 
     # Estimación del ritmo de umbral (min/km) a partir del VO2max.
     # Relación empírica validada: VDOT 40 -> ~4:25/km, VDOT 50 -> ~3:40/km.
@@ -11936,7 +11936,7 @@ def plan_this_week(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     sessions_per_week = max(2, min(6, int(sessions_per_week)))
     today = date.today()
@@ -12021,7 +12021,7 @@ def get_todays_schedule(plan_start_date: str | None = None) -> dict:
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     today = date.today().isoformat()
 
@@ -12089,7 +12089,7 @@ def list_tools_spanish() -> dict:
     try:
         tools = _list_tools_sync()
     except Exception as exc:
-        return {"error": f"No se pudo listar las herramientas: {exc}"}
+        raise RuntimeError(f"No se pudo listar las herramientas: {exc}")
 
     grouped: dict[str, list[str]] = {}
     for name, doc in tools:
@@ -12167,12 +12167,12 @@ def route_to_poi(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     home_lat = user.get("home_lat")
     home_lon = user.get("home_lon")
     if not home_lat or not home_lon:
-        return {"error": "No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon."}
+        raise RuntimeError("No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon.")
 
     try:
         import requests as _req
@@ -12185,10 +12185,10 @@ def route_to_poi(
         resp.raise_for_status()
         results = resp.json()
     except Exception as e:
-        return {"error": f"No se pudo geocodificar el lugar '{place}': {e}"}
+        raise RuntimeError(f"No se pudo geocodificar el lugar '{place}': {e}")
 
     if not results:
-        return {"error": f"No encontré el lugar '{place}'."}
+        raise RuntimeError(f"No encontré el lugar '{place}'.")
 
     poi_lat = float(results[0]["lat"])
     poi_lon = float(results[0]["lon"])
@@ -12205,7 +12205,7 @@ def route_to_poi(
             max_results=3,
         )
     except Exception as e:
-        return {"error": f"Error generando rutas: {e}"}
+        raise RuntimeError(f"Error generando rutas: {e}")
 
     for i, route in enumerate(routes):
         route["name"] = f"Ruta hacia {poi_name[:30]} ({i + 1})"
@@ -12240,12 +12240,12 @@ def generate_periodized_plan(
     """
     user = _get_auth_user()
     if not user:
-        return {"error": "No autenticado"}
+        raise RuntimeError("No autenticado")
 
     try:
         race_dt = date.fromisoformat(race_date)
     except ValueError:
-        return {"error": f"Fecha inválida: {race_date}"}
+        raise RuntimeError(f"Fecha inválida: {race_date}")
 
     weeks_map = {5: 8, 10: 10, 21.1: 14, 42.2: 18}
     total_weeks = weeks_map.get(race_distance_km, 12)
