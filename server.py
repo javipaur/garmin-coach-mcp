@@ -969,14 +969,16 @@ def _get_api(user_id: str | None = None) -> Garmin:
         if user:
             user_id = user["id"]
     try:
+        retry_attempts = os.environ.get("GARMIN_RETRY_ATTEMPTS")
+        retry_attempts = int(retry_attempts) if retry_attempts else 1
         if user_id:
             token_dir = _user_token_dir(user_id)
             _seed_user_token_file(user_id, token_dir)
-            api = Garmin()
+            api = Garmin(retry_attempts=retry_attempts)
             api.login(str(token_dir))
             return api
         _seed_token_file_if_needed()
-        api = Garmin()
+        api = Garmin(retry_attempts=retry_attempts)
         api.login(str(TOKEN_DIR))
         return api
     except RuntimeError:
@@ -2038,6 +2040,14 @@ async def lock_session(request: Request) -> Response:
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
+    if FETCH_LOCK.locked():
+        return JSONResponse({
+            "status": "busy",
+            "app": APP_NAME,
+            "mcp_endpoint": "/mcp",
+            "busy": True,
+            "detail": "Una operación de Garmin está en curso; el servidor sigue vivo.",
+        })
     with CACHE_LOCK:
         payload = {
             "status": "ok",
@@ -11139,6 +11149,13 @@ def create_training_plan(
     user = _get_auth_user()
     if not user:
         raise RuntimeError("No autenticado")
+
+    MAX_PLAN_SESSIONS = 24
+    if len(sessions) > MAX_PLAN_SESSIONS:
+        raise RuntimeError(
+            f"A un plan se le pueden añadir como máximo {MAX_PLAN_SESSIONS} sesiones por llamada "
+            f"(recibí {len(sessions)}). Crea el plan en tandas de {MAX_PLAN_SESSIONS} sesiones con la misma fecha de inicio."
+        )
 
     try:
         base_date = date.fromisoformat(start_date)
