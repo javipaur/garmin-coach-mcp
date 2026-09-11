@@ -11,6 +11,9 @@ ignore = ["E501"]
 quote-style = "double"
 indent-style = "space"
 
+[tool.ruff.lint.per-file-ignores]
+"server.py" = ["E402", "B904", "SIM105", "F841"]
+
 [tool.mypy]
 python_version = "3.12"
 ignore_missing_imports = true
@@ -21,3 +24,10 @@ check_untyped_defs = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.coverage.run]
+source = ["config.py", "date_utils.py", "localization.py", "recovery.py", "activity.py", "workout.py", "coaching.py", "sleep.py", "auth.py", "snapshot.py", "server.py"]
+
+[tool.coverage.report]
+fail_under = 30
+show_missing = true

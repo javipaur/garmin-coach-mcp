@@ -121,6 +121,9 @@ DATA_DIR=./data PUBLIC_URL=http://localhost:8000 python server.py
 | `/connect?api_key=…` | Asistente para conectar Claude / Cursor / móvil. |
 | `/garmin-connect` | Conexión de la cuenta Garmin del corredor. |
 | `/health` | Healthcheck (200 = vivo). |
+| `/metrics` | Métricas Prometheus (uptime, estado de caché, último refresco). |
+
+> `/mcp` y `/admin` están protegidos con *rate limit* (60 req/min por IP → `429`).
 
 ---
 
@@ -156,9 +159,17 @@ claude mcp add --transport http garmin-coach https://tu-dominio/mcp \
 
 ## 🧩 Herramientas MCP destacadas
 
-`get_daily_summary` · `get_hrv_data` · `detect_fatigue_risk` · `plan_this_week` · `parse_training_pdf` · `calculate_pace_zones` · `summarize_period` · `route_from_home` · `get_race_predictions` · `list_tools_spanish` … y **más de 110** hasta completar el cuaderno.
+`get_daily_summary` · `get_hrv_data` · `detect_fatigue_risk` · `plan_this_week` · `parse_training_pdf` · `calculate_pace_zones` · `summarize_period` · `route_from_home` · `get_race_predictions` · `list_tools_spanish` … y **más de 120** en total.
 
 Pídele al asistente `list_tools_spanish` para ver el catálogo completo en directo.
+
+---
+
+## 📈 Observabilidad
+
+- **Logs estructurados JSON** — el servidor logea en un solo formato (`time`, `level`, `logger`, `message`), fácil de ingestar en Grafana/Loki.
+- **`/metrics`** — exponen métricas Prometheus: uptime, estado de la caché y timestamp del último refresco.
+- **Snapshots pre-calentados** — al arrancar, un hilo en segundo plano refresca la foto del día (con reintentos rápidos si Garmin falla) para que la primera consulta del asistente no sea fría.
 
 ---
 
@@ -180,8 +191,10 @@ index.html           # Landing pública
 Dockerfile           # Imagen (instala GDAL/geos/proj para rutas)
 docker-compose.yml   # Despliegue en Dokploy con volumen /data
 requirements.txt     # Dependencias
-tests/               # Suite pytest
-pyproject.toml       # Config de ruff, mypy y pytest
+tests/               # Suite pytest (+ integración del servidor HTTP/MCP)
+pyproject.toml       # Config de ruff, mypy, pytest y coverage (≥30%)
+.github/workflows/   # CI: lint, typecheck, tests+coverage, docker (GHCR), gitleaks
+.github/dependabot.yml   # Actualizaciones de dependencias
 .pre-commit-config.yaml
 ```
 

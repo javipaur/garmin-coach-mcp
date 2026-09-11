@@ -4,14 +4,18 @@ import base64
 import concurrent.futures
 import functools
 import inspect
+import io
 import json
+import logging
+import logging.config
 import os
+import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -25,69 +29,82 @@ from garminconnect import (
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
-import contextvars
-from contextvars import ContextVar
-import hashlib
-import secrets
-import io
-import re
-import math
+from starlette.responses import JSONResponse, Response
 
-from config import (
-    APP_NAME, CACHE_MINUTES, ACTIVITY_LIMIT, PORT, APP_TIMEZONE,
-    RECOVERY_MAX_FRESH_MINUTES, RECOVERY_CROSS_DAY_STALE_MINUTES,
-    GARMIN_LANGUAGE, ADMIN_API_KEY, ADMIN_TOKEN, AUTH_COOKIE_MAX_AGE_SECONDS,
-    LOGIN_SESSION_TTL_SECONDS, LOGIN_MFA_TIMEOUT_SECONDS,
-    DATA_ROOT, TOKEN_DIR, TOKEN_FILE, GARMIN_TOKENS_JSON, RESET_GARMIN_TOKENS,
-    USERS_DB_DIR, USERS_DB_FILE,
+from activity import (
+    _activity_family,
+    _extract_primary_device_info,
+    _pick_activity_summary,
 )
 from auth import (
-    current_user, _get_auth_user, _generate_id, _generate_api_key, _hash_api_key,
-    _load_users_db, _save_users_db, _get_user_by_api_key, _get_user_by_id,
-    _create_user, _delete_user, _update_user,
-    _user_token_dir, _user_token_file, _seed_user_token_file,
-    _json_loads_maybe_base64,
-    _admin_token_file, _current_admin_token, _write_admin_token_file,
-    _login_admin_ok, _login_active_token,
-    _login_cleanup_expired_sessions, _login_get_session, _login_set_session, _login_drop_session,
-    _request_is_https, _set_auth_cookie, _request_user, _set_user_cookie,
+    _create_user,
+    _current_admin_token,
+    _delete_user,
     _find_user_by_email,
-    USERS_DB_LOCK,
+    _get_auth_user,
+    _get_user_by_api_key,
+    _json_loads_maybe_base64,
+    _load_users_db,
+    _login_active_token,
+    _login_admin_ok,
+    _login_cleanup_expired_sessions,
+    _login_drop_session,
+    _login_get_session,
+    _login_set_session,
+    _request_user,
+    _seed_user_token_file,
+    _set_auth_cookie,
+    _set_user_cookie,
+    _update_user,
+    _user_token_dir,
+    _user_token_file,
+    _write_admin_token_file,
+    current_user,
 )
-from localization import (
-    _translate_garmin,
-    _ACTIVITY_TYPE_ES, _ACTIVITY_FAMILY_ES,
-    ES_FIELD_LABELS,
+from coaching import (
+    _brief_int,
+    _brief_num,
+    _brief_primary_message,
+    _decision_collect_reasons,
+    _decision_collect_risks,
+    _decision_level,
+    _decision_pick_primary_driver,
+    _decision_recommendation_text,
+)
+from config import (
+    ACTIVITY_LIMIT,
+    ADMIN_API_KEY,
+    APP_NAME,
+    CACHE_MINUTES,
+    DATA_ROOT,
+    GARMIN_LANGUAGE,
+    GARMIN_TOKENS_JSON,
+    LOGIN_MFA_TIMEOUT_SECONDS,
+    PORT,
+    RESET_GARMIN_TOKENS,
+    TOKEN_DIR,
+    TOKEN_FILE,
+    USERS_DB_DIR,
 )
 from date_utils import (
-    _now_iso, _today_local,
     _isoish_to_local,
+    _now_iso,
+    _today_local,
+)
+from localization import (
+    _ACTIVITY_FAMILY_ES,
+    _ACTIVITY_TYPE_ES,
+    ES_FIELD_LABELS,
+    _translate_garmin,
 )
 from sleep import (
     _Garmin_get_sleep_data_multi_day,
     _parse_iso_date_or_today,
 )
-from activity import (
-    _activity_family, _normalize_activity,
-    _pick_activity_summary, _pick_activity_metadata,
-    _extract_primary_device_info,
-    _ACTIVITY_TRANSPORT_TYPES, _ACTIVITY_ENDURANCE_TYPES, _ACTIVITY_STRENGTH_TYPES,
-)
-from coaching import (
-    _decision_num, _decision_pick_primary_driver, _decision_collect_reasons,
-    _decision_collect_risks, _decision_level, _decision_recommendation_text,
-    _brief_num, _brief_int, _brief_primary_message, _brief_plan,
-)
 from workout import (
-    _garmin_workout_step_from_desc, _parse_workout_steps_text,
-    _parse_distance_to_m, _parse_duration_min,
+    _garmin_workout_step_from_desc,
+    _parse_workout_steps_text,
 )
-from route_gen import (
-    _run_with_timeout, _get_route_graph, _generate_loop_route,
-    ROUTE_GEN_TIMEOUT_SECONDS,
-)
-
 
 # ---------------------------------------------------------------------------
 # Multi-user system (imported from auth.py)
@@ -101,6 +118,7 @@ from route_gen import (
 _LAST_MCP_HIT_LOCK = threading.Lock()
 _LAST_MCP_HIT: float | None = None
 _LAST_MCP_CLIENT: str = ""
+_SERVER_START_TIME: float = time.time()
 
 CACHE_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
@@ -115,8 +133,8 @@ CACHE: dict[str, Any] = {
 mcp = FastMCP(
     APP_NAME,
     instructions=(
-        
-(
+
+
         "Herramientas para leer métricas reales de Garmin Connect. "
         "Responde siempre en español y prioriza términos canónicos alineados con Garmin Connect en español. "
         "Usa 'Predisposición para entrenar', 'VFC', 'Puntuación de sueño', 'Carga aguda' y 'Estrés'. "
@@ -128,7 +146,7 @@ mcp = FastMCP(
         "Cuando el usuario pregunte por la hora de sincronización o de cuándo son los datos, prioriza ultima_sincronizacion_conector_local, snapshot_obtenido_local y datos_hasta_local.  Para Body Battery, usa el nombre 'Body Battery', no 'Batería corporal'. Para Predisposición para entrenar, usa estados en femenino: Muy baja, Baja, Moderada, Alta u Óptima según corresponda. Para sueño, prioriza sueno_texto_seguro, puntuacion_de_sueno y duracion_de_sueno_texto. No menciones REM, fases del sueño ni despertares salvo que existan campos canónicos explícitos para ello. "
         "Si el usuario pide máxima exactitud, usa get_raw_sources o get_cached_snapshot y responde basándote en raw_sources sin inventar campos. "
         "Si una métrica no existe, di que Garmin no la devolvió."
-    )
+
 ),
 )
 
@@ -151,6 +169,7 @@ if GARMIN_LANGUAGE.startswith("es"):
 
 def _seed_token_file_if_needed() -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    _configure_structured_logging()
 
     if RESET_GARMIN_TOKENS and GARMIN_TOKENS_JSON:
         parsed = _json_loads_maybe_base64(GARMIN_TOKENS_JSON)
@@ -176,8 +195,6 @@ def _seed_token_file_if_needed() -> None:
 import html as _html
 import secrets as _secrets
 import tempfile as _tempfile
-import urllib.request as _urllib_request
-import urllib.error as _urllib_error
 
 
 def _js_json(value: Any) -> str:
@@ -1038,9 +1055,21 @@ def _refresh_cache_sync() -> dict[str, Any]:
 
 
 def _background_refresh_loop() -> None:
+    retry_seconds = 30
     while True:
-        _refresh_cache_sync()
-        time.sleep(CACHE_MINUTES * 60)
+        try:
+            _refresh_cache_sync()
+            with CACHE_LOCK:
+                ok = CACHE.get("status") == "ok"
+        except Exception:
+            ok = False
+        log = logging.getLogger("prewarm")
+        if ok:
+            log.info("snapshot del día pre-caliente")
+            time.sleep(CACHE_MINUTES * 60)
+        else:
+            log.warning("refresco inicial fallido; reintento en %ss", retry_seconds)
+            time.sleep(retry_seconds)
 
 
 def _dashboard_status() -> dict[str, Any]:
@@ -1093,7 +1122,7 @@ def _dashboard_status() -> dict[str, Any]:
     }
 
 
-def _public_base_url(request: "Request") -> str:
+def _public_base_url(request: Request) -> str:
     """Build the externally-visible base URL, honoring reverse-proxy headers.
 
     Reverse proxies (Dokploy, Nginx, etc.) terminate TLS and forward requests
@@ -1124,7 +1153,7 @@ def _human_time_ago(minutes: int | None) -> str:
     return f"hace {days} d"
 
 
-def _render_dashboard(request: "Request") -> str:
+def _render_dashboard(request: Request) -> str:
     """Build the home dashboard HTML based on current status."""
     s = _dashboard_status()
     public_url = _public_base_url(request)
@@ -1360,7 +1389,7 @@ def _landing_html() -> str | None:
 
 @mcp.custom_route("/", methods=["GET"])
 async def root(request: Request) -> Response:
-    from starlette.responses import HTMLResponse, RedirectResponse
+    from starlette.responses import HTMLResponse
     landing = _landing_html()
     if landing is not None:
         # Public marketing landing. Admin dashboard lives at /admin.
@@ -1429,6 +1458,28 @@ async def health(_: Request) -> JSONResponse:
             "volume_path": str(DATA_ROOT),
         }
     return JSONResponse(payload)
+
+
+
+@mcp.custom_route("/metrics", methods=["GET"])
+async def metrics(request: Request) -> Response:
+    from starlette.responses import PlainTextResponse
+    with CACHE_LOCK:
+        last_refresh = CACHE.get("last_refresh")
+        status = CACHE.get("status")
+    uptime_s = time.time() - _SERVER_START_TIME
+    lines = [
+        "# HELP gcmcp_uptime_seconds Time since server start",
+        "# TYPE gcmcp_uptime_seconds gauge",
+        f'gcmcp_uptime_seconds {uptime_s:.1f}',
+        "# HELP gcmcp_cache_status Last cache status",
+        "# TYPE gcmcp_cache_status gauge",
+        f'gcmcp_cache_status{{status="{status}"}} 1',
+        "# HELP gcmcp_last_refresh_unix Last refresh unix timestamp",
+        "# TYPE gcmcp_last_refresh_unix gauge",
+        f'gcmcp_last_refresh_unix {(last_refresh or 0):.1f}',
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1858,7 +1909,7 @@ async def admin_users_create(request: Request) -> Response:
 # Per-user web panel (API-key based) + Garmin connection wizard
 # ---------------------------------------------------------------------------
 
-def _require_user(request: "Request"):
+def _require_user(request: Request):
     """Return the authenticated user from the user_api_key cookie, or None."""
     return _request_user(request)
 
@@ -1875,7 +1926,7 @@ def _user_unauthorized_html() -> str:
 @mcp.custom_route("/u/login", methods=["GET"])
 async def user_login_start(request: Request) -> Response:
     """Authenticate a user by API key (from URL) and set their session cookie."""
-    from starlette.responses import RedirectResponse
+    from starlette.responses import HTMLResponse, RedirectResponse
     api_key = request.query_params.get("api_key", "").strip()
     if not api_key:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2291,7 +2342,6 @@ async def garmin_connect_result(request: Request) -> Response:
 
 @mcp.custom_route("/download/{activity_id}", methods=["GET"])
 async def download_activity_fit(request: Request) -> Response:
-    import urllib.request as _urllib
     activity_id = request.path_params.get("activity_id")
 
     # Intenta primero con tokens locales
@@ -2470,7 +2520,6 @@ async def save_adj(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/activities", methods=["GET"])
 async def list_activities_web(request: Request) -> JSONResponse:
-    import urllib.request as _urllib
     limit = int(request.query_params.get("limit", "30"))
     limit = max(1, min(500, limit))
     start_date = request.query_params.get("start_date", "").strip()  # YYYY-MM-DD
@@ -2575,7 +2624,7 @@ async def debug_activities(_: Request) -> JSONResponse:
             return JSONResponse({"error": str(err)}, status_code=500)
         if not activities:
             return JSONResponse({"error": "No activities found"}, status_code=404)
-        
+
         result = [
             {
                 "activityId": a.get("activityId"),
@@ -3123,6 +3172,59 @@ class _MCPHitTracker:
         await self.app(scope, receive, send)
 
 
+
+class _RateLimitMiddleware:
+    def __init__(self, app, max_requests: int = 60, window_seconds: int = 60):
+        self.app = app
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self._buckets: dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def _is_rate_limited(self, ip: str, path: str) -> bool:
+        now = time.time()
+        key = f"{ip}:{path}"
+        with self._lock:
+            dq = self._buckets.setdefault(key, deque())
+            while dq and dq[0] < now - self.window:
+                dq.popleft()
+            if len(dq) >= self.max_requests:
+                return True
+            dq.append(now)
+            return False
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            client_ip = (scope.get("client") or ("", 0))[0]
+            path = scope.get("path", "")
+            if (path.startswith("/mcp") or path.startswith("/admin")) and self._is_rate_limited(client_ip, path):
+                from starlette.responses import Response
+                await Response("Too Many Requests", status_code=429, headers={"Retry-After": str(self.window)})(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+class _JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict[str, Any] = {
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+        }
+        if hasattr(record, "request_id"):
+            entry["request_id"] = record.request_id
+        return json.dumps(entry, ensure_ascii=False)
+
+
+def _configure_structured_logging() -> None:
+    root = logging.getLogger()
+    if getattr(root, "_gcmcp_configured", False):
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(_JSONFormatter())
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+    root._gcmcp_configured = True
 def _run_server() -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -3160,6 +3262,7 @@ def _run_server() -> None:
             Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
             Middleware(_UserAuthMiddleware),
             Middleware(_MCPHitTracker),
+            Middleware(_RateLimitMiddleware, max_requests=60, window_seconds=60),
         ],
     )
 
@@ -3285,9 +3388,7 @@ def _hrv_candidate_from_raw_for_wrapper(requested_date_iso: str, hrv_raw: Any) -
     }
 
 
-try:
-    _Garmin_get_hrv_data_original_multi_day
-except NameError:
+if "_Garmin_get_hrv_data_original_multi_day" not in globals():
     try:
         _Garmin_get_hrv_data_original_multi_day = Garmin.get_hrv_data
     except Exception:
@@ -7123,7 +7224,9 @@ def upload_activity(file_base64: str, name: str = "", description: str = "", act
     description: descripción (opcional).
     activity_type: tipo de actividad, p.ej. 'running', 'cycling' (opcional).
     """
-    import base64 as _b64, tempfile, os
+    import base64 as _b64
+    import os
+    import tempfile
     try:
         data = _b64.b64decode(file_base64)
     except Exception as e:
@@ -7466,6 +7569,7 @@ def extract_pdf_text(
     """
     try:
         import base64 as _b64
+
         import pypdf
     except ImportError:
         raise RuntimeError("La librería pypdf no está instalada en el servidor.")
@@ -7595,7 +7699,7 @@ def _parse_plan_text_to_sessions(plan_text: str) -> list[dict[str, Any]]:
     create_training_plan las desglose correctamente.
     """
     sessions: list[dict[str, Any]] = []
-    lines = [l.strip() for l in plan_text.strip().splitlines() if l.strip()]
+    lines = [line.strip() for line in plan_text.strip().splitlines() if line.strip()]
 
     day_map = {
         "lunes": 0, "mon": 0, "martes": 1, "tue": 1, "miércoles": 2,
@@ -7872,7 +7976,7 @@ def import_natural_language_plan(
         raise RuntimeError(f"Fecha inválida: {start_date}")
 
     sessions = []
-    lines = [l.strip() for l in plan_text.strip().splitlines() if l.strip()]
+    lines = [line.strip() for line in plan_text.strip().splitlines() if line.strip()]
 
     current_week = 0
     for line in lines:
@@ -8107,7 +8211,6 @@ def _run_with_timeout(fn, timeout_s: float = ROUTE_GEN_TIMEOUT_SECONDS, *args, *
 def _get_route_graph(lat: float, lon: float, radius_m: int = 5000, network_type: str = "walk") -> Any:
     """Descarga y cachea el grafo de caminos de OpenStreetMap."""
     import osmnx as ox
-    import networkx as nx
 
     cache_key = f"{round(lat, 3)}_{round(lon, 3)}_{radius_m}_{network_type}"
     with _route_graph_cache_lock:
@@ -8137,9 +8240,10 @@ def _generate_loop_route(
     max_results: int = 3,
 ) -> list[dict[str, Any]]:
     """Genera rutas circulares desde un punto dado."""
-    import osmnx as ox
+    from math import atan2, cos, radians, sin, sqrt
+
     import networkx as nx
-    from math import radians, sin, cos, sqrt, atan2
+    import osmnx as ox
 
     G = _get_route_graph(lat, lon, network_type=network_type)
     orig_node = ox.distance.nearest_nodes(G, lon, lat)
@@ -9261,9 +9365,7 @@ def _attach_frontend_view_to_snapshot(snap: Any) -> Any:
     return ordered
 
 
-try:
-    _FRONTEND_ES_OUTPUT_ORIGINAL_NORMALIZE_ACTIVITY
-except NameError:
+if "_FRONTEND_ES_OUTPUT_ORIGINAL_NORMALIZE_ACTIVITY" not in globals():
     _FRONTEND_ES_OUTPUT_ORIGINAL_NORMALIZE_ACTIVITY = _normalize_activity
 
 
