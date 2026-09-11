@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py
+      - run: ruff check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py
 
   typecheck:
     name: Typecheck (mypy)
@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install mypy
-      - run: mypy config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py
+      - run: mypy config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py
 
   test:
     name: Tests (pytest)
