@@ -73,7 +73,6 @@ from activity import (
     _pick_activity_summary, _pick_activity_metadata,
     _extract_primary_device_info,
     _ACTIVITY_TRANSPORT_TYPES, _ACTIVITY_ENDURANCE_TYPES, _ACTIVITY_STRENGTH_TYPES,
-    _ACTIVITY_CYCLING_TYPES, _ACTIVITY_SWIM_TYPES, _ACTIVITY_SUMMARY_KEYS,
 )
 from coaching import (
     _decision_num, _decision_pick_primary_driver, _decision_collect_reasons,
@@ -491,7 +490,7 @@ def _optional_call_variants(
     return None, last_error
 
 
-def _parse_date(target_date: str | None) -> str:
+def _parse_input_date(target_date: str | None) -> str:
     if not target_date:
         return _today_local().isoformat()
     return date.fromisoformat(target_date).isoformat()
@@ -906,7 +905,7 @@ def _collect_extra_raw(
 
 
 def _collect_day_snapshot(target_date: str, include_recent_activities: bool = False) -> dict[str, Any]:
-    target_date = _parse_date(target_date)
+    target_date = _parse_input_date(target_date)
     sleep_reference_day = target_date
 
     with FETCH_LOCK:
@@ -2567,7 +2566,6 @@ async def debug_audit(_: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
-
 @mcp.custom_route("/debug/activities", methods=["GET"])
 async def debug_activities(_: Request) -> JSONResponse:
     with FETCH_LOCK:
@@ -2951,7 +2949,6 @@ async def setup_protection_submit(request: Request) -> Response:
     return resp
 
 
-
 @mcp.tool
 def get_cached_snapshot() -> dict[str, Any]:
     """Última foto cacheada del día actual, con métricas normalizadas y raw_sources."""
@@ -2982,13 +2979,13 @@ def refresh_snapshot() -> dict[str, Any]:
 @mcp.tool
 def get_day_snapshot(target_date: str | None = None) -> dict[str, Any]:
     """Foto completa de un día concreto (YYYY-MM-DD)."""
-    return _collect_day_snapshot(_parse_date(target_date), include_recent_activities=False)
+    return _collect_day_snapshot(_parse_input_date(target_date), include_recent_activities=False)
 
 
 @mcp.tool
 def get_raw_sources(target_date: str | None = None, include_recent_activities: bool = True) -> dict[str, Any]:
     """Devuelve los payloads crudos que ha devuelto Garmin para un día."""
-    snapshot = _collect_day_snapshot(_parse_date(target_date), include_recent_activities=include_recent_activities)
+    snapshot = _collect_day_snapshot(_parse_input_date(target_date), include_recent_activities=include_recent_activities)
     return {
         "date": snapshot["date"],
         "fetched_at": snapshot["fetched_at"],
@@ -3000,7 +2997,7 @@ def get_raw_sources(target_date: str | None = None, include_recent_activities: b
 @mcp.tool
 def get_primary_device_info(target_date: str | None = None) -> dict[str, Any]:
     """Devuelve el dispositivo principal detectado y, si existe, su configuración."""
-    snapshot = _collect_day_snapshot(_parse_date(target_date), include_recent_activities=False)
+    snapshot = _collect_day_snapshot(_parse_input_date(target_date), include_recent_activities=False)
     raw = snapshot["raw_sources"]
     return {
         "date": snapshot["date"],
@@ -3260,7 +3257,6 @@ except Exception:
     pass
 
 
-
 # === GARMIN GET_HRV_DATA MULTI-DAY WRAPPER START ===
 _HRV_SELECTION_DEBUG_LAST = None
 
@@ -3365,54 +3361,6 @@ ES_FIELD_LABELS.update({
 })
 # === GARMIN GET_HRV_DATA MULTI-DAY WRAPPER END ===
 # === MCPX ACTIVITY DEEP PATCH START ===
-_ACTIVITY_SUMMARY_KEYS = [
-    "distance",
-    "duration",
-    "elapsedDuration",
-    "movingDuration",
-    "calories",
-    "activityTrainingLoad",
-    "trainingEffect",
-    "anaerobicTrainingEffect",
-    "trainingEffectLabel",
-    "aerobicTrainingEffectMessage",
-    "anaerobicTrainingEffectMessage",
-    "averageHR",
-    "maxHR",
-    "minHR",
-    "averageSpeed",
-    "averageMovingSpeed",
-    "maxSpeed",
-    "avgGradeAdjustedSpeed",
-    "averagePower",
-    "maxPower",
-    "minPower",
-    "normalizedPower",
-    "totalWork",
-    "averageRunCadence",
-    "maxRunCadence",
-    "groundContactTime",
-    "verticalOscillation",
-    "verticalRatio",
-    "strideLength",
-    "steps",
-    "averageTemperature",
-    "maxTemperature",
-    "minTemperature",
-    "avgElevation",
-    "maxElevation",
-    "minElevation",
-    "elevationGain",
-    "elevationLoss",
-    "beginPotentialStamina",
-    "endPotentialStamina",
-    "minAvailableStamina",
-    "differenceBodyBattery",
-    "waterEstimated",
-    "moderateIntensityMinutes",
-    "vigorousIntensityMinutes",
-]
-
 
 def _activity_type_key_from_payload(payload: Any) -> str | None:
     if not isinstance(payload, dict):
@@ -3422,12 +3370,6 @@ def _activity_type_key_from_payload(payload: Any) -> str | None:
         if isinstance(value, dict) and value.get("typeKey"):
             return str(value.get("typeKey"))
     return None
-
-
-def _pick_activity_summary(summary: Any) -> dict[str, Any]:
-    if not isinstance(summary, dict):
-        return {}
-    return {key: summary.get(key) for key in _ACTIVITY_SUMMARY_KEYS if summary.get(key) is not None}
 
 
 def _pick_activity_metadata(metadata: Any) -> dict[str, Any]:
@@ -4466,15 +4408,6 @@ def _format_distance_km_plain(value: Any) -> float | None:
         return None
 
 
-def _safe_float(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
 def _extract_lap_list(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     laps = bundle.get("laps")
     return laps if isinstance(laps, list) else []
@@ -5373,17 +5306,6 @@ def get_hybrid_coach_snapshot(limit: int = 12, target_date: str | None = None) -
 # === MCPX HYBRID COACH DECISION START ===
 
 
-
-
-
-
-
-
-
-
-
-
-
 @mcp.tool
 def get_hybrid_coach_decision(limit: int = 12, target_date: str | None = None) -> dict[str, Any]:
     """Devuelve una decisión diaria lista para entrenador a partir del snapshot híbrido."""
@@ -5418,11 +5340,6 @@ def get_hybrid_coach_decision(limit: int = 12, target_date: str | None = None) -
 
 
 # === MCPX HYBRID USER BRIEFING START ===
-
-
-
-
-
 
 
 def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> dict[str, Any]:
@@ -5929,8 +5846,8 @@ def get_activities_in_range(
     Sin end_date usa hoy. Lista ordenada de más reciente a más antigua.
     Para rangos muy amplios (más de 1 año) prefiere get_activities_paged con paginación.
     """
-    start = _parse_date(start_date)
-    end = _parse_date(end_date) if end_date else _today_local().isoformat()
+    start = _parse_input_date(start_date)
+    end = _parse_input_date(end_date) if end_date else _today_local().isoformat()
 
     if start > end:
         start, end = end, start
@@ -6016,7 +5933,7 @@ def get_daily_wellness(target_date: str) -> dict:
     Incluye: pasos, distancia, calorías, FC en reposo, estrés, Body Battery, VFC y más.
     Formato de fecha: YYYY-MM-DD (ejemplo: 2017-06-15)
     """
-    parsed_date = _parse_date(target_date)
+    parsed_date = _parse_input_date(target_date)
     return _collect_day_snapshot(parsed_date, include_recent_activities=False)
 
 
@@ -6031,9 +5948,9 @@ def get_wellness_range(
     Ejemplo 3 meses: llamada 1 start=2025-01-01 end=2025-01-30,
                      llamada 2 start=2025-01-31 end=2025-03-01, etc.
     """
-    start_dt = date.fromisoformat(_parse_date(start_date))
+    start_dt = date.fromisoformat(_parse_input_date(start_date))
     end_dt = date.fromisoformat(
-        _parse_date(end_date) if end_date else _today_local().isoformat()
+        _parse_input_date(end_date) if end_date else _today_local().isoformat()
     )
 
     if start_dt > end_dt:
@@ -6087,8 +6004,8 @@ def get_race_predictions(
     Sin fechas devuelve las predicciones actuales.
     Formato fechas: YYYY-MM-DD.
     """
-    sd = _parse_date(start_date) if start_date else None
-    ed = _parse_date(end_date) if end_date else None
+    sd = _parse_input_date(start_date) if start_date else None
+    ed = _parse_input_date(end_date) if end_date else None
 
     with FETCH_LOCK:
         api = _get_api()
@@ -6124,7 +6041,7 @@ def get_fitness_age(target_date: str | None = None) -> dict:
     Compara tu condición física con tu edad cronológica.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
 
     with FETCH_LOCK:
         api = _get_api()
@@ -6147,8 +6064,8 @@ def get_endurance_score(
     Rango de fechas para ver la evolución. Sin fechas usa los últimos 28 días.
     Formato: YYYY-MM-DD.
     """
-    ed = _parse_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_date(start_date) if start_date else (
+    ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
+    sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=27)
     ).isoformat()
 
@@ -6171,8 +6088,8 @@ def get_hill_score(
     Evalúa tu capacidad en subidas. Sin fechas usa los últimos 28 días.
     Formato: YYYY-MM-DD.
     """
-    ed = _parse_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_date(start_date) if start_date else (
+    ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
+    sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=27)
     ).isoformat()
 
@@ -6275,8 +6192,8 @@ def get_weigh_ins(
     """Historial de pesajes registrados en Garmin Connect.
     Sin fechas devuelve los últimos 30 días. Formato: YYYY-MM-DD.
     """
-    ed = _parse_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_date(start_date) if start_date else (
+    ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
+    sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=29)
     ).isoformat()
 
@@ -6299,7 +6216,7 @@ def add_weigh_in(
     weight_kg: peso en kilogramos (puede ser decimal, ej: 75.5).
     target_date: fecha en formato YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date) if target_date else _today_local().isoformat()
+    parsed = _parse_input_date(target_date) if target_date else _today_local().isoformat()
 
     with FETCH_LOCK:
         api = _get_api()
@@ -6432,7 +6349,7 @@ def get_all_day_stress(target_date: str | None = None) -> dict:
     Permite ver picos y valles de estrés a lo largo del día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_all_day_stress",), parsed)
@@ -6447,7 +6364,7 @@ def get_steps_data(target_date: str | None = None) -> dict:
     Permite ver la distribución de actividad durante el día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_steps_data",), parsed)
@@ -6464,8 +6381,8 @@ def get_daily_steps(
     """Pasos diarios totales en un rango de fechas.
     Sin fechas usa los últimos 7 días. Formato: YYYY-MM-DD.
     """
-    ed = _parse_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_date(start_date) if start_date else (
+    ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
+    sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=6)
     ).isoformat()
     with FETCH_LOCK:
@@ -6481,7 +6398,7 @@ def get_floors(target_date: str | None = None) -> dict:
     """Pisos subidos y bajados durante el día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_floors", "get_floors_data"), parsed)
@@ -6499,8 +6416,8 @@ def get_blood_pressure(
     Solo disponible si el dispositivo o la app registra tensión arterial.
     Sin fechas usa los últimos 7 días. Formato: YYYY-MM-DD.
     """
-    ed = _parse_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_date(start_date) if start_date else (
+    ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
+    sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=6)
     ).isoformat()
     with FETCH_LOCK:
@@ -6519,7 +6436,7 @@ def get_stats_and_body(target_date: str | None = None) -> dict:
     Combina pasos, calorías, distancia y peso en una sola llamada.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_stats_and_body",), parsed)
@@ -6539,8 +6456,8 @@ def get_progress_summary(
             'movingDuration', 'calories', 'bmrCalories', 'steps'.
     Sin fechas usa los últimos 30 días. Formato: YYYY-MM-DD.
     """
-    ed = _parse_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_date(start_date) if start_date else (
+    ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
+    sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=29)
     ).isoformat()
     valid = {"distance","duration","elevationGain","movingDuration","calories","bmrCalories","steps"}
@@ -6665,7 +6582,7 @@ def get_daily_weigh_ins(target_date: str | None = None) -> dict:
     Útil cuando hay varios registros en el mismo día.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_daily_weigh_ins",), parsed)
@@ -6736,7 +6653,7 @@ def delete_weigh_in(weight_pk: str, target_date: str) -> dict:
     weight_pk: identificador del pesaje (campo weightPk de get_weigh_ins o get_daily_weigh_ins).
     target_date: fecha del pesaje en formato YYYY-MM-DD.
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("delete_weigh_in",), weight_pk, parsed)
@@ -6751,7 +6668,7 @@ def delete_weigh_ins(target_date: str, delete_all: bool = False) -> dict:
     delete_all=True elimina todos los registros del día; False elimina solo el más reciente.
     target_date: fecha en formato YYYY-MM-DD.
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("delete_weigh_ins",), parsed, delete_all)
@@ -6813,7 +6730,7 @@ def get_spo2_data(target_date: str | None = None) -> dict:
     Muestra el nivel de saturación de oxígeno en sangre registrado por el sensor del reloj.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_spo2_data", "get_pulse_ox_data"), parsed)
@@ -6828,7 +6745,7 @@ def get_respiration_data(target_date: str | None = None) -> dict:
     Útil para detectar tendencias de recuperación y estado de forma aeróbica.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_respiration_data",), parsed)
@@ -6843,7 +6760,7 @@ def get_hydration_data(target_date: str | None = None) -> dict:
     Muestra el objetivo diario y el progreso hasta ese momento.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_hydration_data",), parsed)
@@ -6860,8 +6777,8 @@ def get_body_composition(
     """Composición corporal en un rango de fechas: peso, IMC y porcentaje de grasa.
     Sin fechas devuelve los últimos 30 días. Formato: YYYY-MM-DD.
     """
-    ed = _parse_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_date(start_date) if start_date else (
+    ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
+    sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=29)
     ).isoformat()
     with FETCH_LOCK:
@@ -6940,7 +6857,7 @@ def get_workout_for_date(target_date: str) -> dict:
     target_date: fecha en formato YYYY-MM-DD.
     Devuelve el entrenamiento del calendario Y su definición completa si existe un workout asociado.
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     target = date.fromisoformat(parsed)
 
     with FETCH_LOCK:
@@ -7088,7 +7005,7 @@ def schedule_workout(workout_id: str, target_date: str) -> dict:
     workout_id: ID del entrenamiento a programar.
     target_date: fecha en formato YYYY-MM-DD.
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         try:
@@ -7162,7 +7079,7 @@ def get_nutrition_log(target_date: str | None = None) -> dict:
     Requiere que el usuario registre alimentos en Garmin Connect o la app.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         food_log, meals, settings = None, None, None
@@ -7288,7 +7205,7 @@ def get_max_metrics(target_date: str | None = None) -> dict:
     """Métricas máximas: VO2max, umbral de lactato, capacidad anaeróbica, potencia máxima.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_max_metrics",), parsed)
@@ -7303,7 +7220,7 @@ def get_body_battery(target_date: str | None = None) -> dict:
     Devuelve los valores horarios, no solo el resumen.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_body_battery",), parsed)
@@ -7317,7 +7234,7 @@ def get_heart_rates(target_date: str | None = None) -> dict:
     """Serie temporal de frecuencia cardíaca durante un día (lecturas cada ~2 min).
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_heart_rates",), parsed)
@@ -7331,7 +7248,7 @@ def get_sleep_data(target_date: str | None = None) -> dict:
     """Datos completos de sueño: fases, duración, puntuación, respiración nocturna, SpO2.
     Formato fecha: YYYY-MM-DD de la noche (por defecto ayer).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_sleep_data",), parsed)
@@ -7345,7 +7262,7 @@ def get_hrv_data(target_date: str | None = None) -> dict:
     """Datos detallados de VFC (variabilidad de FC): valores nocturnos, estado, baseline, últimas 5 noches.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_hrv_data",), parsed)
@@ -7359,7 +7276,7 @@ def get_training_status(target_date: str | None = None) -> dict:
     """Estado de entrenamiento detallado: carga aguda, carga crónica, estado actual y VO2max.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_training_status",), parsed)
@@ -7373,7 +7290,7 @@ def get_training_readiness(target_date: str | None = None) -> dict:
     """Predisposición para entrenar detallada: puntuación, factores, recomendación de carga.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_training_readiness",), parsed)
@@ -7387,7 +7304,7 @@ def get_rhr_day(target_date: str | None = None) -> dict:
     """FC en reposo medida un día concreto.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_rhr_day",), parsed)
@@ -7401,7 +7318,7 @@ def get_stress_data(target_date: str | None = None) -> dict:
     """Serie temporal del nivel de estrés durante el día (0-100, lectura cada ~3 min).
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_stress_data",), parsed)
@@ -7415,7 +7332,7 @@ def get_user_summary(target_date: str | None = None) -> dict:
     """Resumen diario del usuario: pasos, calorías, distancia total, minutos intensidad, pisos.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_user_summary",), parsed)
@@ -7429,7 +7346,7 @@ def get_stats(target_date: str | None = None) -> dict:
     """Estadísticas diarias crudas: pasos, calorías activas y en reposo, minutos intensidad, pisos.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     with FETCH_LOCK:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_stats",), parsed)
@@ -7529,77 +7446,6 @@ def update_user_profile(
 
 
 # === TRAINING PLAN IMPORT TOOLS ===
-
-def _garmin_workout_step_from_desc(step: dict[str, Any], step_order: int) -> dict[str, Any]:
-    """Convierte un paso normalizado al formato JSON de workout actual de Garmin.
-
-    Produce pasos del tipo ExecutableStepDTO con endCondition/endConditionValue y
-    targetType, agrupables dentro de workoutSegments.
-    """
-    step_type = step.get("type", "active").lower()
-    intensity_map = {
-        "warmup": "warmup", "calentamiento": "warmup",
-        "active": "interval", "interval": "interval", "intervalo": "interval",
-        "rest": "recovery", "recovery": "recovery", "recuperación": "recovery", "recuperacion": "recovery",
-        "cooldown": "cooldown", "vuelta a la calma": "cooldown",
-    }
-    intensity = intensity_map.get(step_type, "interval")
-
-    # stepTypeId y displayOrder coinciden con los enums de Garmin.
-    step_type_id = {"warmup": 1, "cooldown": 2, "interval": 3, "recovery": 4, "repeat": 6}.get(intensity, 3)
-
-    duration_value: float | None = None
-    duration_type = "time"
-    if "duration_sec" in step and step["duration_sec"]:
-        duration_value = float(step["duration_sec"])
-    elif "duration_min" in step and step["duration_min"]:
-        duration_value = float(step["duration_min"]) * 60
-    elif "distance_m" in step and step["distance_m"]:
-        duration_type = "distance"
-        duration_value = float(step["distance_m"])
-    elif "distance_km" in step and step["distance_km"]:
-        duration_type = "distance"
-        duration_value = float(step["distance_km"]) * 1000
-
-    result: dict[str, Any] = {
-        "type": "ExecutableStepDTO",
-        "stepOrder": step_order,
-        "stepType": {"stepTypeId": step_type_id, "stepTypeKey": intensity, "displayOrder": step_type_id},
-    }
-
-    if duration_value is not None:
-        result["endCondition"] = {
-            "conditionTypeId": 2 if duration_type == "time" else 1,
-            "conditionTypeKey": duration_type,
-            "displayOrder": 2 if duration_type == "time" else 1,
-            "displayable": True,
-        }
-        result["endConditionValue"] = duration_value
-
-    hr_zone = step.get("target_hr_zone")
-    target_pace = step.get("target_pace_mps")
-    if hr_zone:
-        result["targetType"] = {
-            "workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone", "displayOrder": 3,
-        }
-        result["targetValueOne"] = 0.0
-        result["targetValueTwo"] = 0.0
-        result["zoneNumber"] = int(hr_zone)
-    elif target_pace:
-        result["targetType"] = {
-            "workoutTargetTypeId": 5, "workoutTargetTypeKey": "speed.zone", "displayOrder": 4,
-        }
-        result["targetValueOne"] = float(target_pace)
-        result["targetValueTwo"] = 0.0
-    else:
-        result["targetType"] = {
-            "workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1,
-        }
-        result["targetValueTwo"] = 0.0
-
-    if step.get("name"):
-        result["stepName"] = str(step["name"])
-    return result
 
 
 @mcp.tool
@@ -7808,133 +7654,6 @@ def _parse_plan_text_to_sessions(plan_text: str) -> list[dict[str, Any]]:
             "description": text,
         })
     return sessions
-
-
-def _parse_distance_to_m(text: str) -> float | None:
-    """Convierte una distancia textual (km o m) a metros."""
-    m_km = re.search(r'(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?)', text, re.I)
-    if m_km:
-        return float(m_km.group(1)) * 1000
-    m_m = re.search(r'(\d+(?:\.\d+)?)\s*m\b', text, re.I)
-    if m_m:
-        return float(m_m.group(1))
-    return None
-
-
-def _parse_duration_min(text: str) -> float | None:
-    """Convierte una duración textual (min o ' horizonte) a minutos. Solo 'min'/'m' claros."""
-    m_min = re.search(r'(\d+(?:\.\d+)?)\s*(?:min|mins|minutes?|minutos?)\b', text, re.I)
-    if m_min:
-        return float(m_min.group(1))
-    return None
-
-
-def _parse_workout_steps_text(desc: str) -> list[dict[str, Any]]:
-    """Convierte una descripción de entrenamiento en una lista de pasos normalizados.
-
-    Entiende calentamiento, series con repeticiones (3x800m, 4x1km, 5x200m),
-    descansos, zonas y vuelta a la calma. Cada serie se expande en sus repeticiones
-    (interval + descanso) para que Garmin la registre correctamente.
-    """
-    parts = [p.strip() for p in re.split(r'[,\n;]+', desc) if p.strip()]
-    steps: list[dict[str, Any]] = []
-    pending_zone: int | None = None
-
-    for part in parts:
-        lower = part.lower()
-
-        # Captura un "Z4" suelto (zona de intensidad que se aplica a la serie anterior).
-        zone_match = re.fullmatch(r'\s*z\s*(\d)\s*', lower)
-        if zone_match and steps:
-            pending_zone = int(zone_match.group(1))
-            steps[-1]["target_hr_zone"] = pending_zone
-            continue
-
-        # ---- Series con repeticiones: 3x800m, 4x1km, 5x200m, 3 x 800 m ----
-        series_match = re.search(
-            r'(\d+)\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?|m\b|min(?:uto?s)?\b)',
-            part, re.I,
-        )
-        if series_match:
-            reps = int(series_match.group(1))
-            value = float(series_match.group(2))
-            unit = series_match.group(3).lower()
-            # Zona de intensidad de la serie (puede ir en la misma parte: 4x1km Z4)
-            zone_m_pre = re.search(r'[Zz]\s*(\d)', part)
-            zone = int(zone_m_pre.group(1)) if zone_m_pre else pending_zone
-            # Descanso entre repeticiones: "400m rec", "rec 400m", "descanso 2min"
-            rest_m = None
-            rest_min = None
-            m_rest = re.search(r'(?:rec|rest|descanso|recuperación)\s*(?:de\s*)?(\d+(?:\.\d+)?)\s*(km|m\b|min(?:uto?s)?\b)?', lower) or \
-                     re.search(r'(\d+(?:\.\d+)?)\s*(m\b|km|min(?:uto?s)?\b)?\s*(?:rec|rest|descanso|recuperación)', lower)
-            if m_rest:
-                rest_num = float(m_rest.group(1))
-                rest_unit = (m_rest.group(2) or "m").lower()
-                if rest_unit.startswith("min"):
-                    rest_min = rest_num
-                elif rest_unit == "km":
-                    rest_m = rest_num * 1000
-                else:
-                    rest_m = rest_num
-
-            for _ in range(reps):
-                step: dict[str, Any] = {"type": "interval"}
-                if unit.startswith("min"):
-                    step["duration_min"] = value
-                elif unit == "km":
-                    step["distance_km"] = value
-                else:
-                    step["distance_m"] = value
-                if zone:
-                    step["target_hr_zone"] = zone
-                steps.append(step)
-                if rest_m or rest_min:
-                    rest_step: dict[str, Any] = {"type": "rest"}
-                    if rest_min:
-                        rest_step["duration_min"] = rest_min
-                    else:
-                        rest_step["distance_m"] = rest_m
-                    steps.append(rest_step)
-            pending_zone = None
-            continue
-
-        # ---- Distancia + zona (5km Z2, 800m) ----
-        dist_m = _parse_distance_to_m(part)
-        duration_min = _parse_duration_min(part)
-        zone_m = re.search(r'[Zz]\s*(\d)', part)
-
-        is_warmup = any(w in lower for w in ("calentamiento", "warmup", "warm up", "calentar"))
-        is_cooldown = any(w in lower for w in ("vuelta a la calma", "cooldown", "cool down", "calma", "enfriamiento", "vuelta al ruedo"))
-        is_rest = any(w in lower for w in ("rec", "rest", "descanso", "recuperación"))
-
-        step: dict[str, Any] = {}
-        if is_warmup:
-            step["type"] = "warmup"
-        elif is_cooldown:
-            step["type"] = "cooldown"
-        elif is_rest:
-            step["type"] = "rest"
-        else:
-            step["type"] = "active"
-
-        consumed = False
-        if duration_min is not None:
-            step["duration_min"] = duration_min
-            consumed = True
-        if dist_m is not None:
-            if dist_m >= 1000:
-                step["distance_km"] = dist_m / 1000.0
-            else:
-                step["distance_m"] = dist_m
-            consumed = True
-        if zone_m:
-            step["target_hr_zone"] = int(zone_m.group(1))
-        if not consumed:
-            # Solo texto sin medida explícita → serie genérica de 30 min
-            step["duration_min"] = 30
-        steps.append(step)
-
-    return steps
 
 
 @mcp.tool
@@ -8743,7 +8462,7 @@ def calculate_training_load(target_date: str | None = None) -> dict:
     Reutiliza los datos de estado de entrenamiento de Garmin.
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     user = _get_auth_user()
     if not user:
         raise RuntimeError("No autenticado")
@@ -8802,7 +8521,7 @@ def detect_fatigue_risk(target_date: str | None = None) -> dict:
     Combina HRV (VFC), preparación para entrenar y calidad del sueño.
     Formato fecha: YYYY-MM-DD (por defecto hoy). Devuelve un veredicto y recomendación en texto.
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     user = _get_auth_user()
     if not user:
         raise RuntimeError("No autenticado")
@@ -8968,7 +8687,7 @@ def calculate_pace_zones(target_date: str | None = None) -> dict:
     """Zonas de ritmo personalizadas para entrenamiento, según el VO2max y umbral del usuario.
     Formato fecha: YYYY-MM-DD (por defecto hoy). Devuelve zonas de 1 a 5 y el ritmo de umbral (km/min).
     """
-    parsed = _parse_date(target_date)
+    parsed = _parse_input_date(target_date)
     user = _get_auth_user()
     if not user:
         raise RuntimeError("No autenticado")

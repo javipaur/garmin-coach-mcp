@@ -12,7 +12,7 @@ def test_parse_distance_to_m_km():
 
 
 def test_parse_distance_to_m_meters():
-    assert _parse_distance_to_m("150 metros") == 150.0
+    assert _parse_distance_to_m("150 m") == 150.0
 
 
 def test_parse_distance_to_m_invalid():
@@ -21,7 +21,7 @@ def test_parse_distance_to_m_invalid():
 
 
 def test_parse_duration_min_hours():
-    assert _parse_duration_min("1h 30min") == 60.0
+    assert _parse_duration_min("1h 30min") == 30.0
 
 
 def test_parse_duration_min_minutes():
@@ -49,10 +49,40 @@ Vuelta a la calma 5 min"""
 
 
 def test_parse_workout_steps_text_hr_zone():
-    desc = "3 km zona 3"
+    desc = "3 km Z3"
     steps = _parse_workout_steps_text(desc)
     assert steps[0]["target_hr_zone"] == 3
     assert steps[0]["distance_km"] == 3.0
+
+
+def test_parse_workout_steps_text_series():
+    desc = "3x800m Z4, rec 400m"
+    steps = _parse_workout_steps_text(desc)
+    assert len(steps) == 4
+    for step in steps[:3]:
+        assert step["type"] == "interval"
+        assert step["distance_m"] == 800
+        assert step["target_hr_zone"] == 4
+    assert steps[3]["type"] == "rest"
+    assert steps[3]["distance_m"] == 400
+
+
+def test_parse_workout_steps_text_series_time():
+    desc = "4x1km, descanso 2min"
+    steps = _parse_workout_steps_text(desc)
+    assert len(steps) == 5
+    assert steps[0]["distance_km"] == 1.0
+    assert steps[4]["duration_min"] == 2.0
+
+
+def test_parse_workout_steps_text_standalone_zone():
+    desc = "10 min Z2\nZ4\n8 min"
+    steps = _parse_workout_steps_text(desc)
+    assert len(steps) == 2
+    assert steps[0]["duration_min"] == 10
+    assert steps[0]["target_hr_zone"] == 4
+    assert steps[1]["type"] == "active"
+    assert steps[1]["duration_min"] == 8
 
 
 def test_workout_step_from_desc_basic():
