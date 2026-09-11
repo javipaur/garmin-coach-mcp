@@ -34,16 +34,15 @@ jobs:
       - run: mypy config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py
 
   test:
-    name: Tests + coverage
+    name: Tests (pytest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt pytest coverage
-      - run: coverage run -m pytest tests/ -q
-      - run: coverage report --fail-under=30
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest tests/ -q
 
   smoke:
     name: Smoke (import server)

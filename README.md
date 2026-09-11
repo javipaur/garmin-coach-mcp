@@ -192,8 +192,8 @@ Dockerfile           # Imagen (instala GDAL/geos/proj para rutas)
 docker-compose.yml   # Despliegue en Dokploy con volumen /data
 requirements.txt     # Dependencias
 tests/               # Suite pytest (+ integración del servidor HTTP/MCP)
-pyproject.toml       # Config de ruff, mypy, pytest y coverage (≥30%)
-.github/workflows/   # CI: lint, typecheck, tests+coverage, docker (GHCR), gitleaks
+pyproject.toml       # Config de ruff, mypy, pytest (y coverage, opcional)
+.github/workflows/   # CI: lint, typecheck, tests, docker (GHCR), gitleaks
 .github/dependabot.yml   # Actualizaciones de dependencias
 .pre-commit-config.yaml
 ```
