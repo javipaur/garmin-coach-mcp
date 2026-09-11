@@ -25,10 +25,14 @@ def _decision_pick_primary_driver(ctx: dict[str, Any], latest_run: dict[str, Any
         return "Body Battery bajo"
     if sleep is not None and sleep <= 65:
         return "Sueño mejorable"
-    if latest_run and _decision_num(latest_run.get("training_load")) and _decision_num(latest_run.get("training_load")) >= 220:
-        return "La última sesión endurance fue exigente"
-    if latest_strength and _decision_num(latest_strength.get("training_load")) and _decision_num(latest_strength.get("training_load")) >= 60:
-        return "La última sesión de fuerza dejó carga relevante"
+    if latest_run:
+        latest_run_load = _decision_num(latest_run.get("training_load"))
+        if latest_run_load is not None and latest_run_load >= 220:
+            return "La última sesión endurance fue exigente"
+    if latest_strength:
+        latest_strength_load = _decision_num(latest_strength.get("training_load"))
+        if latest_strength_load is not None and latest_strength_load >= 60:
+            return "La última sesión de fuerza dejó carga relevante"
     if acute is not None:
         return "Carga aguda reciente"
     if hrv is not None:

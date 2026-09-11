@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from localization import _ACTIVITY_TYPE_ES, _ACTIVITY_FAMILY_ES
-
+from localization import _ACTIVITY_FAMILY_ES, _ACTIVITY_TYPE_ES
 
 _ACTIVITY_TRANSPORT_TYPES = {"motorcycling", "driving", "car", "automotive"}
 _ACTIVITY_ENDURANCE_TYPES = {"running", "treadmill_running", "walking", "hiking", "trail_running", "track_running"}
@@ -72,7 +71,7 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any]:
         "normalized_power": summary.get("normalizedPower"),
         "average_run_cadence": activity.get("averageRunCadence") or summary.get("averageRunCadence"),
         "steps": activity.get("steps") or summary.get("steps"),
-        "tipo_actividad": _ACTIVITY_TYPE_ES.get(type_key, type_key),
+        "tipo_actividad": _ACTIVITY_TYPE_ES.get(type_key, type_key) if isinstance(type_key, str) else type_key,
         "familia_actividad": _ACTIVITY_FAMILY_ES.get(_activity_family(type_key), _activity_family(type_key)),
     }
 

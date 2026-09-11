@@ -4,10 +4,10 @@ from datetime import timedelta
 from typing import Any
 
 from config import (
-    RECOVERY_MAX_FRESH_MINUTES,
     RECOVERY_CROSS_DAY_STALE_MINUTES,
+    RECOVERY_MAX_FRESH_MINUTES,
 )
-from date_utils import _now_local, _today_local, _parse_garmin_datetime
+from date_utils import _now_local, _parse_garmin_datetime, _today_local
 from localization import _RECOVERY_STATE_ES
 
 
@@ -21,7 +21,6 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _extract_latest_activity_end_local(raw_sources: Any) -> Any:
-    from datetime import datetime
     if not isinstance(raw_sources, dict):
         return None
 
@@ -158,10 +157,7 @@ def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
         result["training_readiness_recovery_answer_for_llm"] = result["training_readiness_recovery_safe_text"]
         return result
 
-    if unit == "minutes":
-        base_minutes = raw_value
-    else:
-        base_minutes = raw_value * 60.0
+    base_minutes = raw_value if unit == "minutes" else raw_value * 60.0
 
     remaining_minutes = max(0, int(round(base_minutes - float(age_minutes or 0))))
     remaining_hours = round(remaining_minutes / 60.0, 1)

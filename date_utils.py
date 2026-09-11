@@ -27,10 +27,7 @@ def _isoish_to_local(value: Any) -> Any:
     try:
         normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
         dt = datetime.fromisoformat(normalized)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=APP_TIMEZONE)
-        else:
-            dt = dt.astimezone(APP_TIMEZONE)
+        dt = dt.replace(tzinfo=APP_TIMEZONE) if dt.tzinfo is None else dt.astimezone(APP_TIMEZONE)
         return dt.isoformat()
     except Exception:
         return value
@@ -57,10 +54,7 @@ def _parse_garmin_datetime(value: Any) -> datetime | None:
     try:
         normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
         dt = datetime.fromisoformat(normalized)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=APP_TIMEZONE)
-        else:
-            dt = dt.astimezone(APP_TIMEZONE)
+        dt = dt.replace(tzinfo=APP_TIMEZONE) if dt.tzinfo is None else dt.astimezone(APP_TIMEZONE)
         return dt
     except Exception:
         return None

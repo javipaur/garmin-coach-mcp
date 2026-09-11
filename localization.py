@@ -1,5 +1,8 @@
 from __future__ import annotations
+
 from typing import Any
+
+from config import GARMIN_LANGUAGE
 
 _GARMIN_ES: dict[str, str] = {
     # HRV / VFC
@@ -154,12 +157,10 @@ _GARMIN_ES: dict[str, str] = {
     "WARMUP": "Calentamiento",
     "COOLDOWN": "Vuelta a la calma",
     "INTERVAL": "Intervalo",
-    "RECOVERY": "Recuperación",
     "REST": "Descanso",
     "RECOVER": "Recuperación",
     "REPEAT": "Repetición",
     "REPEAT_STEP": "Bloque de repetición",
-    "ACTIVE": "Activo",
 
     # Workout — tipos de objetivo (target)
     "NO_TARGET": "Sin objetivo",

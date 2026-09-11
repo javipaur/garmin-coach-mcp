@@ -5,12 +5,11 @@ from typing import Any
 
 from config import APP_TIMEZONE
 from date_utils import (
-    _now_local,
-    _today_local,
-    _parse_garmin_datetime,
     _format_duration_hm,
+    _now_local,
+    _parse_garmin_datetime,
     _short_local_dt_text,
-    _isoish_to_local,
+    _today_local,
 )
 from localization import _build_sleep_safe_text
 
@@ -68,7 +67,7 @@ def _parse_iso_date_or_today(value: Any) -> date:
 def _find_sleep_client_in_args(*args, **kwargs):
     candidates = list(args) + list(kwargs.values())
     for obj in candidates:
-        if hasattr(obj, "get_sleep_data") and callable(getattr(obj, "get_sleep_data")):
+        if hasattr(obj, "get_sleep_data") and callable(obj.get_sleep_data):
             return obj
     return None
 

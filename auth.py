@@ -8,11 +8,11 @@ import shutil
 import threading
 import time
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from config import USERS_DB_DIR, USERS_DB_FILE, ADMIN_TOKEN, AUTH_COOKIE_MAX_AGE_SECONDS
+from config import ADMIN_TOKEN, AUTH_COOKIE_MAX_AGE_SECONDS, USERS_DB_DIR, USERS_DB_FILE
 
 USERS_DB_LOCK = threading.Lock()
 
@@ -53,7 +53,7 @@ def _save_users_db(db: dict[str, Any]) -> None:
 
 def _get_user_by_api_key(api_key: str) -> dict[str, Any] | None:
     db = _load_users_db()
-    for uid, user in db.get("users", {}).items():
+    for user in db.get("users", {}).values():
         stored_key = user.get("api_key", "")
         if secrets.compare_digest(stored_key, api_key):
             return user
@@ -75,7 +75,7 @@ def _create_user(display_name: str, garmin_email: str = "") -> dict[str, Any]:
         "api_key": api_key,
         "display_name": display_name,
         "garmin_email": garmin_email,
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(UTC).isoformat(),
         "home_lat": None,
         "home_lon": None,
         "home_name": "",
@@ -191,9 +191,7 @@ def _login_admin_ok(request: Any) -> bool:
     qp = request.query_params.get("token", "")
     if cookie and secrets.compare_digest(cookie, admin):
         return True
-    if qp and secrets.compare_digest(qp, admin):
-        return True
-    return False
+    return bool(qp and secrets.compare_digest(qp, admin))
 
 
 def _login_active_token(request: Any) -> str:
@@ -270,7 +268,7 @@ def _login_drop_session(session_id: str) -> None:
 
 def _find_user_by_email(email: str) -> dict[str, Any] | None:
     db = _load_users_db()
-    for uid, user in db.get("users", {}).items():
+    for user in db.get("users", {}).values():
         if user.get("garmin_email", "").lower() == email.lower():
             return user
     return None
