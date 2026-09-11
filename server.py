@@ -26,433 +26,100 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
-from contextvars import ContextVar
 import contextvars
+from contextvars import ContextVar
 import hashlib
 import secrets
 import io
 import re
 import math
 
+from config import (
+    APP_NAME, CACHE_MINUTES, ACTIVITY_LIMIT, PORT, APP_TIMEZONE,
+    RECOVERY_MAX_FRESH_MINUTES, RECOVERY_CROSS_DAY_STALE_MINUTES,
+    GARMIN_LANGUAGE, ADMIN_API_KEY, ADMIN_TOKEN, AUTH_COOKIE_MAX_AGE_SECONDS,
+    LOGIN_SESSION_TTL_SECONDS, LOGIN_MFA_TIMEOUT_SECONDS,
+    DATA_ROOT, TOKEN_DIR, TOKEN_FILE, GARMIN_TOKENS_JSON, RESET_GARMIN_TOKENS,
+    USERS_DB_DIR, USERS_DB_FILE,
+)
+from auth import (
+    current_user, _get_auth_user, _generate_id, _generate_api_key, _hash_api_key,
+    _load_users_db, _save_users_db, _get_user_by_api_key, _get_user_by_id,
+    _create_user, _delete_user, _update_user,
+    _user_token_dir, _user_token_file, _seed_user_token_file,
+    _json_loads_maybe_base64,
+    _admin_token_file, _current_admin_token, _write_admin_token_file,
+    _login_admin_ok, _login_active_token,
+    _login_cleanup_expired_sessions, _login_get_session, _login_set_session, _login_drop_session,
+    _request_is_https, _set_auth_cookie, _request_user, _set_user_cookie,
+    _find_user_by_email,
+    USERS_DB_LOCK,
+)
+from localization import (
+    _GARMIN_ES, _translate_garmin,
+    _normalize_readiness_status_es, _build_sleep_safe_text,
+    _translate_metric_status_es, _translate_training_readiness_message_es,
+    _extract_training_status_code,
+    _ACTIVITY_TYPE_ES, _ACTIVITY_FAMILY_ES,
+    ES_FIELD_LABELS, ES_TERM_LABELS,
+    _RECOVERY_STATE_ES,
+    _GARMIN_STATUS_ES_GENERIC, _GARMIN_STATUS_ES_BY_FIELD,
+    _GARMIN_TRAINING_READINESS_MESSAGE_ES, _GARMIN_TRAINING_STATUS_ES,
+    _ES_STATUS_MAP, _ES_MESSAGE_MAP,
+    _FINAL_STATUS_ES, _FINAL_MESSAGE_ES,
+    _translate_status_es, _translate_message_es,
+)
+from date_utils import (
+    _now_iso, _now_local, _today_local,
+    _isoish_to_local, _format_duration_hm,
+    _parse_garmin_datetime, _short_local_dt_text,
+    _gsec_to_text,
+)
+from recovery import (
+    _safe_float as _safe_float_recovery,
+    _extract_latest_activity_end_local, _extract_recovery_value,
+    _build_recovery_metrics,
+)
+from sleep import (
+    _sleep_candidate_from_raw, _sleep_candidate_from_raw_for_wrapper,
+    _apply_sleep_candidate_to_metrics, _recompute_sleep_freshness_fields,
+    _Garmin_get_sleep_data_multi_day,
+    _parse_iso_date_or_today, _find_sleep_client_in_args,
+)
+from activity import (
+    _activity_family, _normalize_activity,
+    _pick_activity_summary, _pick_activity_metadata,
+    _extract_primary_device_info,
+    _ACTIVITY_TRANSPORT_TYPES, _ACTIVITY_ENDURANCE_TYPES, _ACTIVITY_STRENGTH_TYPES,
+    _ACTIVITY_CYCLING_TYPES, _ACTIVITY_SWIM_TYPES, _ACTIVITY_SUMMARY_KEYS,
+)
+from coaching import (
+    _decision_num, _decision_pick_primary_driver, _decision_collect_reasons,
+    _decision_collect_risks, _decision_level, _decision_recommendation_text,
+    _brief_num, _brief_int, _brief_primary_message, _brief_plan,
+)
+from workout import (
+    _garmin_workout_step_from_desc, _parse_workout_steps_text,
+    _parse_distance_to_m, _parse_duration_min,
+)
+from route_gen import (
+    _run_with_timeout, _get_route_graph, _generate_loop_route,
+    ROUTE_GEN_TIMEOUT_SECONDS,
+)
 
-APP_NAME = "Garmin Coach MCP"
-CACHE_MINUTES = max(5, int(os.getenv("CACHE_MINUTES", "30")))
-ACTIVITY_LIMIT = max(1, min(20, int(os.getenv("ACTIVITY_LIMIT", "8"))))
-PORT = int(os.getenv("PORT", "8000"))
-APP_TIMEZONE = ZoneInfo(os.getenv("GARMIN_TIMEZONE", "Europe/Madrid"))
-RECOVERY_MAX_FRESH_MINUTES = max(15, int(os.getenv("RECOVERY_MAX_FRESH_MINUTES", "360")))
-RECOVERY_CROSS_DAY_STALE_MINUTES = max(15, int(os.getenv("RECOVERY_CROSS_DAY_STALE_MINUTES", "180")))
-GARMIN_LANGUAGE = os.getenv("GARMIN_LANGUAGE", "es").lower()
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
-# Multi-user system
+# Multi-user system (imported from auth.py)
 # ---------------------------------------------------------------------------
-USERS_DB_DIR = Path(os.getenv("USERS_DB_DIR", "/data/users"))
-USERS_DB_FILE = USERS_DB_DIR / "users.json"
-USERS_DB_LOCK = threading.Lock()
-
-current_user: ContextVar[dict[str, Any] | None] = ContextVar("current_user", default=None)
-
-
-def _get_auth_user() -> dict[str, Any] | None:
-    """Retrieve the current authenticated user from ContextVar."""
-    return current_user.get()
-
-
-def _generate_id(length: int = 8) -> str:
-    return secrets.token_hex(length // 2)
-
-
-def _generate_api_key() -> str:
-    return f"gcmcp_{secrets.token_hex(24)}"
-
-
-def _hash_api_key(key: str) -> str:
-    return hashlib.sha256(key.encode()).hexdigest()
-
-
-def _load_users_db() -> dict[str, Any]:
-    with USERS_DB_LOCK:
-        if USERS_DB_FILE.exists():
-            try:
-                return json.loads(USERS_DB_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {"users": {}}
-
-
-def _save_users_db(db: dict[str, Any]) -> None:
-    USERS_DB_DIR.mkdir(parents=True, exist_ok=True)
-    with USERS_DB_LOCK:
-        USERS_DB_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _get_user_by_api_key(api_key: str) -> dict[str, Any] | None:
-    db = _load_users_db()
-    for uid, user in db.get("users", {}).items():
-        stored_key = user.get("api_key", "")
-        if secrets.compare_digest(stored_key, api_key):
-            return user
-    return None
-
-
-def _get_user_by_id(user_id: str) -> dict[str, Any] | None:
-    db = _load_users_db()
-    return db.get("users", {}).get(user_id)
-
-
-def _create_user(display_name: str, garmin_email: str = "") -> dict[str, Any]:
-    user_id = _generate_id()
-    api_key = _generate_api_key()
-    user_dir = USERS_DB_DIR / user_id
-    user_dir.mkdir(parents=True, exist_ok=True)
-    user = {
-        "id": user_id,
-        "api_key": api_key,
-        "display_name": display_name,
-        "garmin_email": garmin_email,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "home_lat": None,
-        "home_lon": None,
-        "home_name": "",
-    }
-    db = _load_users_db()
-    db.setdefault("users", {})[user_id] = user
-    _save_users_db(db)
-    return user
-
-
-def _delete_user(user_id: str) -> bool:
-    db = _load_users_db()
-    if user_id in db.get("users", {}):
-        del db["users"][user_id]
-        _save_users_db(db)
-        import shutil
-        user_dir = USERS_DB_DIR / user_id
-        if user_dir.exists():
-            shutil.rmtree(user_dir, ignore_errors=True)
-        return True
-    return False
-
-
-def _update_user(user_id: str, **fields: Any) -> dict[str, Any] | None:
-    db = _load_users_db()
-    user = db.get("users", {}).get(user_id)
-    if not user:
-        return None
-    for k, v in fields.items():
-        if k in ("display_name", "garmin_email", "home_lat", "home_lon", "home_name"):
-            user[k] = v
-    _save_users_db(db)
-    return user
-
-
-def _user_token_dir(user_id: str) -> Path:
-    return USERS_DB_DIR / user_id
-
-
-def _user_token_file(user_id: str) -> Path:
-    return _user_token_dir(user_id) / "garmin_tokens.json"
-
-
-def _seed_user_token_file(user_id: str, token_dir: Path) -> None:
-    token_dir.mkdir(parents=True, exist_ok=True)
-    token_file = token_dir / "garmin_tokens.json"
-    if token_file.exists():
-        return
-    user = _get_user_by_id(user_id)
-    if user and user.get("garmin_tokens_json"):
-        parsed = _json_loads_maybe_base64(user["garmin_tokens_json"])
-        token_file.write_text(json.dumps(parsed), encoding="utf-8")
-        return
-    legacy = os.getenv("GARMIN_TOKENS_JSON", "").strip()
-    if legacy and not token_file.exists():
-        parsed = _json_loads_maybe_base64(legacy)
-        token_file.write_text(json.dumps(parsed), encoding="utf-8")
-
 
 # Context variable for route generation caching
 # Route graph cache is a module-level dict, not ContextVar
-
-# Traducción de enums de la API de Garmin al español de Garmin Connect
-_GARMIN_ES: dict[str, str] = {
-    # HRV / VFC
-    "BALANCED": "Equilibrado",
-    "UNBALANCED": "Desequilibrado",
-    "LOW": "Bajo",
-    "POOR": "Deficiente",
-    "NO_STATUS": "Sin estado",
-
-    # Estado de entrenamiento (Training Status)
-    "PRODUCTIVE": "Productivo",
-    "MAINTAINING": "Manteniendo",
-    "RECOVERY": "Recuperación",
-    "OVERREACHING": "Sobreentrenamiento",
-    "UNPRODUCTIVE": "No productivo",
-    "DETRAINING": "Pérdida de forma",
-    "PEAKING": "Pico de forma",
-    "OVERLOAD": "Sobrecarga",
-
-    # Predisposición para entrenar (Training Readiness)
-    "EXCELLENT": "Óptima",
-    "GOOD": "Alta",
-    "FAIR": "Moderada",
-    "BAD": "Baja",
-    "VERY_BAD": "Muy baja",
-
-    # Fases de sueño (la API puede devolver mayúsculas o minúsculas)
-    "AWAKE": "Despierto",
-    "LIGHT": "Ligero",
-    "DEEP": "Profundo",
-    "REM": "REM",
-    "awake": "Despierto",
-    "light": "Ligero",
-    "deep": "Profundo",
-    "rem": "REM",
-
-    # Puntuación de sueño (Sleep Score)
-    # GOOD → "Buena" (se comparte con Training Readiness, forma masculina es "Bueno")
-    # FAIR → "Regular" (ya definido arriba)
-    # POOR → "Deficiente" (ya definido arriba)
-    # EXCELLENT → "Excelente" (ya definido arriba)
-
-    # Efecto del entrenamiento (Training Effect)
-    "IMPROVING": "Mejorando",
-    "HIGHLY_AEROBIC": "Aeróbico intenso",
-    "AEROBIC": "Aeróbico",
-    "ANAEROBIC": "Anaeróbico",
-    "VO2MAX": "Mejora VO2max",
-    "ANAEROBIC_CAPACITY": "Capacidad anaeróbica",
-    "AEROBIC_BASE": "Base aeróbica",
-
-    # Zonas de intensidad
-    "ZONE_1": "Calentamiento",
-    "ZONE_2": "Suave",
-    "ZONE_3": "Aeróbica",
-    "ZONE_4": "Umbral",
-    "ZONE_5": "Máximo",
-
-    # Tipos de actividad
-    "treadmill_running": "Carrera en cinta",
-    "strength_training": "Fuerza",
-
-    # Mensajes Body Battery / feedback UI
-    "DAY_STRESSFUL_AND_INACTIVE": "Día estresante e inactivo",
-    "SLEEP_TIME_PASSED_STRESSFUL_AND_INACTIVE": "Noche estresante + inactividad",
-
-    # Insights de sueño
-    "NEGATIVE_STRENUOUS_EXERCISE": "Ejercicio intenso previo",
-    "HARD_EXERCISE_NEG_FAIR_OR_POOR_SLEEP": "Entrenamiento duro + mal sueño",
-
-    # Estados genéricos de nivel / calidad
-    "OPTIMAL": "Óptimo",
-    "MODERATE": "Moderado",
-    "HIGH": "Alto",
-    "NORMAL": "Normal",
-    "ABOVE_NORMAL": "Por encima de lo normal",
-    "BELOW_NORMAL": "Por debajo de lo normal",
-
-    # Tendencias (composición corporal, peso, VO2max…)
-    "STABLE": "Estable",
-    "INCREASING": "En aumento",
-    "DECREASING": "En descenso",
-    "IMPROVED": "Mejorado",
-    "DECLINED": "Empeorado",
-    "UNCHANGED": "Sin cambios",
-    "INCREASED": "Aumentado",
-    "DECREASED": "Disminuido",
-
-    # Estado de retos / objetivos
-    "ACTIVE": "Activo",
-    "INACTIVE": "Inactivo",
-    "COMPLETED": "Completado",
-    "IN_PROGRESS": "En progreso",
-    "PENDING": "Pendiente",
-    "FAILED": "No completado",
-    "AVAILABLE": "Disponible",
-
-    # Sistema de unidades
-    "METRIC": "Métrico",
-    "STATUTE": "Imperial",
-    "MARINE": "Náutico",
-
-    # Perfil / género
-    "MALE": "Masculino",
-    "FEMALE": "Femenino",
-
-    # SPO2
-    "STANDARD": "Estándar",
-    "CONTINUOUS": "Continuo",
-    "SPOT_CHECK": "Medición puntual",
-    "INTERRUPTED": "Interrumpido",
-    "HIGH_ALTITUDE": "Altitud elevada",
-    "ENABLED": "Activo",
-    "DISABLED": "Desactivado",
-
-    # Respiración
-    "TACHYPNEA": "Taquipnea",
-    "BRADYPNEA": "Bradipnea",
-
-    # Tipos de actividad adicionales
-    "running": "Correr",
-    "cycling": "Ciclismo",
-    "walking": "Caminar",
-    "hiking": "Senderismo",
-    "swimming": "Natación",
-    "trail_running": "Trail running",
-    "road_biking": "Ciclismo en carretera",
-    "indoor_cycling": "Ciclismo indoor",
-    "mountain_biking": "Ciclismo de montaña",
-    "virtual_ride": "Ciclismo virtual",
-    "open_water_swimming": "Natación en aguas abiertas",
-    "pool_swimming": "Natación en piscina",
-    "cardio": "Cardio",
-    "elliptical": "Elíptica",
-    "track_running": "Carrera en pista",
-    "multi_sport": "Multideporte",
-    "triathlon": "Triatlón",
-    "yoga": "Yoga",
-    "pilates": "Pilates",
-    "tennis": "Tenis",
-    "golf": "Golf",
-    "rowing": "Remo",
-    "cross_country_skiing": "Esquí de fondo",
-    "skiing": "Esquí alpino",
-    "snowboarding": "Snowboard",
-    "basketball": "Baloncesto",
-    "football": "Fútbol americano",
-    "soccer": "Fútbol",
-    "other": "Otro",
-
-    # Workout — tipos de paso
-    "WARMUP": "Calentamiento",
-    "COOLDOWN": "Vuelta a la calma",
-    "INTERVAL": "Intervalo",
-    "RECOVERY": "Recuperación",
-    "REST": "Descanso",
-    "RECOVER": "Recuperación",
-    "REPEAT": "Repetición",
-    "REPEAT_STEP": "Bloque de repetición",
-    "ACTIVE": "Activo",
-
-    # Workout — tipos de objetivo (target)
-    "NO_TARGET": "Sin objetivo",
-    "OPEN": "Abierto",
-    "LAP_BUTTON": "Botón vuelta",
-    "HEART_RATE": "Frecuencia cardíaca",
-    "POWER": "Potencia",
-    "CADENCE": "Cadencia",
-    "PACE": "Ritmo",
-    "SPEED": "Velocidad",
-    "GRADE": "Pendiente",
-    "ITERATIONS": "Repeticiones",
-
-    # Workout — tipos de duración
-    "TIME": "Tiempo",
-    "REPS": "Repeticiones",
-    "FIXED_REST": "Descanso fijo",
-
-    # Workout — deportes
-    "RUNNING": "Correr",
-    "CYCLING": "Ciclismo",
-    "SWIMMING": "Natación",
-    "FITNESS_EQUIPMENT": "Máquina de fitness",
-    "STRENGTH_TRAINING": "Fuerza",
-    "CARDIO_TRAINING": "Cardio",
-    "WALK": "Caminar",
-
-    # Workout — estado en calendario
-    "SCHEDULED": "Planificado",
-    "SKIPPED": "Omitido",
-    "MISSED": "No realizado",
-
-    # Calendario — tipo de elemento
-    "workout": "Entrenamiento",
-    "race": "Carrera",
-    "note": "Nota",
-    "garmincoach": "Garmin Coach",
-
-    # Nutrición — comidas
-    "BREAKFAST": "Desayuno",
-    "LUNCH": "Almuerzo",
-    "DINNER": "Cena",
-    "SNACK": "Tentempié",
-    "WATER": "Agua",
-    "SUPPLEMENT": "Suplemento",
-    "ANYTIME": "En cualquier momento",
-
-    # Genéricos
-    "UNKNOWN": "Desconocido",
-    "NONE": "Sin datos",
-    "NO_DATA": "Sin datos",
-    "POSITIVE": "Positivo",
-    "NEGATIVE": "Negativo",
-    "NEUTRAL": "Neutral",
-    "ASCENDING": "Ascendente",
-    "DESCENDING": "Descendente",
-    "WEEKLY": "Semanal",
-    "DAILY": "Diario",
-    "DISTANCE": "Distancia",
-    "DURATION": "Duración",
-    "CALORIES": "Calorías",
-    "STEPS": "Pasos",
-}
-
-
-def _translate_garmin(obj: Any, _depth: int = 0) -> Any:
-    """Traduce recursivamente los enums de Garmin al español de Garmin Connect."""
-    if not GARMIN_LANGUAGE.startswith("es"):
-        return obj
-    if _depth > 50:
-        return obj
-    if isinstance(obj, dict):
-        return {k: _translate_garmin(v, _depth + 1) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_translate_garmin(i, _depth + 1) for i in obj]
-    if isinstance(obj, str) and obj in _GARMIN_ES:
-        return _GARMIN_ES[obj]
-    return obj
-
-DATA_ROOT = Path(os.getenv("DATA_DIR", "/data"))
-LOCAL_GARMINCONNECT_DIR = Path.home() / ".garminconnect"
-LOCAL_DEBUG_TOKEN_DIR = Path.cwd() / ".debug-data" / "garmin"
-
-def _resolve_token_dir() -> Path:
-    explicit = os.getenv("GARMIN_TOKEN_DIR", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-
-    if LOCAL_GARMINCONNECT_DIR.exists():
-        return LOCAL_GARMINCONNECT_DIR
-
-    if DATA_ROOT.exists() and os.access(DATA_ROOT, os.W_OK):
-        return DATA_ROOT / "garmin"
-
-    return LOCAL_DEBUG_TOKEN_DIR
-
-TOKEN_DIR = _resolve_token_dir()
-TOKEN_FILE = TOKEN_DIR / "garmin_tokens.json"
-
-GARMIN_TOKENS_JSON = os.getenv("GARMIN_TOKENS_JSON", "").strip()
-RESET_GARMIN_TOKENS = os.getenv("RESET_GARMIN_TOKENS", "0").lower() in {"1", "true", "yes"}
-
-# Re-login web flow (mobile-friendly wizard at /login)
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-LOGIN_SESSION_TTL_SECONDS = 600
-LOGIN_MFA_TIMEOUT_SECONDS = 300
-# Auth cookie lifetime. Refreshed on each visit (sliding), so in practice you stay
-# logged in as long as you keep opening the panel within this window.
-AUTH_COOKIE_MAX_AGE_SECONDS = 31536000  # 365 days
 
 # Track the last time the /mcp endpoint was hit, used by the dashboard to tell
 # the user whether an IA has actually connected to this server.
 _LAST_MCP_HIT_LOCK = threading.Lock()
 _LAST_MCP_HIT: float | None = None
 _LAST_MCP_CLIENT: str = ""
-
-_LOGIN_SESSIONS: dict[str, dict[str, Any]] = {}
-_LOGIN_SESSIONS_LOCK = threading.Lock()
 
 CACHE_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
@@ -501,119 +168,6 @@ if GARMIN_LANGUAGE.startswith("es"):
     mcp.tool = _translating_tool
 
 
-def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def _now_local() -> datetime:
-    return datetime.now(APP_TIMEZONE)
-
-
-def _today_local() -> date:
-    return _now_local().date()
-
-
-def _isoish_to_local(value: Any) -> Any:
-    if value is None:
-        return None
-    raw = str(value).strip()
-    if not raw:
-        return None
-    try:
-        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-        dt = datetime.fromisoformat(normalized)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=APP_TIMEZONE)
-        else:
-            dt = dt.astimezone(APP_TIMEZONE)
-        return dt.isoformat()
-    except Exception:
-        return value
-
-
-def _format_duration_hm(seconds: Any) -> str | None:
-    try:
-        total = int(round(float(seconds)))
-    except Exception:
-        return None
-    if total < 0:
-        return None
-    hours = total // 3600
-    minutes = (total % 3600) // 60
-    return f"{hours}h {minutes:02d}m"
-
-def _short_local_dt_text(value: Any) -> str | None:
-    dt = _parse_garmin_datetime(value) if value is not None else None
-    if dt is None:
-        return None
-    return dt.strftime("%d/%m/%Y %H:%M")
-
-
-
-def _normalize_readiness_status_es(value: Any) -> str | None:
-    if value is None:
-        return None
-    raw = str(value).strip()
-    if not raw:
-        return None
-
-    mapping = {
-        "very low": "Muy baja",
-        "low": "Baja",
-        "moderate": "Moderada",
-        "high": "Alta",
-        "optimal": "Óptima",
-        "muy bajo": "Muy baja",
-        "muy baja": "Muy baja",
-        "bajo": "Baja",
-        "baja": "Baja",
-        "moderado": "Moderada",
-        "moderada": "Moderada",
-        "alto": "Alta",
-        "alta": "Alta",
-        "óptimo": "Óptima",
-        "optimo": "Óptima",
-        "óptima": "Óptima",
-        "optima": "Óptima",
-    }
-    return mapping.get(raw.casefold(), raw)
-
-
-def _build_sleep_safe_text(score: Any, duration_text: Any) -> str | None:
-    if score is None and not duration_text:
-        return None
-    if score is not None and duration_text:
-        return f"{score} puntos y {duration_text}"
-    if score is not None:
-        return f"{score} puntos"
-    return str(duration_text)
-
-
-def _json_loads_maybe_base64(raw: str) -> dict[str, Any]:
-    raw = raw.strip()
-    if not raw:
-        raise RuntimeError("GARMIN_TOKENS_JSON está vacío")
-
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("GARMIN_TOKENS_JSON no contiene un objeto JSON válido")
-        return parsed
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        decoded = base64.b64decode(raw).decode("utf-8")
-        parsed = json.loads(decoded)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("El base64 no contiene un objeto JSON válido")
-        return parsed
-    except Exception as exc:
-        raise RuntimeError(
-            "GARMIN_TOKENS_JSON no es JSON válido ni base64 de JSON válido"
-        ) from exc
-
-
 def _seed_token_file_if_needed() -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -657,90 +211,6 @@ def _js_json(value: Any) -> str:
 def _is_first_run() -> bool:
     """True when there are no Garmin tokens persisted anywhere yet."""
     return not GARMIN_TOKENS_JSON and not TOKEN_FILE.exists()
-
-
-def _admin_token_file() -> Path:
-    return TOKEN_DIR / "admin_token"
-
-
-def _current_admin_token() -> str:
-    """Live admin password.
-
-    Prefers the on-disk file (which the wizard can update WITHOUT a server
-    restart, so password changes take effect instantly), and falls back to the
-    ADMIN_TOKEN env var (used to survive container restarts on free tier).
-    """
-    try:
-        f = _admin_token_file()
-        if f.exists():
-            v = f.read_text(encoding="utf-8").strip()
-            if v:
-                return v
-    except Exception:
-        pass
-    return ADMIN_TOKEN
-
-
-def _write_admin_token_file(value: str) -> None:
-    f = _admin_token_file()
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(value, encoding="utf-8")
-
-
-def _login_admin_ok(request: "Request") -> bool:
-    """Open until a password is set; protected once a password exists.
-
-    Model: while the user hasn't chosen a password, the setup and login pages are
-    open to whoever has the URL — the initial, unprotected state, and the
-    dashboard nudges the user to lock it down. Once a password is set, every
-    sensitive page requires it (via ?token= or cookie).
-    """
-    admin = _current_admin_token()
-    if not admin:
-        return True
-    cookie = request.cookies.get("admin_token", "")
-    qp = request.query_params.get("token", "")
-    if cookie and _secrets.compare_digest(cookie, admin):
-        return True
-    if qp and _secrets.compare_digest(qp, admin):
-        return True
-    return False
-
-
-def _login_active_token(request: "Request") -> str:
-    """Return the admin token if the request presented it (for cookie setting)."""
-    admin = _current_admin_token()
-    qp = request.query_params.get("token", "")
-    if admin and qp and _secrets.compare_digest(qp, admin):
-        return admin
-    return ""
-
-
-def _login_cleanup_expired_sessions() -> None:
-    now = time.time()
-    with _LOGIN_SESSIONS_LOCK:
-        stale = [
-            sid
-            for sid, s in _LOGIN_SESSIONS.items()
-            if now - s.get("created_at", now) > LOGIN_SESSION_TTL_SECONDS
-        ]
-        for sid in stale:
-            _LOGIN_SESSIONS.pop(sid, None)
-
-
-def _login_get_session(session_id: str) -> dict[str, Any] | None:
-    with _LOGIN_SESSIONS_LOCK:
-        return _LOGIN_SESSIONS.get(session_id)
-
-
-def _login_set_session(session_id: str, data: dict[str, Any]) -> None:
-    with _LOGIN_SESSIONS_LOCK:
-        _LOGIN_SESSIONS[session_id] = data
-
-
-def _login_drop_session(session_id: str) -> None:
-    with _LOGIN_SESSIONS_LOCK:
-        _LOGIN_SESSIONS.pop(session_id, None)
 
 
 def _login_worker(session_id: str, email: str, password: str, user_id: str | None = None) -> None:
@@ -1367,71 +837,6 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _extract_primary_device_info(training_status: Any, devices_raw: Any) -> dict[str, Any]:
-    device_id = None
-    device_name = None
-    image_url = None
-
-    if isinstance(training_status, dict):
-        try:
-            latest = training_status["mostRecentTrainingStatus"]["latestTrainingStatusData"]
-            if isinstance(latest, dict) and latest:
-                key = next(iter(latest.keys()))
-                device_id = int(key)
-        except Exception:
-            pass
-
-        if device_id is None:
-            try:
-                balance = training_status["mostRecentTrainingLoadBalance"]["metricsTrainingLoadBalanceDTOMap"]
-                if isinstance(balance, dict) and balance:
-                    key = next(iter(balance.keys()))
-                    device_id = int(key)
-            except Exception:
-                pass
-
-        for path in [
-            ("mostRecentTrainingStatus", "recordedDevices"),
-            ("mostRecentTrainingLoadBalance", "recordedDevices"),
-        ]:
-            try:
-                devices = training_status[path[0]][path[1]]
-                if isinstance(devices, list):
-                    for dev in devices:
-                        if not isinstance(dev, dict):
-                            continue
-                        dev_id = dev.get("deviceId")
-                        if device_id is None and dev_id is not None:
-                            device_id = dev_id
-                        if device_id is not None and dev_id == device_id:
-                            device_name = dev.get("deviceName")
-                            image_url = dev.get("imageURL")
-                            break
-                    if device_name:
-                        break
-            except Exception:
-                pass
-
-    if device_id is None and isinstance(devices_raw, list):
-        for dev in devices_raw:
-            if not isinstance(dev, dict):
-                continue
-            for key in ("deviceId", "id", "unitId"):
-                if dev.get(key) is not None:
-                    device_id = dev.get(key)
-                    break
-            if device_id is not None:
-                device_name = dev.get("deviceName") or dev.get("displayName") or dev.get("modelName")
-                image_url = dev.get("imageURL")
-                break
-
-    return {
-        "primary_device_id": device_id,
-        "primary_device_name": device_name,
-        "primary_device_image_url": image_url,
-    }
-
-
 def _collect_extra_raw(
     api: Garmin,
     target_date: str,
@@ -1885,34 +1290,6 @@ def _render_unlock_page(wrong: bool = False) -> str:
         '</details>'
     )
     return _login_render_page("Panel protegido", None, body)
-
-
-def _request_is_https(request: "Request") -> bool:
-    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip() or request.url.scheme
-    return proto == "https"
-
-
-def _set_auth_cookie(response, token: str, request: "Request") -> None:
-    """Set/refresh the long-lived sliding auth cookie (Instagram/X style)."""
-    response.set_cookie(
-        "admin_token", token, httponly=True, samesite="strict",
-        max_age=AUTH_COOKIE_MAX_AGE_SECONDS, secure=_request_is_https(request),
-    )
-
-
-def _request_user(request: "Request") -> dict[str, Any] | None:
-    """Return the user authenticated via the user_api_key cookie, if any."""
-    api_key = request.cookies.get("user_api_key", "").strip()
-    if not api_key:
-        return None
-    return _get_user_by_api_key(api_key)
-
-
-def _set_user_cookie(response, api_key: str, request: "Request") -> None:
-    response.set_cookie(
-        "user_api_key", api_key, httponly=True, samesite="strict",
-        max_age=AUTH_COOKIE_MAX_AGE_SECONDS, secure=_request_is_https(request),
-    )
 
 
 @mcp.custom_route("/dashboard/rows", methods=["GET"])
@@ -2652,18 +2029,6 @@ async def user_logout(request: Request) -> Response:
     resp = RedirectResponse("/u/login", status_code=303)
     resp.delete_cookie("user_api_key", samesite="strict")
     return resp
-
-
-def _find_user_by_email(email: str) -> dict[str, Any] | None:
-    """Return the user whose Garmin email matches, case-insensitive."""
-    needle = (email or "").strip().lower()
-    if not needle:
-        return None
-    db = _load_users_db()
-    for u in db.get("users", {}).values():
-        if (u.get("garmin_email") or "").strip().lower() == needle:
-            return u
-    return None
 
 
 @mcp.custom_route("/login-usuario", methods=["GET"])
@@ -3821,6 +3186,21 @@ class _MCPHitTracker:
 
 def _run_server() -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Compatibilidad: el SDK mcp rechaza con 406 a los clientes que no envían
+    # exactamente "Accept: application/json, text/event-stream" (lo que rompe
+    # el arranque en algunos clientes MCP como Claude desktop). Aceptamos
+    # cualquier Accept header validando siempre True.
+    try:
+        from mcp.server.streamable_http import StreamableHTTPServerTransport
+
+        async def _accept_any_accept_header(self, request, scope, send):
+            return True
+
+        StreamableHTTPServerTransport._validate_accept_header = _accept_any_accept_header
+    except Exception:
+        pass
+
     thread = threading.Thread(target=_background_refresh_loop, daemon=True)
     thread.start()
 
@@ -4092,109 +3472,6 @@ def _collect_day_snapshot(*args, **kwargs):
 # === END GARMIN METRICS PATCH ===
 
 # === GARMIN_ES_TRANSLATIONS_PATCH_START ===
-_GARMIN_STATUS_ES_GENERIC = {
-    "BALANCED": "Equilibrado",
-    "LOW": "Bajo",
-    "MODERATE": "Moderada",
-    "HIGH": "Alto",
-    "OPTIMAL": "Óptimo",
-    "POOR": "Deficiente",
-    "UNBALANCED": "Desequilibrado",
-    "NORMAL": "Normal",
-}
-
-_GARMIN_STATUS_ES_BY_FIELD = {
-    "stress_label": {
-        "BALANCED": "Equilibrado",
-        "LOW": "Bajo",
-        "MODERATE": "Moderada",
-        "HIGH": "Alto",
-    },
-    "hrv_status": {
-        "BALANCED": "Equilibrada",
-        "LOW": "Baja",
-        "MODERATE": "Moderada",
-        "HIGH": "Alta",
-    },
-    "training_readiness_status": {
-        "BALANCED": "Equilibrada",
-        "LOW": "Baja",
-        "MODERATE": "Moderada",
-        "HIGH": "Alta",
-    },
-    "acute_load_status": {
-        "OPTIMAL": "Óptima",
-        "LOW": "Baja",
-        "MODERATE": "Moderada",
-        "HIGH": "Alta",
-        "BALANCED": "Equilibrada",
-        "POOR": "Deficiente",
-        "UNBALANCED": "Desequilibrada",
-    },
-}
-
-_GARMIN_TRAINING_READINESS_MESSAGE_ES = {
-    "WORKING_HARD": "Entrenando duro",
-    "BALANCE_YOUR_TRAINING_LOAD": "Equilibra tu carga de entrenamiento",
-    "READY_TO_TRAIN": "Listo para entrenar",
-    "RECOVERING": "Recuperando",
-    "WELL_RECOVERED": "Bien recuperado",
-    "FATIGUED": "Fatigado",
-}
-
-_GARMIN_TRAINING_STATUS_ES = {
-    "PRODUCTIVE": "Productivo",
-    "MAINTAINING": "Mantenimiento",
-    "RECOVERY": "Recuperación",
-    "PEAKING": "Pico de forma",
-    "UNPRODUCTIVE": "No productivo",
-    "OVERREACHING": "Sobrecarga",
-    "DETRAINING": "Desentrenamiento",
-    "NO_STATUS": "Sin estado",
-}
-
-def _translate_metric_status_es(field_name, value):
-    if not value or not isinstance(value, str):
-        return None
-    field_map = _GARMIN_STATUS_ES_BY_FIELD.get(field_name) or {}
-    return field_map.get(value) or _GARMIN_STATUS_ES_GENERIC.get(value)
-
-def _translate_training_readiness_message_es(value):
-    if not value or not isinstance(value, str):
-        return None
-    return _GARMIN_TRAINING_READINESS_MESSAGE_ES.get(value)
-
-def _translate_training_status_es(value):
-    if not value or not isinstance(value, str):
-        return None
-    base = value.split("_", 1)[0]
-    return _GARMIN_TRAINING_STATUS_ES.get(base)
-
-def _extract_training_status_code(raw):
-    if not isinstance(raw, dict):
-        return None
-
-    latest = ((raw.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {})
-    if not isinstance(latest, dict) or not latest:
-        return None
-
-    entry = None
-    for v in latest.values():
-        if isinstance(v, dict) and v.get("primaryTrainingDevice"):
-            entry = v
-            break
-
-    if entry is None:
-        entry = next((v for v in latest.values() if isinstance(v, dict)), None)
-
-    if not isinstance(entry, dict):
-        return None
-
-    phrase = entry.get("trainingStatusFeedbackPhrase")
-    if isinstance(phrase, str) and phrase:
-        return phrase.split("_", 1)[0]
-
-    return None
 
 if "_collect_day_snapshot" in globals():
     _GARMIN_COACH_ORIGINAL_COLLECT_DAY_SNAPSHOT = _collect_day_snapshot
@@ -4237,84 +3514,6 @@ if "_collect_day_snapshot" in globals():
 
 # ==== ES_FINAL_TRANSLATIONS_PATCH_START ====
 
-_ES_STATUS_MAP = {
-    "BALANCED": "Equilibrado",
-    "LOW": "Bajo",
-    "MODERATE": "Moderada",
-    "HIGH": "Alto",
-    "OPTIMAL": "Óptimo",
-    "PRODUCTIVE": "Productivo",
-    "RECOVERY": "Recuperación",
-    "STRAINED": "Sobrecarga",
-    "OVERREACHING": "Exceso de carga",
-    "DETRAINING": "Desentrenamiento",
-    "MAINTAINING": "Mantenimiento",
-    "PEAKING": "Pico de forma",
-}
-
-_ES_MESSAGE_MAP = {
-    "WORKING_HARD": "Entrenando duro",
-    "BALANCE_YOUR_TRAINING_LOAD": "Equilibra tu carga de entrenamiento",
-}
-
-ES_FIELD_LABELS = {
-    "body_battery_current": "Batería corporal actual",
-    "body_battery_max": "Batería corporal máxima",
-    "body_battery_min": "Batería corporal mínima",
-    "body_battery_charged": "Batería corporal cargada",
-    "body_battery_drained": "Batería corporal drenada",
-    "body_battery_status": "Estado de la batería corporal",
-    "sleep_duration_seconds": "Duración del sueño",
-    "sleep_hours": "Horas de sueño",
-    "sleep_score": "Puntuación de sueño",
-    "sleep_deep_min": "Sueño profundo",
-    "sleep_rem_min": "Sueño REM",
-    "sleep_light_min": "Sueño ligero",
-    "sleep_awake_min": "Tiempo despierto",
-    "resting_heart_rate": "FC en reposo",
-    "resting_heart_rate_7d_avg": "FC en reposo media de 7 días",
-    "stress_avg": "Estrés medio",
-    "stress_max": "Estrés máximo",
-    "stress_label": "Estado del estrés",
-    "hrv_last_night": "VFC nocturna",
-    "hrv_weekly_avg": "VFC media semanal",
-    "hrv_status": "Estado de la VFC",
-    "hrv_baseline_low": "Límite inferior equilibrado de la VFC",
-    "hrv_baseline_high": "Límite superior equilibrado de la VFC",
-    "hrv_last_night_5min_high": "Máximo nocturno de VFC en 5 min",
-    "training_readiness_score": "Preparación para entrenar",
-    "training_readiness_status": "Estado de preparación para entrenar",
-    "training_readiness_message": "Mensaje de preparación para entrenar",
-    "training_readiness_recovery_time": "Recuperación restante",
-    "training_readiness_input_context": "Contexto de preparación para entrenar",
-    "acute_load": "Carga aguda",
-    "acute_load_ratio": "Ratio carga aguda/crónica",
-    "acute_load_status": "Estado de la carga aguda",
-    "steps": "Pasos",
-    "steps_goal": "Objetivo de pasos",
-    "vo2max": "VO2max",
-}
-
-ES_TERM_LABELS = {
-    "hr": "FC",
-    "rhr": "FC en reposo",
-    "hrv": "VFC",
-    "vo2max": "VO2max",
-    "spo2": "SpO2",
-    "rem": "REM",
-    "body_battery": "Batería corporal",
-}
-
-def _translate_status_es(value):
-    if value is None:
-        return None
-    return _ES_STATUS_MAP.get(str(value).strip().upper(), value)
-
-def _translate_message_es(value):
-    if value is None:
-        return None
-    return _ES_MESSAGE_MAP.get(str(value).strip().upper(), value)
-
 try:
     _collect_day_snapshot_original_es_patch
 except NameError:
@@ -4336,43 +3535,6 @@ def _collect_day_snapshot(*args, **kwargs):
 # ==== ES_FINAL_TRANSLATIONS_PATCH_END ====
 
 # === CANONICAL_ES_TRANSLATIONS_START ===
-_FINAL_STATUS_ES = {
-    "BALANCED": "Equilibrado",
-    "UNBALANCED": "Desequilibrado",
-    "LOW": "Bajo",
-    "MODERATE": "Moderada",
-    "HIGH": "Alto",
-    "VERY_HIGH": "Muy alto",
-    "OPTIMAL": "Óptimo",
-    "PRODUCTIVE": "Productivo",
-    "RECOVERY": "Recuperación",
-    "UNPRODUCTIVE": "No productivo",
-    "PEAK": "Pico",
-    "MAINTAINING": "Mantenimiento",
-    "OVERREACHING": "Exceso de carga",
-}
-
-_FINAL_MESSAGE_ES = {
-    "WORKING_HARD": "Entrenando duro",
-    "BALANCE_YOUR_TRAINING_LOAD": "Equilibra tu carga de entrenamiento",
-    "UNKNOWN": "Desconocido",
-    "PRODUCTIVE": "Productivo",
-    "RECOVERY": "Recuperación",
-    "UNPRODUCTIVE": "No productivo",
-    "OVERREACHING": "Exceso de carga",
-}
-
-def _translate_status_es(value):
-    if value is None:
-        return None
-    value = str(value).strip().upper()
-    return _FINAL_STATUS_ES.get(value, value)
-
-def _translate_message_es(value):
-    if value is None:
-        return None
-    value = str(value).strip().upper()
-    return _FINAL_MESSAGE_ES.get(value, value)
 
 try:
     _collect_day_snapshot_original_es_final
@@ -4394,245 +3556,6 @@ def _collect_day_snapshot(*args, **kwargs):
 
 
 # === TRAINING READINESS RECOVERY GUARDRAILS START ===
-_RECOVERY_STATE_ES = {
-    "fresh": "Fresco",
-    "estimated_from_last_activity": "Estimado desde la última actividad",
-    "stale": "Desactualizado",
-    "missing_timestamp": "Sin marca temporal",
-    "missing": "Sin datos",
-}
-
-
-def _safe_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-def _parse_garmin_datetime(value: Any) -> datetime | None:
-    if value is None:
-        return None
-
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            ts = float(value)
-            if ts > 1_000_000_000_000:
-                ts /= 1000.0
-            dt = datetime.fromtimestamp(ts, tz=APP_TIMEZONE)
-        except Exception:
-            return None
-    else:
-        raw = str(value).strip()
-        if not raw:
-            return None
-
-        candidates = [raw]
-        if " " in raw and "T" not in raw:
-            candidates.append(raw.replace(" ", "T", 1))
-
-        dt = None
-        for candidate in candidates:
-            normalized = candidate
-            if normalized.endswith("Z"):
-                normalized = normalized[:-1] + "+00:00"
-            try:
-                dt = datetime.fromisoformat(normalized)
-                break
-            except ValueError:
-                continue
-
-        if dt is None:
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
-                try:
-                    dt = datetime.strptime(raw, fmt)
-                    break
-                except ValueError:
-                    continue
-
-        if dt is None:
-            return None
-
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=APP_TIMEZONE)
-    return dt.astimezone(APP_TIMEZONE)
-
-
-def _extract_latest_activity_end_local(raw_sources: Any) -> datetime | None:
-    if not isinstance(raw_sources, dict):
-        return None
-
-    latest = None
-    for key in ("recent_activities_raw", "activities_for_date_raw"):
-        activities = raw_sources.get(key)
-        if not isinstance(activities, list):
-            continue
-
-        for activity in activities:
-            if not isinstance(activity, dict):
-                continue
-
-            start_dt = _parse_garmin_datetime(
-                activity.get("endTimeLocal")
-                or activity.get("stopTimeLocal")
-                or activity.get("startTimeLocal")
-                or activity.get("startTimeGMT")
-                or activity.get("beginTimestamp")
-            )
-            if start_dt is None:
-                continue
-
-            end_dt = _parse_garmin_datetime(activity.get("endTimeLocal") or activity.get("stopTimeLocal"))
-            if end_dt is None:
-                duration_seconds = _safe_float(activity.get("duration"))
-                if duration_seconds is not None:
-                    end_dt = start_dt + timedelta(seconds=duration_seconds)
-                else:
-                    end_dt = start_dt
-
-            if latest is None or end_dt > latest:
-                latest = end_dt
-
-    return latest
-
-
-def _extract_recovery_value(entry: dict[str, Any]) -> tuple[float | None, str | None, str | None]:
-    for key, unit in (
-        ("recoveryMinutes", "minutes"),
-        ("recoveryTimeMinutes", "minutes"),
-        ("recoveryMin", "minutes"),
-        ("recoveryHours", "hours"),
-        ("recoveryTime", "hours_assumed"),
-    ):
-        value = _safe_float(entry.get(key))
-        if value is not None:
-            return value, unit, key
-    return None, None, None
-
-
-def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
-    base_result: dict[str, Any] = {
-        "training_readiness_recovery_time_raw": None,
-        "training_readiness_recovery_time_raw_key": None,
-        "training_readiness_recovery_time_unit": None,
-        "training_readiness_recovery_time_unit_is_assumed": False,
-        "training_readiness_recovery_reference_source": None,
-        "training_readiness_recovery_reference_local": None,
-        "training_readiness_recovery_age_minutes": None,
-        "training_readiness_recovery_state": "missing",
-        "training_readiness_recovery_state_es": _RECOVERY_STATE_ES.get("missing"),
-        "training_readiness_recovery_is_stale": True,
-        "training_readiness_recovery_minutes_remaining": None,
-        "training_readiness_recovery_hours_remaining": None,
-        "training_readiness_recovery_time": None,
-        "training_readiness_recovery_safe_text": "Sin datos de recuperación",
-        "training_readiness_recovery_answer_for_llm": "Sin datos de recuperación en este snapshot",
-    }
-
-    if not isinstance(entry, dict):
-        return base_result
-
-    raw_value, unit, raw_key = _extract_recovery_value(entry)
-    reference_dt = _parse_garmin_datetime(entry.get("timestampLocal") or entry.get("timestamp"))
-    reference_source = "training_readiness_timestamp"
-    if reference_dt is None:
-        reference_dt = _extract_latest_activity_end_local(raw_sources)
-        if reference_dt is not None:
-            reference_source = "last_activity_end"
-
-    result: dict[str, Any] = {
-        "training_readiness_recovery_time_raw": raw_value,
-        "training_readiness_recovery_time_raw_key": raw_key,
-        "training_readiness_recovery_time_unit": unit,
-        "training_readiness_recovery_time_unit_is_assumed": unit == "hours_assumed",
-        "training_readiness_recovery_reference_source": reference_source if reference_dt is not None else None,
-        "training_readiness_recovery_reference_local": reference_dt.isoformat() if reference_dt is not None else None,
-        "training_readiness_recovery_age_minutes": None,
-        "training_readiness_recovery_state": "missing",
-        "training_readiness_recovery_state_es": _RECOVERY_STATE_ES.get("missing"),
-        "training_readiness_recovery_is_stale": True,
-        "training_readiness_recovery_minutes_remaining": None,
-        "training_readiness_recovery_hours_remaining": None,
-        "training_readiness_recovery_time": None,
-        "training_readiness_recovery_safe_text": "Sin datos de recuperación",
-        "training_readiness_recovery_answer_for_llm": "Sin datos de recuperación en este snapshot",
-    }
-
-    if raw_value is None:
-        state = "missing"
-        age_minutes = None
-    elif reference_dt is None:
-        state = "missing_timestamp"
-        age_minutes = None
-    else:
-        age_minutes = max(0, int((_now_local() - reference_dt).total_seconds() // 60))
-        crossed_local_day = reference_dt.date() < _today_local()
-        is_stale = age_minutes > RECOVERY_MAX_FRESH_MINUTES or (crossed_local_day and age_minutes > RECOVERY_CROSS_DAY_STALE_MINUTES)
-        if is_stale:
-            state = "stale"
-        elif reference_source == "last_activity_end":
-            state = "estimated_from_last_activity"
-        else:
-            state = "fresh"
-
-    result["training_readiness_recovery_age_minutes"] = age_minutes
-    result["training_readiness_recovery_state"] = state
-    result["training_readiness_recovery_state_es"] = _RECOVERY_STATE_ES.get(state, state)
-    result["training_readiness_recovery_is_stale"] = state in {"stale", "missing", "missing_timestamp"}
-
-    if raw_value is None or state in {"stale", "missing", "missing_timestamp"} or unit is None:
-        result.setdefault("training_readiness_recovery_minutes_remaining", None)
-        result.setdefault("training_readiness_recovery_hours_remaining", None)
-        result["training_readiness_recovery_time"] = 0 if raw_value == 0 else None
-
-        if state == "stale":
-            result["training_readiness_recovery_safe_text"] = "Dato de recuperación desactualizado; no extrapolar"
-        elif state == "missing_timestamp":
-            result["training_readiness_recovery_safe_text"] = "Sin marca temporal; no extrapolar"
-        else:
-            result["training_readiness_recovery_safe_text"] = "Sin datos de recuperación"
-
-        result["training_readiness_recovery_answer_for_llm"] = result["training_readiness_recovery_safe_text"]
-        return result
-
-    if unit == "minutes":
-        base_minutes = raw_value
-    else:
-        base_minutes = raw_value * 60.0
-
-    remaining_minutes = max(0, int(round(base_minutes - float(age_minutes or 0))))
-    remaining_hours = round(remaining_minutes / 60.0, 1)
-    result["training_readiness_recovery_minutes_remaining"] = remaining_minutes
-    result["training_readiness_recovery_hours_remaining"] = remaining_hours
-    result["training_readiness_recovery_time"] = int((remaining_minutes + 59) // 60) if unit in {"hours", "hours_assumed"} else remaining_minutes
-
-    if state == "fresh":
-        if remaining_minutes == 0:
-            result["training_readiness_recovery_safe_text"] = "0 min restantes"
-        elif remaining_minutes < 60:
-            result["training_readiness_recovery_safe_text"] = f"{remaining_minutes} min restantes"
-        else:
-            result["training_readiness_recovery_safe_text"] = f"{remaining_hours} h restantes"
-    elif state == "estimated_from_last_activity":
-        if remaining_minutes == 0:
-            result["training_readiness_recovery_safe_text"] = "Estimación: 0 min restantes"
-        elif remaining_minutes < 60:
-            result["training_readiness_recovery_safe_text"] = f"Estimación: {remaining_minutes} min restantes"
-        else:
-            result["training_readiness_recovery_safe_text"] = f"Estimación: {remaining_hours} h restantes"
-    elif state == "stale":
-        result["training_readiness_recovery_safe_text"] = "Dato de recuperación desactualizado; no extrapolar"
-    elif state == "missing_timestamp":
-        result["training_readiness_recovery_safe_text"] = "Sin marca temporal; no extrapolar"
-    else:
-        result["training_readiness_recovery_safe_text"] = "Sin datos de recuperación"
-
-    result["training_readiness_recovery_answer_for_llm"] = result["training_readiness_recovery_safe_text"]
-    return result
 
 
 try:
@@ -4897,17 +3820,6 @@ ES_FIELD_LABELS.update({
 
 
 # === RAW SLEEP DTO CANONICALIZATION START ===
-def _parse_epoch_millis_to_local_iso(value: Any) -> str | None:
-    if value is None:
-        return None
-    try:
-        ts = float(value)
-        if ts > 1_000_000_000_000:
-            ts /= 1000.0
-        dt = datetime.fromtimestamp(ts, tz=APP_TIMEZONE)
-        return dt.isoformat()
-    except Exception:
-        return None
 
 
 try:
@@ -5043,16 +3955,6 @@ ES_FIELD_LABELS.update({
 
 
 # === SLEEP GMT TIMESTAMP FIX START ===
-def _epoch_millis_gmt_to_local_iso(value: Any) -> str | None:
-    if value is None:
-        return None
-    try:
-        ts = float(value)
-        if ts > 1_000_000_000_000:
-            ts /= 1000.0
-        return datetime.fromtimestamp(ts, tz=APP_TIMEZONE).isoformat()
-    except Exception:
-        return None
 
 
 try:
@@ -5086,15 +3988,6 @@ def _collect_day_snapshot(*args, **kwargs):
 
 
 # === SLEEP FRESHNESS GUARDRAILS START ===
-def _hours_between_local_datetimes(newer: Any, older: Any) -> float | None:
-    newer_dt = _parse_garmin_datetime(newer) if newer is not None else None
-    older_dt = _parse_garmin_datetime(older) if older is not None else None
-    if newer_dt is None or older_dt is None:
-        return None
-    try:
-        return round((newer_dt - older_dt).total_seconds() / 3600.0, 1)
-    except Exception:
-        return None
 
 
 try:
@@ -5201,50 +4094,6 @@ ES_FIELD_LABELS.update({
 
 
 # === MULTI_DAY_SLEEP_SELECTION START ===
-def _find_sleep_client_in_args(*args, **kwargs):
-    candidates = list(args) + list(kwargs.values())
-    for obj in candidates:
-        if hasattr(obj, "get_sleep_data") and callable(getattr(obj, "get_sleep_data")):
-            return obj
-    return None
-
-
-def _sleep_candidate_from_raw(sleep_raw: Any) -> dict[str, Any] | None:
-    if not isinstance(sleep_raw, dict):
-        return None
-    daily = sleep_raw.get("dailySleepDTO")
-    if not isinstance(daily, dict):
-        return None
-
-    sleep_seconds = daily.get("sleepTimeSeconds")
-    if sleep_seconds in (None, 0):
-        return None
-
-    end_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepEndTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampLocal"))
-    )
-    start_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepStartTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampLocal"))
-    )
-
-    end_dt = _parse_garmin_datetime(end_local) if end_local else None
-    start_dt = _parse_garmin_datetime(start_local) if start_local else None
-
-    if end_dt is None:
-        return None
-
-    return {
-        "raw": sleep_raw,
-        "daily": daily,
-        "calendar_date": daily.get("calendarDate"),
-        "sleep_seconds": sleep_seconds,
-        "start_local": start_local,
-        "end_local": end_local,
-        "start_dt": start_dt,
-        "end_dt": end_dt,
-    }
 
 
 def _pick_latest_sleep_from_client(client: Any, snapshot_local_iso: str | None) -> dict[str, Any] | None:
@@ -5295,107 +4144,6 @@ def _pick_latest_sleep_from_client(client: Any, snapshot_local_iso: str | None) 
     }
 
 
-def _apply_sleep_candidate_to_metrics(metrics: dict[str, Any], candidate: dict[str, Any], source_label: str) -> None:
-    daily = candidate["daily"]
-
-    score = None
-    sleep_scores = daily.get("sleepScores")
-    if isinstance(sleep_scores, dict):
-        overall = sleep_scores.get("overall")
-        if isinstance(overall, dict):
-            score = overall.get("value")
-
-    duration_seconds = daily.get("sleepTimeSeconds")
-    rem_seconds = daily.get("remSleepSeconds")
-    deep_seconds = daily.get("deepSleepSeconds")
-    light_seconds = daily.get("lightSleepSeconds")
-    awake_seconds = daily.get("awakeSleepSeconds")
-
-    start_local_iso = candidate.get("start_local")
-    end_local_iso = candidate.get("end_local")
-
-    metrics["sueno_fecha_calendario"] = daily.get("calendarDate")
-    metrics["sueno_origen_canonico"] = source_label
-    metrics["sleep_score"] = score
-    metrics["sleep_duration_seconds"] = duration_seconds
-
-    metrics["puntuacion_de_sueno"] = score
-    metrics["duracion_de_sueno_texto"] = _format_duration_hm(duration_seconds)
-    metrics["sueno_texto_seguro"] = _build_sleep_safe_text(
-        metrics.get("puntuacion_de_sueno"),
-        metrics.get("duracion_de_sueno_texto"),
-    )
-    metrics["sueno_resumen_humano"] = metrics.get("sueno_texto_seguro")
-
-    metrics["sueno_rem_texto"] = _format_duration_hm(rem_seconds)
-    metrics["sueno_profundo_texto"] = _format_duration_hm(deep_seconds)
-    metrics["sueno_ligero_texto"] = _format_duration_hm(light_seconds)
-    metrics["sueno_despierto_texto"] = _format_duration_hm(awake_seconds)
-
-    metrics["sueno_inicio_local"] = start_local_iso
-    metrics["sueno_fin_local"] = end_local_iso
-    metrics["sueno_inicio_texto"] = _short_local_dt_text(start_local_iso)
-    metrics["sueno_fin_texto"] = _short_local_dt_text(end_local_iso)
-
-    metrics["sueno_numero_despertares"] = daily.get("awakeCount")
-    metrics["sueno_feedback_raw"] = daily.get("sleepScoreFeedback")
-    metrics["sueno_insight_raw"] = daily.get("sleepScoreInsight")
-    metrics["sueno_personalized_insight_raw"] = daily.get("sleepScorePersonalizedInsight")
-
-    fases = []
-    if metrics.get("sueno_rem_texto"):
-        fases.append(f'REM {metrics.get("sueno_rem_texto")}')
-    if metrics.get("sueno_profundo_texto"):
-        fases.append(f'Profundo {metrics.get("sueno_profundo_texto")}')
-    if metrics.get("sueno_ligero_texto"):
-        fases.append(f'Ligero {metrics.get("sueno_ligero_texto")}')
-    if metrics.get("sueno_despierto_texto"):
-        fases.append(f'Despierto {metrics.get("sueno_despierto_texto")}')
-    metrics["sueno_fases_resumen_humano"] = ", ".join(fases) if fases else None
-
-    current_datos_hasta = _parse_garmin_datetime(metrics.get("datos_hasta_local")) if metrics.get("datos_hasta_local") else None
-    sleep_end_dt = _parse_garmin_datetime(end_local_iso) if end_local_iso else None
-    if sleep_end_dt is not None and (current_datos_hasta is None or sleep_end_dt > current_datos_hasta):
-        metrics["datos_hasta_local"] = sleep_end_dt.isoformat()
-        metrics["datos_hasta_texto"] = _short_local_dt_text(metrics.get("datos_hasta_local"))
-
-
-def _recompute_sleep_freshness_fields(metrics: dict[str, Any]) -> None:
-    snapshot_local = metrics.get("snapshot_obtenido_local") or _now_local().isoformat()
-    sleep_ref_local = metrics.get("sueno_fin_local") or metrics.get("sueno_referencia_local")
-    sleep_ref_dt = _parse_garmin_datetime(sleep_ref_local) if sleep_ref_local is not None else None
-    snapshot_dt = _parse_garmin_datetime(snapshot_local) if snapshot_local is not None else None
-
-    state = "missing"
-    if sleep_ref_dt is not None and snapshot_dt is not None:
-        state = "fresh" if sleep_ref_dt.date() == snapshot_dt.date() else "stale"
-    elif sleep_ref_dt is not None:
-        state = "unknown"
-
-    age_hours = _hours_between_local_datetimes(snapshot_local, sleep_ref_local)
-
-    metrics["sueno_referencia_local"] = sleep_ref_dt.isoformat() if sleep_ref_dt is not None else None
-    metrics["sueno_antiguedad_horas"] = age_hours
-    metrics["sueno_estado_frescura"] = state
-    metrics["sueno_es_actual"] = state == "fresh"
-
-    summary = metrics.get("sueno_resumen_humano") or metrics.get("sueno_texto_seguro")
-    phases = metrics.get("sueno_fases_resumen_humano")
-
-    if state == "fresh":
-        metrics["sueno_resumen_para_llm"] = summary
-        metrics["sueno_fases_para_llm"] = phases
-    elif state == "stale":
-        ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or metrics.get("sueno_fecha_calendario")
-        metrics["sueno_resumen_para_llm"] = f"Último sueño disponible del conector: {ref_text}; no asumir que corresponde a anoche"
-        metrics["sueno_fases_para_llm"] = None
-    elif state == "unknown":
-        ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or "sin fecha clara"
-        metrics["sueno_resumen_para_llm"] = f"Hay un sueño disponible ({ref_text}), pero no se pudo validar si corresponde a hoy"
-        metrics["sueno_fases_para_llm"] = None
-    else:
-        metrics["sueno_resumen_para_llm"] = "No hay sueño usable en el snapshot actual"
-        metrics["sueno_fases_para_llm"] = None
 
 
 try:
@@ -5468,57 +4216,6 @@ async def debug_sleep_selection(_: Request) -> JSONResponse:
 
 # === GARMIN GET_SLEEP_DATA MULTI-DAY WRAPPER START ===
 _SLEEP_SELECTION_DEBUG_LAST = None
-
-
-def _parse_iso_date_or_today(value: Any) -> date:
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if value is None:
-        return _today_local()
-    raw = str(value).strip()
-    if not raw:
-        return _today_local()
-    try:
-        return date.fromisoformat(raw[:10])
-    except Exception:
-        return _today_local()
-
-
-def _sleep_candidate_from_raw_for_wrapper(requested_date_iso: str, sleep_raw: Any) -> dict[str, Any] | None:
-    if not isinstance(sleep_raw, dict):
-        return None
-    daily = sleep_raw.get("dailySleepDTO")
-    if not isinstance(daily, dict):
-        return None
-
-    sleep_seconds = daily.get("sleepTimeSeconds")
-    if sleep_seconds in (None, 0):
-        return None
-
-    end_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepEndTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampLocal"))
-    )
-    start_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepStartTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampLocal"))
-    )
-
-    end_dt = _parse_garmin_datetime(end_local) if end_local else None
-    start_dt = _parse_garmin_datetime(start_local) if start_local else None
-    if end_dt is None:
-        return None
-
-    return {
-        "requested_date": requested_date_iso,
-        "calendar_date": daily.get("calendarDate"),
-        "sleep_seconds": sleep_seconds,
-        "start_local": start_local,
-        "end_local": end_local,
-        "start_dt": start_dt,
-        "end_dt": end_dt,
-        "raw": sleep_raw,
-    }
 
 
 try:
@@ -6286,12 +4983,6 @@ _ACTIVITY_SUMMARY_KEYS = [
     "vigorousIntensityMinutes",
 ]
 
-_ACTIVITY_TRANSPORT_TYPES = {"motorcycling", "driving", "car", "automotive"}
-_ACTIVITY_ENDURANCE_TYPES = {"running", "treadmill_running", "walking", "hiking", "trail_running", "track_running"}
-_ACTIVITY_STRENGTH_TYPES = {"strength_training"}
-_ACTIVITY_CYCLING_TYPES = {"cycling", "indoor_cycling", "mountain_biking", "road_biking", "virtual_ride"}
-_ACTIVITY_SWIM_TYPES = {"lap_swimming", "open_water_swimming", "swimming"}
-
 
 def _activity_type_key_from_payload(payload: Any) -> str | None:
     if not isinstance(payload, dict):
@@ -6301,22 +4992,6 @@ def _activity_type_key_from_payload(payload: Any) -> str | None:
         if isinstance(value, dict) and value.get("typeKey"):
             return str(value.get("typeKey"))
     return None
-
-
-def _activity_family(activity_type: str | None) -> str:
-    if not activity_type:
-        return "other"
-    if activity_type in _ACTIVITY_ENDURANCE_TYPES:
-        return "endurance"
-    if activity_type in _ACTIVITY_STRENGTH_TYPES:
-        return "strength"
-    if activity_type in _ACTIVITY_CYCLING_TYPES:
-        return "cycling"
-    if activity_type in _ACTIVITY_SWIM_TYPES:
-        return "swimming"
-    if activity_type in _ACTIVITY_TRANSPORT_TYPES:
-        return "transport"
-    return activity_type
 
 
 def _pick_activity_summary(summary: Any) -> dict[str, Any]:
@@ -8267,189 +6942,16 @@ def get_hybrid_coach_snapshot(limit: int = 12, target_date: str | None = None) -
 
 # === MCPX HYBRID COACH DECISION START ===
 
-def _decision_num(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
 
 
-def _decision_pick_primary_driver(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> str:
-    readiness = _decision_num(ctx.get("training_readiness"))
-    bb = _decision_num(ctx.get("body_battery_current"))
-    sleep = _decision_num(ctx.get("sleep_score"))
-    hrv = _decision_num(ctx.get("hrv_last_night"))
-    acute = _decision_num(ctx.get("acute_load"))
-
-    if readiness is not None and readiness <= 45:
-        return "Predisposición para entrenar baja o moderada-baja"
-    if bb is not None and bb <= 35:
-        return "Body Battery bajo"
-    if sleep is not None and sleep <= 65:
-        return "Sueño mejorable"
-    if latest_run and _decision_num(latest_run.get("training_load")) and _decision_num(latest_run.get("training_load")) >= 220:
-        return "La última sesión endurance fue exigente"
-    if latest_strength and _decision_num(latest_strength.get("training_load")) and _decision_num(latest_strength.get("training_load")) >= 60:
-        return "La última sesión de fuerza dejó carga relevante"
-    if acute is not None:
-        return "Carga aguda reciente"
-    if hrv is not None:
-        return "Contexto de VFC reciente"
-    return "Contexto general de recuperación"
 
 
-def _decision_collect_reasons(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> list[str]:
-    reasons: list[str] = []
-
-    readiness = _decision_num(ctx.get("training_readiness"))
-    bb = _decision_num(ctx.get("body_battery_current"))
-    sleep = _decision_num(ctx.get("sleep_score"))
-    hrv = _decision_num(ctx.get("hrv_last_night"))
-    stress = _decision_num(ctx.get("stress_avg"))
-    acute = _decision_num(ctx.get("acute_load"))
-    acute_status_es = ctx.get("acute_load_status_es")
-    training_status_es = ctx.get("training_status_es")
-
-    if readiness is not None:
-        reasons.append(f"Predisposición para entrenar: {round(readiness)}")
-    if bb is not None:
-        reasons.append(f"Body Battery actual: {round(bb)}")
-    if sleep is not None:
-        reasons.append(f"Puntuación de sueño: {round(sleep)}")
-    if hrv is not None:
-        reasons.append(f"VFC nocturna: {round(hrv)} ms")
-    if stress is not None:
-        reasons.append(f"Estrés medio: {round(stress)}")
-    if acute is not None:
-        if acute_status_es:
-            reasons.append(f"Carga aguda: {round(acute)} ({acute_status_es})")
-        else:
-            reasons.append(f"Carga aguda: {round(acute)}")
-    if training_status_es:
-        reasons.append(f"Estado de entreno: {training_status_es}")
-
-    if latest_run:
-        run_load = _decision_num(latest_run.get("training_load"))
-        run_te = _decision_num(latest_run.get("training_effect_aerobic"))
-        run_stamina_end = _decision_num(latest_run.get("stamina_end"))
-        if run_load is not None:
-            reasons.append(f"Última sesión endurance carga: {round(run_load, 1)}")
-        if run_te is not None:
-            reasons.append(f"Último TE aeróbico endurance: {round(run_te, 1)}")
-        if run_stamina_end is not None:
-            reasons.append(f"Energía disponible final endurance: {round(run_stamina_end)}")
-
-    if latest_strength:
-        strength_load = _decision_num(latest_strength.get("training_load"))
-        sets_ = _decision_num(latest_strength.get("active_sets_estimated"))
-        volume = _decision_num(latest_strength.get("total_volume_kg_estimated"))
-        if strength_load is not None:
-            reasons.append(f"Última fuerza carga: {round(strength_load, 1)}")
-        if sets_ is not None:
-            reasons.append(f"Última fuerza sets activos: {round(sets_)}")
-        if volume is not None:
-            reasons.append(f"Última fuerza volumen estimado: {round(volume)} kg")
-
-    return reasons
 
 
-def _decision_collect_risks(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> list[str]:
-    risks: list[str] = []
-
-    readiness = _decision_num(ctx.get("training_readiness"))
-    bb = _decision_num(ctx.get("body_battery_current"))
-    sleep = _decision_num(ctx.get("sleep_score"))
-    stress = _decision_num(ctx.get("stress_avg"))
-
-    if readiness is not None and readiness <= 45:
-        risks.append("La predisposición para entrenar no es alta.")
-    if bb is not None and bb <= 35:
-        risks.append("El Body Battery es bajo para meter calidad agresiva.")
-    if sleep is not None and sleep <= 65:
-        risks.append("El sueño no ha sido especialmente reparador.")
-    if stress is not None and stress >= 40:
-        risks.append("El estrés medio diario no es bajo.")
-
-    if latest_run:
-        gct = _decision_num(latest_run.get("ground_contact_time_ms"))
-        vr = _decision_num(latest_run.get("vertical_ratio"))
-        run_load = _decision_num(latest_run.get("training_load"))
-        if run_load is not None and run_load >= 220:
-            risks.append("La última sesión endurance dejó una carga alta.")
-        if gct is not None and gct >= 295:
-            risks.append("El tiempo de contacto con el suelo reciente es relativamente alto.")
-        if vr is not None and vr >= 9.0:
-            risks.append("La relación vertical reciente es exigente para sostener más intensidad.")
-
-    if latest_strength:
-        sets_ = _decision_num(latest_strength.get("active_sets_estimated"))
-        volume = _decision_num(latest_strength.get("total_volume_kg_estimated"))
-        if sets_ is not None and sets_ >= 18:
-            risks.append("La última sesión de fuerza tuvo bastante volumen de trabajo.")
-        if volume is not None and volume >= 10000:
-            risks.append("El volumen total de fuerza reciente es alto.")
-
-    return risks
 
 
-def _decision_level(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> tuple[str, str, str]:
-    readiness = _decision_num(ctx.get("training_readiness"))
-    bb = _decision_num(ctx.get("body_battery_current"))
-    sleep = _decision_num(ctx.get("sleep_score"))
-
-    latest_run_load = _decision_num((latest_run or {}).get("training_load"))
-    latest_strength_load = _decision_num((latest_strength or {}).get("training_load"))
-
-    if (readiness is not None and readiness <= 45) or (bb is not None and bb <= 28) or (sleep is not None and sleep <= 50):
-        return (
-            "descanso_recuperacion",
-            "Descanso o recuperación",
-            "Hoy priorizaría recuperación, movilidad o paseo suave."
-        )
-
-    if (
-        (readiness is not None and readiness <= 60)
-        or (bb is not None and bb <= 45)
-        or (sleep is not None and sleep <= 65)
-        or (latest_run_load is not None and latest_run_load >= 220)
-        or (latest_strength_load is not None and latest_strength_load >= 60)
-    ):
-        return (
-            "suave_controlado",
-            "Día suave o controlado",
-            "Hoy encaja mejor una sesión suave, técnica o trabajo aeróbico controlado."
-        )
-
-    return (
-        "intensidad_controlada",
-        "Intensidad controlada",
-        "Hoy podrías meter calidad, pero con control de volumen y sin encadenar fatiga innecesaria."
-    )
 
 
-def _decision_recommendation_text(level_key: str, latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> str:
-    if level_key == "descanso_recuperacion":
-        return (
-            "Haz descanso, movilidad o paseo muy suave de 20-40 min. "
-            "Nada de calidad ni fuerza dura."
-        )
-
-    if level_key == "suave_controlado":
-        if latest_run and latest_strength:
-            return (
-                "Haz endurance suave en Z2 real 30-45 min o una fuerza ligera/técnica recortando volumen. "
-                "Evita combinar fuerza pesada con trabajo intenso de carrera."
-            )
-        return (
-            "Haz una sesión suave y controlada, priorizando técnica, base aeróbica o fuerza ligera."
-        )
-
-    return (
-        "Puedes hacer una sesión de calidad controlada. "
-        "Mejor una sola pieza principal: tempo/umbral en cinta o carrera, o fuerza principal con volumen contenido."
-    )
 
 
 @mcp.tool
@@ -8487,36 +6989,10 @@ def get_hybrid_coach_decision(limit: int = 12, target_date: str | None = None) -
 
 # === MCPX HYBRID USER BRIEFING START ===
 
-def _brief_num(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
 
 
-def _brief_int(value: Any) -> int | None:
-    num = _brief_num(value)
-    if num is None:
-        return None
-    return int(round(num))
 
 
-def _brief_primary_message(decision: dict[str, Any], ctx: dict[str, Any]) -> str:
-    title = decision.get("level_title") or "Día sin clasificar"
-    readiness = _brief_int(ctx.get("training_readiness"))
-    bb = _brief_int(ctx.get("body_battery_current"))
-    sleep = _brief_int(ctx.get("sleep_score"))
-
-    parts = [title]
-    if readiness is not None:
-        parts.append(f"predisposición {readiness}")
-    if bb is not None:
-        parts.append(f"Body Battery {bb}")
-    if sleep is not None:
-        parts.append(f"sueño {sleep}")
-    return " · ".join(parts)
 
 
 def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> dict[str, Any]:
@@ -12509,33 +10985,6 @@ try:
         mcp.instructions = _existing_instructions + _FRONTEND_EXTRA_ES_INSTRUCTIONS
 except Exception:
     pass
-
-_ACTIVITY_TYPE_ES = {
-    "running": "Correr",
-    "treadmill_running": "Correr en cinta",
-    "walking": "Caminar",
-    "hiking": "Senderismo",
-    "trail_running": "Trail running",
-    "track_running": "Carrera en pista",
-    "cycling": "Ciclismo",
-    "road_biking": "Ciclismo en carretera",
-    "indoor_cycling": "Ciclismo indoor",
-    "mountain_biking": "Ciclismo de montaña",
-    "virtual_ride": "Ciclismo virtual",
-    "strength_training": "Fuerza",
-    "cardio": "Cardio",
-    "elliptical": "Elíptica",
-    "pool_swimming": "Natación en piscina",
-    "open_water_swimming": "Natación en aguas abiertas",
-    "swimming": "Natación",
-}
-
-_ACTIVITY_FAMILY_ES = {
-    "endurance": "Resistencia",
-    "cycling": "Ciclismo",
-    "strength": "Fuerza",
-    "swimming": "Natación",
-}
 
 
 def _frontend_non_empty(value: Any) -> bool:

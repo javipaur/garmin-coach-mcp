@@ -13,6 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
+COPY config.py date_utils.py localization.py auth.py recovery.py sleep.py activity.py coaching.py workout.py route_gen.py .
 COPY server.py .
 COPY index.html .
 
