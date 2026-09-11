@@ -8,4 +8,4 @@ gpxpy>=1.6
 requests>=2.28
 qrcode>=7.0
 Pillow>=9.0
-pypdf>=4.0
+pypdf>=6.18.0
