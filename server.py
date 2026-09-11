@@ -2608,46 +2608,6 @@ async def debug_activities(_: Request) -> JSONResponse:
         return JSONResponse({"activities": result})
     # === End debug_activities ===
 
-    raw_sleep_top_level = {
-        k: v for k, v in raw_sources.items()
-        if should_keep(k)
-    }
-
-    raw_sleep_candidates = walk(raw_sources)
-
-    normalized_sleep = {
-        "snapshot_obtenido_local": metrics.get("snapshot_obtenido_local"),
-        "snapshot_obtenido_texto": metrics.get("snapshot_obtenido_texto"),
-        "datos_hasta_local": metrics.get("datos_hasta_local"),
-        "datos_hasta_texto": metrics.get("datos_hasta_texto"),
-        "puntuacion_de_sueno": metrics.get("puntuacion_de_sueno"),
-        "duracion_de_sueno_texto": metrics.get("duracion_de_sueno_texto"),
-        "sueno_texto_seguro": metrics.get("sueno_texto_seguro"),
-        "sueno_resumen_humano": metrics.get("sueno_resumen_humano"),
-        "sueno_rem_texto": metrics.get("sueno_rem_texto"),
-        "sueno_profundo_texto": metrics.get("sueno_profundo_texto"),
-        "sueno_ligero_texto": metrics.get("sueno_ligero_texto"),
-        "sueno_despierto_texto": metrics.get("sueno_despierto_texto"),
-        "sueno_inicio_texto": metrics.get("sueno_inicio_texto"),
-        "sueno_fin_texto": metrics.get("sueno_fin_texto"),
-        "sueno_fases_resumen_humano": metrics.get("sueno_fases_resumen_humano"),
-        "sleep_score": metrics.get("sleep_score"),
-        "sleep_duration_seconds": metrics.get("sleep_duration_seconds"),
-    }
-
-    payload = {
-        "status": status,
-        "last_refresh": last_refresh,
-        "last_refresh_local": _isoish_to_local(last_refresh),
-        "last_error": last_error,
-        "snapshot_exists": isinstance(snapshot, dict),
-        "normalized_sleep_metrics": normalized_sleep,
-        "raw_sources_info": raw_sources_info,
-        "raw_sleep_top_level": raw_sleep_top_level,
-        "raw_sleep_candidates": raw_sleep_candidates,
-    }
-    return JSONResponse(payload)
-
 
 # ---------------------------------------------------------------------------
 # Re-login web wizard routes
