@@ -16,7 +16,7 @@ python_version = "3.12"
 ignore_missing_imports = true
 exclude = ["server.py"]
 warn_unused_ignores = false
-check_untyped_defs = false
+check_untyped_defs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

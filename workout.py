@@ -7,14 +7,23 @@ from typing import Any
 def _garmin_workout_step_from_desc(step: dict[str, Any], step_order: int) -> dict[str, Any]:
     step_type = step.get("type", "active").lower()
     intensity_map = {
-        "warmup": "warmup", "calentamiento": "warmup",
-        "active": "interval", "interval": "interval", "intervalo": "interval",
-        "rest": "recovery", "recovery": "recovery", "recuperación": "recovery", "recuperacion": "recovery",
-        "cooldown": "cooldown", "vuelta a la calma": "cooldown",
+        "warmup": "warmup",
+        "calentamiento": "warmup",
+        "active": "interval",
+        "interval": "interval",
+        "intervalo": "interval",
+        "rest": "recovery",
+        "recovery": "recovery",
+        "recuperación": "recovery",
+        "recuperacion": "recovery",
+        "cooldown": "cooldown",
+        "vuelta a la calma": "cooldown",
     }
     intensity = intensity_map.get(step_type, "interval")
 
-    step_type_id = {"warmup": 1, "cooldown": 2, "interval": 3, "recovery": 4, "repeat": 6}.get(intensity, 3)
+    step_type_id = {"warmup": 1, "cooldown": 2, "interval": 3, "recovery": 4, "repeat": 6}.get(
+        intensity, 3
+    )
 
     duration_value: float | None = None
     duration_type = "time"
@@ -32,7 +41,11 @@ def _garmin_workout_step_from_desc(step: dict[str, Any], step_order: int) -> dic
     result: dict[str, Any] = {
         "type": "ExecutableStepDTO",
         "stepOrder": step_order,
-        "stepType": {"stepTypeId": step_type_id, "stepTypeKey": intensity, "displayOrder": step_type_id},
+        "stepType": {
+            "stepTypeId": step_type_id,
+            "stepTypeKey": intensity,
+            "displayOrder": step_type_id,
+        },
     }
 
     if duration_value is not None:
@@ -48,20 +61,26 @@ def _garmin_workout_step_from_desc(step: dict[str, Any], step_order: int) -> dic
     target_pace = step.get("target_pace_mps")
     if hr_zone:
         result["targetType"] = {
-            "workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone", "displayOrder": 3,
+            "workoutTargetTypeId": 4,
+            "workoutTargetTypeKey": "heart.rate.zone",
+            "displayOrder": 3,
         }
         result["targetValueOne"] = 0.0
         result["targetValueTwo"] = 0.0
         result["zoneNumber"] = int(hr_zone)
     elif target_pace:
         result["targetType"] = {
-            "workoutTargetTypeId": 5, "workoutTargetTypeKey": "speed.zone", "displayOrder": 4,
+            "workoutTargetTypeId": 5,
+            "workoutTargetTypeKey": "speed.zone",
+            "displayOrder": 4,
         }
         result["targetValueOne"] = float(target_pace)
         result["targetValueTwo"] = 0.0
     else:
         result["targetType"] = {
-            "workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1,
+            "workoutTargetTypeId": 1,
+            "workoutTargetTypeKey": "no.target",
+            "displayOrder": 1,
         }
         result["targetValueTwo"] = 0.0
 
@@ -69,12 +88,13 @@ def _garmin_workout_step_from_desc(step: dict[str, Any], step_order: int) -> dic
         result["stepName"] = str(step["name"])
     return result
 
+
 def _parse_distance_to_m(text: str) -> float | None:
     """Convierte una distancia textual (km o m) a metros."""
-    m_km = re.search(r'(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?)', text, re.I)
+    m_km = re.search(r"(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?)", text, re.I)
     if m_km:
         return float(m_km.group(1)) * 1000
-    m_m = re.search(r'(\d+(?:\.\d+)?)\s*m\b', text, re.I)
+    m_m = re.search(r"(\d+(?:\.\d+)?)\s*m\b", text, re.I)
     if m_m:
         return float(m_m.group(1))
     return None
@@ -82,7 +102,7 @@ def _parse_distance_to_m(text: str) -> float | None:
 
 def _parse_duration_min(text: str) -> float | None:
     """Convierte una duración textual (min o ' horizonte) a minutos. Solo 'min'/'m' claros."""
-    m_min = re.search(r'(\d+(?:\.\d+)?)\s*(?:min|mins|minutes?|minutos?)\b', text, re.I)
+    m_min = re.search(r"(\d+(?:\.\d+)?)\s*(?:min|mins|minutes?|minutos?)\b", text, re.I)
     if m_min:
         return float(m_min.group(1))
     return None
@@ -95,7 +115,7 @@ def _parse_workout_steps_text(desc: str) -> list[dict[str, Any]]:
     descansos, zonas y vuelta a la calma. Cada serie se expande en sus repeticiones
     (interval + descanso) para que Garmin la registre correctamente.
     """
-    parts = [p.strip() for p in re.split(r'[,\n;]+', desc) if p.strip()]
+    parts = [p.strip() for p in re.split(r"[,\n;]+", desc) if p.strip()]
     steps: list[dict[str, Any]] = []
     pending_zone: int | None = None
 
@@ -103,7 +123,7 @@ def _parse_workout_steps_text(desc: str) -> list[dict[str, Any]]:
         lower = part.lower()
 
         # Captura un "Z4" suelto (zona de intensidad que se aplica a la serie anterior).
-        zone_match = re.fullmatch(r'\s*z\s*(\d)\s*', lower)
+        zone_match = re.fullmatch(r"\s*z\s*(\d)\s*", lower)
         if zone_match and steps:
             pending_zone = int(zone_match.group(1))
             steps[-1]["target_hr_zone"] = pending_zone
@@ -111,21 +131,27 @@ def _parse_workout_steps_text(desc: str) -> list[dict[str, Any]]:
 
         # ---- Series con repeticiones: 3x800m, 4x1km, 5x200m, 3 x 800 m ----
         series_match = re.search(
-            r'(\d+)\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?|m\b|min(?:uto?s)?\b)',
-            part, re.I,
+            r"(\d+)\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(km|kilómetros?|kilometros?|m\b|min(?:uto?s)?\b)",
+            part,
+            re.I,
         )
         if series_match:
             reps = int(series_match.group(1))
             value = float(series_match.group(2))
             unit = series_match.group(3).lower()
             # Zona de intensidad de la serie (puede ir en la misma parte: 4x1km Z4)
-            zone_m_pre = re.search(r'[Zz]\s*(\d)', part)
+            zone_m_pre = re.search(r"[Zz]\s*(\d)", part)
             zone = int(zone_m_pre.group(1)) if zone_m_pre else pending_zone
             # Descanso entre repeticiones: "400m rec", "rec 400m", "descanso 2min"
             rest_m = None
             rest_min = None
-            m_rest = re.search(r'(?:rec|rest|descanso|recuperación)\s*(?:de\s*)?(\d+(?:\.\d+)?)\s*(km|m\b|min(?:uto?s)?\b)?', lower) or \
-                     re.search(r'(\d+(?:\.\d+)?)\s*(m\b|km|min(?:uto?s)?\b)?\s*(?:rec|rest|descanso|recuperación)', lower)
+            m_rest = re.search(
+                r"(?:rec|rest|descanso|recuperación)\s*(?:de\s*)?(\d+(?:\.\d+)?)\s*(km|m\b|min(?:uto?s)?\b)?",
+                lower,
+            ) or re.search(
+                r"(\d+(?:\.\d+)?)\s*(m\b|km|min(?:uto?s)?\b)?\s*(?:rec|rest|descanso|recuperación)",
+                lower,
+            )
             if m_rest:
                 rest_num = float(m_rest.group(1))
                 rest_unit = (m_rest.group(2) or "m").lower()
@@ -160,10 +186,20 @@ def _parse_workout_steps_text(desc: str) -> list[dict[str, Any]]:
         # ---- Distancia + zona (5km Z2, 800m) ----
         dist_m = _parse_distance_to_m(part)
         duration_min = _parse_duration_min(part)
-        zone_m = re.search(r'[Zz]\s*(\d)', part)
+        zone_m = re.search(r"[Zz]\s*(\d)", part)
 
         is_warmup = any(w in lower for w in ("calentamiento", "warmup", "warm up", "calentar"))
-        is_cooldown = any(w in lower for w in ("vuelta a la calma", "cooldown", "cool down", "calma", "enfriamiento", "vuelta al ruedo"))
+        is_cooldown = any(
+            w in lower
+            for w in (
+                "vuelta a la calma",
+                "cooldown",
+                "cool down",
+                "calma",
+                "enfriamiento",
+                "vuelta al ruedo",
+            )
+        )
         is_rest = any(w in lower for w in ("rec", "rest", "descanso", "recuperación"))
 
         step: dict[str, Any] = {}

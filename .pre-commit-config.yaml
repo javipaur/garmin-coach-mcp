@@ -1,0 +1,10 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.7
+    hooks:
+      - id: ruff
+        name: ruff check (módulos)
+        args: [check, "config.py", "date_utils.py", "localization.py", "recovery.py", "activity.py", "workout.py", "coaching.py", "sleep.py", "auth.py", "snapshot.py"]
+      - id: ruff-format
+        name: ruff format (módulos)
+        args: ["config.py", "date_utils.py", "localization.py", "recovery.py", "activity.py", "workout.py", "coaching.py", "sleep.py", "auth.py", "snapshot.py"]

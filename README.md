@@ -173,11 +173,16 @@ Pídele al asistente `list_tools_spanish` para ver el catálogo completo en dire
 ## 📁 Estructura
 
 ```
-server.py            # Servidor FastMCP + panel web (single-file)
+server.py            # Servidor FastMCP + panel web (rutas, wiring de snapshot)
+snapshot.py          # Cadena consolidada de _collect_day_snapshot (parches aislados)
+config.py/date_utils.py/localization.py/...   # Módulos auxiliares
 index.html           # Landing pública
 Dockerfile           # Imagen (instala GDAL/geos/proj para rutas)
 docker-compose.yml   # Despliegue en Dokploy con volumen /data
 requirements.txt     # Dependencias
+tests/               # Suite pytest
+pyproject.toml       # Config de ruff, mypy y pytest
+.pre-commit-config.yaml
 ```
 
 ---

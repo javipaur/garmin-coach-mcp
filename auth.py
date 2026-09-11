@@ -136,6 +136,7 @@ def _seed_user_token_file(user_id: str, token_dir: Path) -> None:
 
 def _json_loads_maybe_base64(raw: str) -> dict[str, Any]:
     import base64
+
     raw = raw.strip()
     if not raw:
         raise RuntimeError("GARMIN_TOKENS_JSON está vacío")
@@ -153,15 +154,15 @@ def _json_loads_maybe_base64(raw: str) -> dict[str, Any]:
             raise RuntimeError("El base64 no contiene un objeto JSON válido")
         return parsed
     except Exception as exc:
-        raise RuntimeError(
-            "GARMIN_TOKENS_JSON no es JSON válido ni base64 de JSON válido"
-        ) from exc
+        raise RuntimeError("GARMIN_TOKENS_JSON no es JSON válido ni base64 de JSON válido") from exc
 
 
 # --- Admin token management ---
 
+
 def _admin_token_file() -> Path:
     from config import TOKEN_DIR
+
     return TOKEN_DIR / "admin_token"
 
 
@@ -204,8 +205,12 @@ def _login_active_token(request: Any) -> str:
 
 def _set_auth_cookie(response: Any, token: str, request: Any) -> None:
     response.set_cookie(
-        "admin_token", token, httponly=True, samesite="strict",
-        max_age=AUTH_COOKIE_MAX_AGE_SECONDS, secure=_request_is_https(request),
+        "admin_token",
+        token,
+        httponly=True,
+        samesite="strict",
+        max_age=AUTH_COOKIE_MAX_AGE_SECONDS,
+        secure=_request_is_https(request),
     )
 
 
@@ -218,8 +223,12 @@ def _request_user(request: Any) -> dict[str, Any] | None:
 
 def _set_user_cookie(response: Any, api_key: str, request: Any) -> None:
     response.set_cookie(
-        "user_api_key", api_key, httponly=True, samesite="strict",
-        max_age=AUTH_COOKIE_MAX_AGE_SECONDS, secure=_request_is_https(request),
+        "user_api_key",
+        api_key,
+        httponly=True,
+        samesite="strict",
+        max_age=AUTH_COOKIE_MAX_AGE_SECONDS,
+        secure=_request_is_https(request),
     )
 
 

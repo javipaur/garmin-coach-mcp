@@ -44,7 +44,9 @@ def _extract_latest_activity_end_local(raw_sources: Any) -> Any:
             if start_dt is None:
                 continue
 
-            end_dt = _parse_garmin_datetime(activity.get("endTimeLocal") or activity.get("stopTimeLocal"))
+            end_dt = _parse_garmin_datetime(
+                activity.get("endTimeLocal") or activity.get("stopTimeLocal")
+            )
             if end_dt is None:
                 duration_seconds = _safe_float(activity.get("duration"))
                 if duration_seconds is not None:
@@ -107,8 +109,12 @@ def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
         "training_readiness_recovery_time_raw_key": raw_key,
         "training_readiness_recovery_time_unit": unit,
         "training_readiness_recovery_time_unit_is_assumed": unit == "hours_assumed",
-        "training_readiness_recovery_reference_source": reference_source if reference_dt is not None else None,
-        "training_readiness_recovery_reference_local": reference_dt.isoformat() if reference_dt is not None else None,
+        "training_readiness_recovery_reference_source": reference_source
+        if reference_dt is not None
+        else None,
+        "training_readiness_recovery_reference_local": reference_dt.isoformat()
+        if reference_dt is not None
+        else None,
         "training_readiness_recovery_age_minutes": None,
         "training_readiness_recovery_state": "missing",
         "training_readiness_recovery_state_es": _RECOVERY_STATE_ES.get("missing"),
@@ -129,7 +135,9 @@ def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
     else:
         age_minutes = max(0, int((_now_local() - reference_dt).total_seconds() // 60))
         crossed_local_day = reference_dt.date() < _today_local()
-        is_stale = age_minutes > RECOVERY_MAX_FRESH_MINUTES or (crossed_local_day and age_minutes > RECOVERY_CROSS_DAY_STALE_MINUTES)
+        is_stale = age_minutes > RECOVERY_MAX_FRESH_MINUTES or (
+            crossed_local_day and age_minutes > RECOVERY_CROSS_DAY_STALE_MINUTES
+        )
         if is_stale:
             state = "stale"
         elif reference_source == "last_activity_end":
@@ -140,7 +148,11 @@ def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
     result["training_readiness_recovery_age_minutes"] = age_minutes
     result["training_readiness_recovery_state"] = state
     result["training_readiness_recovery_state_es"] = _RECOVERY_STATE_ES.get(state, state)
-    result["training_readiness_recovery_is_stale"] = state in {"stale", "missing", "missing_timestamp"}
+    result["training_readiness_recovery_is_stale"] = state in {
+        "stale",
+        "missing",
+        "missing_timestamp",
+    }
 
     if raw_value is None or state in {"stale", "missing", "missing_timestamp"} or unit is None:
         result.setdefault("training_readiness_recovery_minutes_remaining", None)
@@ -148,13 +160,17 @@ def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
         result["training_readiness_recovery_time"] = 0 if raw_value == 0 else None
 
         if state == "stale":
-            result["training_readiness_recovery_safe_text"] = "Dato de recuperación desactualizado; no extrapolar"
+            result["training_readiness_recovery_safe_text"] = (
+                "Dato de recuperación desactualizado; no extrapolar"
+            )
         elif state == "missing_timestamp":
             result["training_readiness_recovery_safe_text"] = "Sin marca temporal; no extrapolar"
         else:
             result["training_readiness_recovery_safe_text"] = "Sin datos de recuperación"
 
-        result["training_readiness_recovery_answer_for_llm"] = result["training_readiness_recovery_safe_text"]
+        result["training_readiness_recovery_answer_for_llm"] = result[
+            "training_readiness_recovery_safe_text"
+        ]
         return result
 
     base_minutes = raw_value if unit == "minutes" else raw_value * 60.0
@@ -163,7 +179,11 @@ def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
     remaining_hours = round(remaining_minutes / 60.0, 1)
     result["training_readiness_recovery_minutes_remaining"] = remaining_minutes
     result["training_readiness_recovery_hours_remaining"] = remaining_hours
-    result["training_readiness_recovery_time"] = int((remaining_minutes + 59) // 60) if unit in {"hours", "hours_assumed"} else remaining_minutes
+    result["training_readiness_recovery_time"] = (
+        int((remaining_minutes + 59) // 60)
+        if unit in {"hours", "hours_assumed"}
+        else remaining_minutes
+    )
 
     if state == "fresh":
         if remaining_minutes == 0:
@@ -176,15 +196,23 @@ def _build_recovery_metrics(entry: Any, raw_sources: Any) -> dict[str, Any]:
         if remaining_minutes == 0:
             result["training_readiness_recovery_safe_text"] = "Estimación: 0 min restantes"
         elif remaining_minutes < 60:
-            result["training_readiness_recovery_safe_text"] = f"Estimación: {remaining_minutes} min restantes"
+            result["training_readiness_recovery_safe_text"] = (
+                f"Estimación: {remaining_minutes} min restantes"
+            )
         else:
-            result["training_readiness_recovery_safe_text"] = f"Estimación: {remaining_hours} h restantes"
+            result["training_readiness_recovery_safe_text"] = (
+                f"Estimación: {remaining_hours} h restantes"
+            )
     elif state == "stale":
-        result["training_readiness_recovery_safe_text"] = "Dato de recuperación desactualizado; no extrapolar"
+        result["training_readiness_recovery_safe_text"] = (
+            "Dato de recuperación desactualizado; no extrapolar"
+        )
     elif state == "missing_timestamp":
         result["training_readiness_recovery_safe_text"] = "Sin marca temporal; no extrapolar"
     else:
         result["training_readiness_recovery_safe_text"] = "Sin datos de recuperación"
 
-    result["training_readiness_recovery_answer_for_llm"] = result["training_readiness_recovery_safe_text"]
+    result["training_readiness_recovery_answer_for_llm"] = result[
+        "training_readiness_recovery_safe_text"
+    ]
     return result

@@ -83,14 +83,12 @@ def _sleep_candidate_from_raw(sleep_raw: Any) -> dict[str, Any] | None:
     if sleep_seconds in (None, 0):
         return None
 
-    end_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepEndTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampLocal"))
-    )
-    start_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepStartTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampLocal"))
-    )
+    end_local = _epoch_millis_gmt_to_local_iso(
+        daily.get("sleepEndTimestampGMT")
+    ) or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampLocal"))
+    start_local = _epoch_millis_gmt_to_local_iso(
+        daily.get("sleepStartTimestampGMT")
+    ) or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampLocal"))
 
     end_dt = _parse_garmin_datetime(end_local) if end_local else None
     start_dt = _parse_garmin_datetime(start_local) if start_local else None
@@ -110,7 +108,9 @@ def _sleep_candidate_from_raw(sleep_raw: Any) -> dict[str, Any] | None:
     }
 
 
-def _sleep_candidate_from_raw_for_wrapper(requested_date_iso: str, sleep_raw: Any) -> dict[str, Any] | None:
+def _sleep_candidate_from_raw_for_wrapper(
+    requested_date_iso: str, sleep_raw: Any
+) -> dict[str, Any] | None:
     if not isinstance(sleep_raw, dict):
         return None
     daily = sleep_raw.get("dailySleepDTO")
@@ -121,14 +121,12 @@ def _sleep_candidate_from_raw_for_wrapper(requested_date_iso: str, sleep_raw: An
     if sleep_seconds in (None, 0):
         return None
 
-    end_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepEndTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampLocal"))
-    )
-    start_local = (
-        _epoch_millis_gmt_to_local_iso(daily.get("sleepStartTimestampGMT"))
-        or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampLocal"))
-    )
+    end_local = _epoch_millis_gmt_to_local_iso(
+        daily.get("sleepEndTimestampGMT")
+    ) or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampLocal"))
+    start_local = _epoch_millis_gmt_to_local_iso(
+        daily.get("sleepStartTimestampGMT")
+    ) or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampLocal"))
 
     end_dt = _parse_garmin_datetime(end_local) if end_local else None
     start_dt = _parse_garmin_datetime(start_local) if start_local else None
@@ -147,7 +145,9 @@ def _sleep_candidate_from_raw_for_wrapper(requested_date_iso: str, sleep_raw: An
     }
 
 
-def _pick_latest_sleep_from_client(client: Any, snapshot_local_iso: str | None) -> dict[str, Any] | None:
+def _pick_latest_sleep_from_client(
+    client: Any, snapshot_local_iso: str | None
+) -> dict[str, Any] | None:
     snapshot_dt = _parse_garmin_datetime(snapshot_local_iso) if snapshot_local_iso else _now_local()
     if snapshot_dt is None:
         snapshot_dt = _now_local()
@@ -160,21 +160,25 @@ def _pick_latest_sleep_from_client(client: Any, snapshot_local_iso: str | None) 
         try:
             raw = client.get_sleep_data(day)
         except Exception as exc:
-            checked.append({
-                "requested_date": day,
-                "ok": False,
-                "error": str(exc),
-            })
+            checked.append(
+                {
+                    "requested_date": day,
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
             continue
 
         candidate = _sleep_candidate_from_raw(raw)
-        checked.append({
-            "requested_date": day,
-            "ok": candidate is not None,
-            "calendar_date": candidate.get("calendar_date") if candidate else None,
-            "end_local": candidate.get("end_local") if candidate else None,
-            "sleep_seconds": candidate.get("sleep_seconds") if candidate else None,
-        })
+        checked.append(
+            {
+                "requested_date": day,
+                "ok": candidate is not None,
+                "calendar_date": candidate.get("calendar_date") if candidate else None,
+                "end_local": candidate.get("end_local") if candidate else None,
+                "sleep_seconds": candidate.get("sleep_seconds") if candidate else None,
+            }
+        )
 
         if candidate is None:
             continue
@@ -195,7 +199,9 @@ def _pick_latest_sleep_from_client(client: Any, snapshot_local_iso: str | None) 
     }
 
 
-def _apply_sleep_candidate_to_metrics(metrics: dict[str, Any], candidate: dict[str, Any], source_label: str) -> None:
+def _apply_sleep_candidate_to_metrics(
+    metrics: dict[str, Any], candidate: dict[str, Any], source_label: str
+) -> None:
     daily = candidate["daily"]
 
     score = None
@@ -244,18 +250,24 @@ def _apply_sleep_candidate_to_metrics(metrics: dict[str, Any], candidate: dict[s
 
     fases = []
     if metrics.get("sueno_rem_texto"):
-        fases.append(f'REM {metrics.get("sueno_rem_texto")}')
+        fases.append(f"REM {metrics.get('sueno_rem_texto')}")
     if metrics.get("sueno_profundo_texto"):
-        fases.append(f'Profundo {metrics.get("sueno_profundo_texto")}')
+        fases.append(f"Profundo {metrics.get('sueno_profundo_texto')}")
     if metrics.get("sueno_ligero_texto"):
-        fases.append(f'Ligero {metrics.get("sueno_ligero_texto")}')
+        fases.append(f"Ligero {metrics.get('sueno_ligero_texto')}")
     if metrics.get("sueno_despierto_texto"):
-        fases.append(f'Despierto {metrics.get("sueno_despierto_texto")}')
+        fases.append(f"Despierto {metrics.get('sueno_despierto_texto')}")
     metrics["sueno_fases_resumen_humano"] = ", ".join(fases) if fases else None
 
-    current_datos_hasta = _parse_garmin_datetime(metrics.get("datos_hasta_local")) if metrics.get("datos_hasta_local") else None
+    current_datos_hasta = (
+        _parse_garmin_datetime(metrics.get("datos_hasta_local"))
+        if metrics.get("datos_hasta_local")
+        else None
+    )
     sleep_end_dt = _parse_garmin_datetime(end_local_iso) if end_local_iso else None
-    if sleep_end_dt is not None and (current_datos_hasta is None or sleep_end_dt > current_datos_hasta):
+    if sleep_end_dt is not None and (
+        current_datos_hasta is None or sleep_end_dt > current_datos_hasta
+    ):
         metrics["datos_hasta_local"] = sleep_end_dt.isoformat()
         metrics["datos_hasta_texto"] = _short_local_dt_text(metrics.get("datos_hasta_local"))
 
@@ -274,7 +286,9 @@ def _recompute_sleep_freshness_fields(metrics: dict[str, Any]) -> None:
 
     age_hours = _hours_between_local_datetimes(snapshot_local, sleep_ref_local)
 
-    metrics["sueno_referencia_local"] = sleep_ref_dt.isoformat() if sleep_ref_dt is not None else None
+    metrics["sueno_referencia_local"] = (
+        sleep_ref_dt.isoformat() if sleep_ref_dt is not None else None
+    )
     metrics["sueno_antiguedad_horas"] = age_hours
     metrics["sueno_estado_frescura"] = state
     metrics["sueno_es_actual"] = state == "fresh"
@@ -286,12 +300,18 @@ def _recompute_sleep_freshness_fields(metrics: dict[str, Any]) -> None:
         metrics["sueno_resumen_para_llm"] = summary
         metrics["sueno_fases_para_llm"] = phases
     elif state == "stale":
-        ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or metrics.get("sueno_fecha_calendario")
-        metrics["sueno_resumen_para_llm"] = f"Último sueño disponible del conector: {ref_text}; no asumir que corresponde a anoche"
+        ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or metrics.get(
+            "sueno_fecha_calendario"
+        )
+        metrics["sueno_resumen_para_llm"] = (
+            f"Último sueño disponible del conector: {ref_text}; no asumir que corresponde a anoche"
+        )
         metrics["sueno_fases_para_llm"] = None
     elif state == "unknown":
         ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or "sin fecha clara"
-        metrics["sueno_resumen_para_llm"] = f"Hay un sueño disponible ({ref_text}), pero no se pudo validar si corresponde a hoy"
+        metrics["sueno_resumen_para_llm"] = (
+            f"Hay un sueño disponible ({ref_text}), pero no se pudo validar si corresponde a hoy"
+        )
         metrics["sueno_fases_para_llm"] = None
     else:
         metrics["sueno_resumen_para_llm"] = "No hay sueño usable en el snapshot actual"
@@ -303,6 +323,7 @@ _SLEEP_SELECTION_DEBUG_LAST = None
 
 def _Garmin_get_sleep_data_multi_day(self, cdate):
     from garminconnect import Garmin
+
     global _SLEEP_SELECTION_DEBUG_LAST
 
     try:
@@ -325,21 +346,25 @@ def _Garmin_get_sleep_data_multi_day(self, cdate):
         try:
             raw = _orig(self, day)
         except Exception as exc:
-            checked.append({
-                "requested_date": day,
-                "ok": False,
-                "error": str(exc),
-            })
+            checked.append(
+                {
+                    "requested_date": day,
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
             continue
 
         candidate = _sleep_candidate_from_raw_for_wrapper(day, raw)
-        checked.append({
-            "requested_date": day,
-            "ok": candidate is not None,
-            "calendar_date": candidate.get("calendar_date") if candidate else None,
-            "end_local": candidate.get("end_local") if candidate else None,
-            "sleep_seconds": candidate.get("sleep_seconds") if candidate else None,
-        })
+        checked.append(
+            {
+                "requested_date": day,
+                "ok": candidate is not None,
+                "calendar_date": candidate.get("calendar_date") if candidate else None,
+                "end_local": candidate.get("end_local") if candidate else None,
+                "sleep_seconds": candidate.get("sleep_seconds") if candidate else None,
+            }
+        )
 
         if candidate is None:
             continue
@@ -361,7 +386,9 @@ def _Garmin_get_sleep_data_multi_day(self, cdate):
             "start_local": selected.get("start_local"),
             "end_local": selected.get("end_local"),
             "sleep_seconds": selected.get("sleep_seconds"),
-        } if selected else None,
+        }
+        if selected
+        else None,
     }
 
     if selected is not None:

@@ -5,9 +5,22 @@ from typing import Any
 from localization import _ACTIVITY_FAMILY_ES, _ACTIVITY_TYPE_ES
 
 _ACTIVITY_TRANSPORT_TYPES = {"motorcycling", "driving", "car", "automotive"}
-_ACTIVITY_ENDURANCE_TYPES = {"running", "treadmill_running", "walking", "hiking", "trail_running", "track_running"}
+_ACTIVITY_ENDURANCE_TYPES = {
+    "running",
+    "treadmill_running",
+    "walking",
+    "hiking",
+    "trail_running",
+    "track_running",
+}
 _ACTIVITY_STRENGTH_TYPES = {"strength_training"}
-_ACTIVITY_CYCLING_TYPES = {"cycling", "indoor_cycling", "mountain_biking", "road_biking", "virtual_ride"}
+_ACTIVITY_CYCLING_TYPES = {
+    "cycling",
+    "indoor_cycling",
+    "mountain_biking",
+    "road_biking",
+    "virtual_ride",
+}
 _ACTIVITY_SWIM_TYPES = {"lap_swimming", "open_water_swimming", "swimming"}
 
 _ACTIVITY_SUMMARY_KEYS = [
@@ -99,16 +112,23 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any]:
         "avg_hr": activity.get("averageHR") or summary.get("averageHR"),
         "max_hr": activity.get("maxHR") or summary.get("maxHR"),
         "calories": activity.get("calories") or summary.get("calories"),
-        "training_load": activity.get("trainingLoad") or activity.get("activityTrainingLoad") or summary.get("activityTrainingLoad"),
+        "training_load": activity.get("trainingLoad")
+        or activity.get("activityTrainingLoad")
+        or summary.get("activityTrainingLoad"),
         "elevation_gain_m": activity.get("elevationGain") or summary.get("elevationGain"),
         "training_effect": summary.get("trainingEffect"),
         "anaerobic_training_effect": summary.get("anaerobicTrainingEffect"),
         "average_power": activity.get("averagePower") or summary.get("averagePower"),
         "normalized_power": summary.get("normalizedPower"),
-        "average_run_cadence": activity.get("averageRunCadence") or summary.get("averageRunCadence"),
+        "average_run_cadence": activity.get("averageRunCadence")
+        or summary.get("averageRunCadence"),
         "steps": activity.get("steps") or summary.get("steps"),
-        "tipo_actividad": _ACTIVITY_TYPE_ES.get(type_key, type_key) if isinstance(type_key, str) else type_key,
-        "familia_actividad": _ACTIVITY_FAMILY_ES.get(_activity_family(type_key), _activity_family(type_key)),
+        "tipo_actividad": _ACTIVITY_TYPE_ES.get(type_key, type_key)
+        if isinstance(type_key, str)
+        else type_key,
+        "familia_actividad": _ACTIVITY_FAMILY_ES.get(
+            _activity_family(type_key), _activity_family(type_key)
+        ),
     }
 
 
@@ -140,11 +160,22 @@ def _pick_activity_metadata(metadata: Any) -> dict[str, Any]:
     if not isinstance(metadata, dict):
         return {}
     keys = [
-        "distance", "duration", "elapsedDuration", "movingDuration",
-        "calories", "activityTrainingLoad", "trainingEffect",
-        "anaerobicTrainingEffect", "averageHR", "maxHR",
-        "averageSpeed", "maxSpeed", "elevationGain", "elevationLoss",
-        "averagePower", "normalizedPower",
+        "distance",
+        "duration",
+        "elapsedDuration",
+        "movingDuration",
+        "calories",
+        "activityTrainingLoad",
+        "trainingEffect",
+        "anaerobicTrainingEffect",
+        "averageHR",
+        "maxHR",
+        "averageSpeed",
+        "maxSpeed",
+        "elevationGain",
+        "elevationLoss",
+        "averagePower",
+        "normalizedPower",
     ]
     return {k: metadata.get(k) for k in keys if metadata.get(k) is not None}
 
@@ -165,7 +196,9 @@ def _extract_primary_device_info(training_status: Any, devices_raw: Any) -> dict
 
         if device_id is None:
             try:
-                balance = training_status["mostRecentTrainingLoadBalance"]["metricsTrainingLoadBalanceDTOMap"]
+                balance = training_status["mostRecentTrainingLoadBalance"][
+                    "metricsTrainingLoadBalanceDTOMap"
+                ]
                 if isinstance(balance, dict) and balance:
                     key = next(iter(balance.keys()))
                     device_id = int(key)
@@ -203,7 +236,9 @@ def _extract_primary_device_info(training_status: Any, devices_raw: Any) -> dict
                     device_id = dev.get(key)
                     break
             if device_id is not None:
-                device_name = dev.get("deviceName") or dev.get("displayName") or dev.get("modelName")
+                device_name = (
+                    dev.get("deviceName") or dev.get("displayName") or dev.get("modelName")
+                )
                 image_url = dev.get("imageURL")
                 break
 

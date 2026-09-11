@@ -84,6 +84,7 @@ _GARMIN_PATCH_ACUTE_LOAD_STATUS_ES = {
     "HIGH": "Alta",
 }
 
+
 def _garmin_patch_first_non_none(*values):
     for v in values:
         if v is not None:
@@ -126,6 +127,7 @@ def _garmin_patch_pick_training_readiness(raw_value):
 
     return sorted(entries, key=rank, reverse=True)[0]
 
+
 def _latest_known_data_timestamp_local(metrics: dict[str, Any]) -> str | None:
     candidates = []
     for key in (
@@ -142,20 +144,26 @@ def _latest_known_data_timestamp_local(metrics: dict[str, Any]) -> str | None:
         return None
     return max(candidates).isoformat()
 
+
 def _first_present_value_sleep(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
     for key in keys:
         if key in mapping and mapping.get(key) is not None:
             return mapping.get(key)
     return None
 
-def _duration_text_from_metric_keys_sleep(metrics: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+
+def _duration_text_from_metric_keys_sleep(
+    metrics: dict[str, Any], keys: tuple[str, ...]
+) -> str | None:
     value = _first_present_value_sleep(metrics, keys)
     if value is None:
         return None
     return _format_duration_hm(value)
 
+
 def _presentation_join(parts):
     return " · ".join([str(p) for p in parts if p not in (None, "", [], {})])
+
 
 def _first_non_none_local(*values):
     for v in values:
@@ -163,17 +171,20 @@ def _first_non_none_local(*values):
             return v
     return None
 
+
 def _gfmt_int(v):
     try:
         return f"{int(round(float(v))):,}".replace(",", ".")
     except Exception:
         return None
 
+
 def _gfmt_km(v):
     try:
         return f"{float(v):.1f}".replace(".", ",") + " km"
     except Exception:
         return None
+
 
 # ---------------------------------------------------------------------------
 # Fetch base del snapshot (extraído de server.py)
@@ -184,26 +195,44 @@ def _snapshot_base(target_date, include_recent_activities=False):
     with _dep("FETCH_LOCK"):
         api = _dep("_get_api")()
 
-        summary, summary_err = _dep("_optional_call_first")(api, ("get_user_summary", "get_stats"), target_date)
-        heart, heart_err = _dep("_optional_call_first")(api, ("get_heart_rates", "get_rhr_day"), target_date)
-        sleep, sleep_err = _dep("_optional_call_first")(api, ("get_sleep_data",), sleep_reference_day)
+        summary, summary_err = _dep("_optional_call_first")(
+            api, ("get_user_summary", "get_stats"), target_date
+        )
+        heart, heart_err = _dep("_optional_call_first")(
+            api, ("get_heart_rates", "get_rhr_day"), target_date
+        )
+        sleep, sleep_err = _dep("_optional_call_first")(
+            api, ("get_sleep_data",), sleep_reference_day
+        )
         stress, stress_err = _dep("_optional_call_first")(api, ("get_stress_data",), target_date)
         body_battery, bb_err = _dep("_optional_call_first")(api, ("get_body_battery",), target_date)
         hrv, hrv_err = _dep("_optional_call_first")(api, ("get_hrv_data",), target_date)
         max_metrics, vo2_err = _dep("_optional_call_first")(api, ("get_max_metrics",), target_date)
-        training_readiness, tr_err = _dep("_optional_call_first")(api, ("get_training_readiness",), target_date)
-        training_status, ts_err = _dep("_optional_call_first")(api, ("get_training_status",), target_date)
+        training_readiness, tr_err = _dep("_optional_call_first")(
+            api, ("get_training_readiness",), target_date
+        )
+        training_status, ts_err = _dep("_optional_call_first")(
+            api, ("get_training_status",), target_date
+        )
 
         activities = []
         activities_raw = []
         activities_err = None
         if include_recent_activities:
-            recent, activities_err = _dep("_optional_call_first")(api, ("get_activities",), 0, _dep("ACTIVITY_LIMIT"))
+            recent, activities_err = _dep("_optional_call_first")(
+                api, ("get_activities",), 0, _dep("ACTIVITY_LIMIT")
+            )
             if isinstance(recent, list):
-                activities_raw = recent[:_dep("ACTIVITY_LIMIT")]
-                activities = [_dep("_normalize_activity")(a) for a in recent[:_dep("ACTIVITY_LIMIT")] if isinstance(a, dict)]
+                activities_raw = recent[: _dep("ACTIVITY_LIMIT")]
+                activities = [
+                    _dep("_normalize_activity")(a)
+                    for a in recent[: _dep("ACTIVITY_LIMIT")]
+                    if isinstance(a, dict)
+                ]
 
-        extra_raw, extra_errors, device_info = _dep("_collect_extra_raw")(api, target_date, training_status)
+        extra_raw, extra_errors, device_info = _dep("_collect_extra_raw")(
+            api, target_date, training_status
+        )
     metrics: dict[str, Any] = {
         "steps": (summary or {}).get("totalSteps"),
         "distance_km": round(((summary or {}).get("totalDistanceMeters") or 0) / 1000, 2),
@@ -267,103 +296,121 @@ def _snapshot_base(target_date, include_recent_activities=False):
         "source_errors": errors,
     }
 
+
 # ---------------------------------------------------------------------------
 # Etiquetas ES que el monolito aplicaba al import (ES_FIELD_LABELS.update)
 # ---------------------------------------------------------------------------
-ES_FIELD_LABELS.update({
-    "training_readiness_recovery_time_raw": "Recuperación Garmin bruta",
-    "training_readiness_recovery_time_unit": "Unidad de recuperación Garmin",
-    "training_readiness_recovery_reference_source": "Origen de la referencia de recuperación",
-    "training_readiness_recovery_reference_local": "Referencia temporal de recuperación",
-    "training_readiness_recovery_age_minutes": "Antigüedad de la recuperación (min)",
-    "training_readiness_recovery_state": "Estado de frescura de la recuperación",
-    "training_readiness_recovery_state_es": "Estado de frescura de la recuperación (ES)",
-    "training_readiness_recovery_is_stale": "Recuperación desactualizada",
-    "training_readiness_recovery_minutes_remaining": "Recuperación restante (min)",
-    "training_readiness_recovery_hours_remaining": "Recuperación restante (h)",
-    "training_readiness_recovery_safe_text": "Texto seguro de recuperación",
-    "training_readiness_recovery_answer_for_llm": "Respuesta canónica de recuperación para LLM",
-    "training_readiness_selected_timestamp_local": "Timestamp de la preparación para entrenar",
-})
+ES_FIELD_LABELS.update(
+    {
+        "training_readiness_recovery_time_raw": "Recuperación Garmin bruta",
+        "training_readiness_recovery_time_unit": "Unidad de recuperación Garmin",
+        "training_readiness_recovery_reference_source": "Origen de la referencia de recuperación",
+        "training_readiness_recovery_reference_local": "Referencia temporal de recuperación",
+        "training_readiness_recovery_age_minutes": "Antigüedad de la recuperación (min)",
+        "training_readiness_recovery_state": "Estado de frescura de la recuperación",
+        "training_readiness_recovery_state_es": "Estado de frescura de la recuperación (ES)",
+        "training_readiness_recovery_is_stale": "Recuperación desactualizada",
+        "training_readiness_recovery_minutes_remaining": "Recuperación restante (min)",
+        "training_readiness_recovery_hours_remaining": "Recuperación restante (h)",
+        "training_readiness_recovery_safe_text": "Texto seguro de recuperación",
+        "training_readiness_recovery_answer_for_llm": "Respuesta canónica de recuperación para LLM",
+        "training_readiness_selected_timestamp_local": "Timestamp de la preparación para entrenar",
+    }
+)
 
-ES_FIELD_LABELS.update({
-    "predisposicion_para_entrenar": "Predisposición para entrenar",
-    "predisposicion_para_entrenar_estado": "Estado de predisposición para entrenar",
-    "predisposicion_para_entrenar_texto": "Resumen de predisposición para entrenar",
-    "estado_vfc": "Estado de VFC",
-    "vfc_media_noche_ms": "VFC media nocturna (ms)",
-    "vfc_media_7_dias_ms": "VFC media de 7 días (ms)",
-    "body_battery_actual": "Body Battery actual",
-    "body_battery_ultimo_timestamp_local": "Último timestamp de Body Battery",
-    "body_battery_texto": "Resumen de Body Battery",
-    "puntuacion_de_sueno": "Puntuación de sueño",
-    "duracion_de_sueno_texto": "Duración de sueño",
-    "sueno_texto_seguro": "Resumen de sueño",
-    "recuperacion_texto_seguro": "Texto seguro de recuperación",
-    "snapshot_obtenido_local": "Momento local de obtención del snapshot",
-    "datos_hasta_local": "Datos disponibles hasta",
-})
+ES_FIELD_LABELS.update(
+    {
+        "predisposicion_para_entrenar": "Predisposición para entrenar",
+        "predisposicion_para_entrenar_estado": "Estado de predisposición para entrenar",
+        "predisposicion_para_entrenar_texto": "Resumen de predisposición para entrenar",
+        "estado_vfc": "Estado de VFC",
+        "vfc_media_noche_ms": "VFC media nocturna (ms)",
+        "vfc_media_7_dias_ms": "VFC media de 7 días (ms)",
+        "body_battery_actual": "Body Battery actual",
+        "body_battery_ultimo_timestamp_local": "Último timestamp de Body Battery",
+        "body_battery_texto": "Resumen de Body Battery",
+        "puntuacion_de_sueno": "Puntuación de sueño",
+        "duracion_de_sueno_texto": "Duración de sueño",
+        "sueno_texto_seguro": "Resumen de sueño",
+        "recuperacion_texto_seguro": "Texto seguro de recuperación",
+        "snapshot_obtenido_local": "Momento local de obtención del snapshot",
+        "datos_hasta_local": "Datos disponibles hasta",
+    }
+)
 
-ES_FIELD_LABELS.update({
-    "sueno_rem_texto": "Sueño REM",
-    "sueno_profundo_texto": "Sueño profundo",
-    "sueno_ligero_texto": "Sueño ligero",
-    "sueno_despierto_texto": "Tiempo despierto",
-    "sueno_inicio_texto": "Inicio del sueño",
-    "sueno_fin_texto": "Fin del sueño",
-    "sueno_fases_resumen_humano": "Resumen de fases del sueño",
-})
+ES_FIELD_LABELS.update(
+    {
+        "sueno_rem_texto": "Sueño REM",
+        "sueno_profundo_texto": "Sueño profundo",
+        "sueno_ligero_texto": "Sueño ligero",
+        "sueno_despierto_texto": "Tiempo despierto",
+        "sueno_inicio_texto": "Inicio del sueño",
+        "sueno_fin_texto": "Fin del sueño",
+        "sueno_fases_resumen_humano": "Resumen de fases del sueño",
+    }
+)
 
-ES_FIELD_LABELS.update({
-    "sueno_fecha_calendario": "Fecha del sueño",
-    "sueno_origen_canonico": "Origen canónico del sueño",
-    "sueno_inicio_local": "Inicio local del sueño",
-    "sueno_fin_local": "Fin local del sueño",
-    "sueno_numero_despertares": "Número de despertares",
-    "sueno_feedback_raw": "Feedback raw de sueño",
-    "sueno_insight_raw": "Insight raw de sueño",
-    "sueno_personalized_insight_raw": "Insight personalizado raw de sueño",
-})
+ES_FIELD_LABELS.update(
+    {
+        "sueno_fecha_calendario": "Fecha del sueño",
+        "sueno_origen_canonico": "Origen canónico del sueño",
+        "sueno_inicio_local": "Inicio local del sueño",
+        "sueno_fin_local": "Fin local del sueño",
+        "sueno_numero_despertares": "Número de despertares",
+        "sueno_feedback_raw": "Feedback raw de sueño",
+        "sueno_insight_raw": "Insight raw de sueño",
+        "sueno_personalized_insight_raw": "Insight personalizado raw de sueño",
+    }
+)
 
-ES_FIELD_LABELS.update({
-    "sueno_referencia_local": "Referencia temporal del sueño",
-    "sueno_antiguedad_horas": "Antigüedad del sueño (h)",
-    "sueno_estado_frescura": "Estado de frescura del sueño",
-    "sueno_es_actual": "Sueño actual",
-    "sueno_resumen_para_llm": "Resumen seguro de sueño para LLM",
-    "sueno_fases_para_llm": "Fases de sueño seguras para LLM",
-})
-
-if "ES_FIELD_LABELS" in globals():
-    ES_FIELD_LABELS.update({
-        "predisposicion_factores_resumen_humano": "Resumen humano de factores de Predisposición",
-        "peso_referencia_texto": "Referencia del peso",
-        "fitness_age_referencia_texto": "Referencia de edad física",
-    })
-
-if "ES_FIELD_LABELS" in globals():
-    ES_FIELD_LABELS.update({
-        "aclimatacion_spo2_promedio": "Promedio de SpO₂ de aclimatación",
-        "aclimatacion_spo2_minima": "SpO₂ mínima de aclimatación",
-        "aclimatacion_spo2_ultima": "Última SpO₂ de aclimatación",
-        "aclimatacion_spo2_media_general": "SpO₂ media general",
-        "aclimatacion_altitud_media_entorno": "Altitud media del entorno",
-        "aclimatacion_spo2_hora_ultima_local": "Hora local de la última SpO₂",
-        "aclimatacion_spo2_sueno_inicio_local": "Inicio local de sueño para SpO₂",
-        "aclimatacion_spo2_sueno_fin_local": "Fin local de sueño para SpO₂",
-        "aclimatacion_spo2_resumen_humano": "Resumen humano de aclimatación por pulsioximetría",
-    })
+ES_FIELD_LABELS.update(
+    {
+        "sueno_referencia_local": "Referencia temporal del sueño",
+        "sueno_antiguedad_horas": "Antigüedad del sueño (h)",
+        "sueno_estado_frescura": "Estado de frescura del sueño",
+        "sueno_es_actual": "Sueño actual",
+        "sueno_resumen_para_llm": "Resumen seguro de sueño para LLM",
+        "sueno_fases_para_llm": "Fases de sueño seguras para LLM",
+    }
+)
 
 if "ES_FIELD_LABELS" in globals():
-    ES_FIELD_LABELS.update({
-        "umbral_lactato_fc_ppm": "Umbral de lactato (frecuencia cardiaca)",
-        "umbral_lactato_autodetectado": "Umbral de lactato autodetectado",
-        "umbral_lactato_ritmo_disponible": "Ritmo de umbral disponible",
-        "umbral_lactato_potencia_disponible": "Potencia de umbral disponible",
-        "umbral_lactato_wkg_disponible": "Potencia relativa de umbral disponible",
-        "umbral_lactato_speed_raw": "Velocidad bruta de umbral de lactato",
-        "umbral_lactato_resumen_humano": "Resumen humano de umbral de lactato",
-    })
+    ES_FIELD_LABELS.update(
+        {
+            "predisposicion_factores_resumen_humano": "Resumen humano de factores de Predisposición",
+            "peso_referencia_texto": "Referencia del peso",
+            "fitness_age_referencia_texto": "Referencia de edad física",
+        }
+    )
+
+if "ES_FIELD_LABELS" in globals():
+    ES_FIELD_LABELS.update(
+        {
+            "aclimatacion_spo2_promedio": "Promedio de SpO₂ de aclimatación",
+            "aclimatacion_spo2_minima": "SpO₂ mínima de aclimatación",
+            "aclimatacion_spo2_ultima": "Última SpO₂ de aclimatación",
+            "aclimatacion_spo2_media_general": "SpO₂ media general",
+            "aclimatacion_altitud_media_entorno": "Altitud media del entorno",
+            "aclimatacion_spo2_hora_ultima_local": "Hora local de la última SpO₂",
+            "aclimatacion_spo2_sueno_inicio_local": "Inicio local de sueño para SpO₂",
+            "aclimatacion_spo2_sueno_fin_local": "Fin local de sueño para SpO₂",
+            "aclimatacion_spo2_resumen_humano": "Resumen humano de aclimatación por pulsioximetría",
+        }
+    )
+
+if "ES_FIELD_LABELS" in globals():
+    ES_FIELD_LABELS.update(
+        {
+            "umbral_lactato_fc_ppm": "Umbral de lactato (frecuencia cardiaca)",
+            "umbral_lactato_autodetectado": "Umbral de lactato autodetectado",
+            "umbral_lactato_ritmo_disponible": "Ritmo de umbral disponible",
+            "umbral_lactato_potencia_disponible": "Potencia de umbral disponible",
+            "umbral_lactato_wkg_disponible": "Potencia relativa de umbral disponible",
+            "umbral_lactato_speed_raw": "Velocidad bruta de umbral de lactato",
+            "umbral_lactato_resumen_humano": "Resumen humano de umbral de lactato",
+        }
+    )
+
 
 def _patch_garmin_metrics(snap, *args, **kwargs):
     raw = snap.get("raw_sources") or {}
@@ -386,12 +433,28 @@ def _patch_garmin_metrics(snap, *args, **kwargs):
         summary.get("sleepingSeconds"),
     )
     _garmin_patch_put(metrics, "sleep_duration_seconds", sleep_seconds)
-    _garmin_patch_put(metrics, "sleep_hours", round(sleep_seconds / 3600, 1) if sleep_seconds is not None else None)
-    _garmin_patch_put(metrics, "sleep_score", ((sleep_dto.get("sleepScores") or {}).get("overall") or {}).get("value"))
-    _garmin_patch_put(metrics, "sleep_deep_min", _garmin_patch_minutes(sleep_dto.get("deepSleepSeconds")))
-    _garmin_patch_put(metrics, "sleep_rem_min", _garmin_patch_minutes(sleep_dto.get("remSleepSeconds")))
-    _garmin_patch_put(metrics, "sleep_light_min", _garmin_patch_minutes(sleep_dto.get("lightSleepSeconds")))
-    _garmin_patch_put(metrics, "sleep_awake_min", _garmin_patch_minutes(sleep_dto.get("awakeSleepSeconds")))
+    _garmin_patch_put(
+        metrics,
+        "sleep_hours",
+        round(sleep_seconds / 3600, 1) if sleep_seconds is not None else None,
+    )
+    _garmin_patch_put(
+        metrics,
+        "sleep_score",
+        ((sleep_dto.get("sleepScores") or {}).get("overall") or {}).get("value"),
+    )
+    _garmin_patch_put(
+        metrics, "sleep_deep_min", _garmin_patch_minutes(sleep_dto.get("deepSleepSeconds"))
+    )
+    _garmin_patch_put(
+        metrics, "sleep_rem_min", _garmin_patch_minutes(sleep_dto.get("remSleepSeconds"))
+    )
+    _garmin_patch_put(
+        metrics, "sleep_light_min", _garmin_patch_minutes(sleep_dto.get("lightSleepSeconds"))
+    )
+    _garmin_patch_put(
+        metrics, "sleep_awake_min", _garmin_patch_minutes(sleep_dto.get("awakeSleepSeconds"))
+    )
     _garmin_patch_put(
         metrics,
         "resting_heart_rate",
@@ -413,11 +476,23 @@ def _patch_garmin_metrics(snap, *args, **kwargs):
         summary.get("stressQualifier"),
         stress.get("stressQualifier"),
     )
-    _garmin_patch_put(metrics, "stress_avg", _garmin_patch_first_non_none(summary.get("averageStressLevel"), stress.get("avgStressLevel")))
-    _garmin_patch_put(metrics, "stress_max", _garmin_patch_first_non_none(summary.get("maxStressLevel"), stress.get("maxStressLevel")))
+    _garmin_patch_put(
+        metrics,
+        "stress_avg",
+        _garmin_patch_first_non_none(
+            summary.get("averageStressLevel"), stress.get("avgStressLevel")
+        ),
+    )
+    _garmin_patch_put(
+        metrics,
+        "stress_max",
+        _garmin_patch_first_non_none(summary.get("maxStressLevel"), stress.get("maxStressLevel")),
+    )
     _garmin_patch_put(metrics, "stress_label", stress_label)
     if stress_label is not None:
-        metrics["stress_label_es"] = _GARMIN_PATCH_STRESS_LABEL_ES.get(stress_label, metrics.get("stress_label_es"))
+        metrics["stress_label_es"] = _GARMIN_PATCH_STRESS_LABEL_ES.get(
+            stress_label, metrics.get("stress_label_es")
+        )
     hrv_summary = hrv.get("hrvSummary") or {}
     hrv_baseline = hrv_summary.get("baseline") or {}
     hrv_status = hrv_summary.get("status")
@@ -428,26 +503,38 @@ def _patch_garmin_metrics(snap, *args, **kwargs):
     _garmin_patch_put(metrics, "hrv_baseline_high", hrv_baseline.get("balancedUpper"))
     _garmin_patch_put(metrics, "hrv_last_night_5min_high", hrv_summary.get("lastNight5MinHigh"))
     if hrv_status is not None:
-        metrics["hrv_status_es"] = _GARMIN_PATCH_HRV_STATUS_ES.get(hrv_status, metrics.get("hrv_status_es"))
+        metrics["hrv_status_es"] = _GARMIN_PATCH_HRV_STATUS_ES.get(
+            hrv_status, metrics.get("hrv_status_es")
+        )
     if training_readiness:
         tr_status = training_readiness.get("level")
         tr_message = training_readiness.get("feedbackShort")
         _garmin_patch_put(metrics, "training_readiness_score", training_readiness.get("score"))
         _garmin_patch_put(metrics, "training_readiness_status", tr_status)
         _garmin_patch_put(metrics, "training_readiness_message", tr_message)
-        _garmin_patch_put(metrics, "training_readiness_recovery_time", training_readiness.get("recoveryTime"))
-        _garmin_patch_put(metrics, "training_readiness_input_context", training_readiness.get("inputContext"))
+        _garmin_patch_put(
+            metrics, "training_readiness_recovery_time", training_readiness.get("recoveryTime")
+        )
+        _garmin_patch_put(
+            metrics, "training_readiness_input_context", training_readiness.get("inputContext")
+        )
         if tr_status is not None:
-            metrics["training_readiness_status_es"] = _GARMIN_PATCH_TRAINING_READINESS_STATUS_ES.get(
-                tr_status,
-                metrics.get("training_readiness_status_es"),
+            metrics["training_readiness_status_es"] = (
+                _GARMIN_PATCH_TRAINING_READINESS_STATUS_ES.get(
+                    tr_status,
+                    metrics.get("training_readiness_status_es"),
+                )
             )
         if tr_message is not None:
-            metrics["training_readiness_message_es"] = _GARMIN_PATCH_TRAINING_READINESS_MESSAGE_ES.get(
-                tr_message,
-                metrics.get("training_readiness_message_es"),
+            metrics["training_readiness_message_es"] = (
+                _GARMIN_PATCH_TRAINING_READINESS_MESSAGE_ES.get(
+                    tr_message,
+                    metrics.get("training_readiness_message_es"),
+                )
             )
-    latest_status_data = (((training_status.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData")) or {})
+    latest_status_data = (
+        (training_status.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData")
+    ) or {}
     acute = None
     if isinstance(latest_status_data, dict):
         for device_data in latest_status_data.values():
@@ -469,7 +556,7 @@ def _patch_garmin_metrics(snap, *args, **kwargs):
     _garmin_patch_put(metrics, "steps", summary.get("totalSteps"))
     _garmin_patch_put(metrics, "steps_goal", summary.get("dailyStepGoal"))
     vo2_block = ((training_status.get("mostRecentVO2Max") or {}).get("generic")) or {}
-    profile_data = (user_profile.get("userData") or {})
+    profile_data = user_profile.get("userData") or {}
     fitness_age_raw = raw.get("fitness_age_raw") or {}
     fitness_age_val = (
         vo2_block.get("fitnessAge")
@@ -487,12 +574,21 @@ def _patch_garmin_metrics(snap, *args, **kwargs):
             profile_data.get("vo2MaxRunning"),
         ),
     )
-    _VO2MAX_CAT_ES = {0: "Deficiente", 1: "Bajo", 2: "Aceptable", 3: "Bueno", 4: "Excelente", 5: "Superior"}
+    _VO2MAX_CAT_ES = {
+        0: "Deficiente",
+        1: "Bajo",
+        2: "Aceptable",
+        3: "Bueno",
+        4: "Excelente",
+        5: "Superior",
+    }
     vo2_cat = vo2_block.get("maxMetCategory")
     if vo2_cat is not None:
         _garmin_patch_put(metrics, "vo2max_label", _VO2MAX_CAT_ES.get(vo2_cat))
     respiration = raw.get("respiration_raw") or {}
-    _garmin_patch_put(metrics, "respiration_waking_avg", respiration.get("avgWakingRespirationValue"))
+    _garmin_patch_put(
+        metrics, "respiration_waking_avg", respiration.get("avgWakingRespirationValue")
+    )
     _garmin_patch_put(metrics, "respiration_sleep_avg", respiration.get("avgSleepRespirationValue"))
     _garmin_patch_put(metrics, "respiration_min", respiration.get("lowestRespirationValue"))
     _garmin_patch_put(metrics, "respiration_max", respiration.get("highestRespirationValue"))
@@ -504,6 +600,8 @@ def _patch_garmin_metrics(snap, *args, **kwargs):
         _garmin_patch_put(metrics, "spo2_min", spo2.get("lowestSpO2"))
         _garmin_patch_put(metrics, "spo2_7d_avg", spo2.get("lastSevenDaysAvgSpO2"))
     return snap
+
+
 def _patch_es_initial(snap, *args, **kwargs):
     if not isinstance(snap, dict):
         return snap
@@ -532,23 +630,37 @@ def _patch_es_initial(snap, *args, **kwargs):
         if translated_training_status:
             metrics["training_status_es"] = translated_training_status
     return snap
+
+
 def _patch_es_recheck(snap, *args, **kwargs):
     metrics = snap.get("metrics") or {}
     metrics["stress_label_es"] = _translate_status_es(metrics.get("stress_label"))
     metrics["hrv_status_es"] = _translate_status_es(metrics.get("hrv_status"))
-    metrics["training_readiness_status_es"] = _translate_status_es(metrics.get("training_readiness_status"))
-    metrics["training_readiness_message_es"] = _translate_message_es(metrics.get("training_readiness_message"))
+    metrics["training_readiness_status_es"] = _translate_status_es(
+        metrics.get("training_readiness_status")
+    )
+    metrics["training_readiness_message_es"] = _translate_message_es(
+        metrics.get("training_readiness_message")
+    )
     metrics["acute_load_status_es"] = _translate_status_es(metrics.get("acute_load_status"))
     snap["metrics"] = metrics
     return snap
+
+
 def _patch_es_canonical(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     metrics["stress_label_es"] = _translate_status_es(metrics.get("stress_label"))
     metrics["hrv_status_es"] = _translate_status_es(metrics.get("hrv_status"))
-    metrics["training_readiness_status_es"] = _translate_status_es(metrics.get("training_readiness_status"))
-    metrics["training_readiness_message_es"] = _translate_message_es(metrics.get("training_readiness_message"))
+    metrics["training_readiness_status_es"] = _translate_status_es(
+        metrics.get("training_readiness_status")
+    )
+    metrics["training_readiness_message_es"] = _translate_message_es(
+        metrics.get("training_readiness_message")
+    )
     metrics["acute_load_status_es"] = _translate_status_es(metrics.get("acute_load_status"))
     return snap
+
+
 def _patch_recovery_guardrails(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw_sources = snap.get("raw_sources") or {}
@@ -565,16 +677,17 @@ def _patch_recovery_guardrails(snap, *args, **kwargs):
         selected_ts = entry.get("timestampLocal") or entry.get("timestamp")
     metrics["training_readiness_selected_timestamp_local"] = selected_ts
     return snap
+
+
 def _patch_ui_canonical_fields(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     metrics["predisposicion_para_entrenar"] = metrics.get("training_readiness_score")
     readiness_status_es = _normalize_readiness_status_es(
-        metrics.get("training_readiness_status_es")
-        or metrics.get("training_readiness_status")
+        metrics.get("training_readiness_status_es") or metrics.get("training_readiness_status")
     )
     metrics["predisposicion_para_entrenar_estado"] = readiness_status_es
     metrics["predisposicion_para_entrenar_texto"] = (
-        f'{metrics.get("training_readiness_score")} — {readiness_status_es}'
+        f"{metrics.get('training_readiness_score')} — {readiness_status_es}"
         if metrics.get("training_readiness_score") is not None and readiness_status_es
         else None
     )
@@ -588,13 +701,21 @@ def _patch_ui_canonical_fields(snap, *args, **kwargs):
         metrics["predisposicion_factor_recuperacion_raw"] = readiness_entry.get("recoveryTime")
         metrics["predisposicion_factor_carga_aguda"] = readiness_entry.get("acuteLoad")
         metrics["predisposicion_factor_feedback_vfc_raw"] = readiness_entry.get("hrvFactorFeedback")
-        metrics["predisposicion_factor_feedback_recuperacion_raw"] = readiness_entry.get("recoveryTimeFactorFeedback")
-        metrics["predisposicion_factor_feedback_sueno_reciente_raw"] = readiness_entry.get("sleepHistoryFactorFeedback")
-        metrics["predisposicion_factor_feedback_estres_reciente_raw"] = readiness_entry.get("stressHistoryFactorFeedback")
+        metrics["predisposicion_factor_feedback_recuperacion_raw"] = readiness_entry.get(
+            "recoveryTimeFactorFeedback"
+        )
+        metrics["predisposicion_factor_feedback_sueno_reciente_raw"] = readiness_entry.get(
+            "sleepHistoryFactorFeedback"
+        )
+        metrics["predisposicion_factor_feedback_estres_reciente_raw"] = readiness_entry.get(
+            "stressHistoryFactorFeedback"
+        )
     metrics["body_battery_actual"] = metrics.get("body_battery_current")
-    metrics["body_battery_ultimo_timestamp_local"] = metrics.get("body_battery_last_timestamp_local")
+    metrics["body_battery_ultimo_timestamp_local"] = metrics.get(
+        "body_battery_last_timestamp_local"
+    )
     metrics["body_battery_texto"] = (
-        f'{metrics.get("body_battery_current")} actual'
+        f"{metrics.get('body_battery_current')} actual"
         if metrics.get("body_battery_current") is not None
         else None
     )
@@ -604,86 +725,109 @@ def _patch_ui_canonical_fields(snap, *args, **kwargs):
         metrics.get("sleep_score"),
         metrics.get("duracion_de_sueno_texto"),
     )
-    metrics["recuperacion_texto_seguro"] = (
-        metrics.get("training_readiness_recovery_answer_for_llm")
-        or metrics.get("training_readiness_recovery_safe_text")
-    )
+    metrics["recuperacion_texto_seguro"] = metrics.get(
+        "training_readiness_recovery_answer_for_llm"
+    ) or metrics.get("training_readiness_recovery_safe_text")
     metrics["snapshot_obtenido_local"] = _isoish_to_local(snap.get("fetched_at"))
     metrics["datos_hasta_local"] = _latest_known_data_timestamp_local(metrics)
     return snap
+
+
 def _patch_human_sleep_phase_fields(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
-    metrics["sueno_rem_texto"] = _duration_text_from_metric_keys_sleep(metrics, (
-        "sleep_rem_seconds",
-        "sleep_rem_duration_seconds",
-        "sleep_rem_time_seconds",
-        "rem_sleep_seconds",
-        "remSleepSeconds",
-        "remSleepDuration",
-        "rem_seconds",
-    ))
-    metrics["sueno_profundo_texto"] = _duration_text_from_metric_keys_sleep(metrics, (
-        "sleep_deep_seconds",
-        "sleep_deep_duration_seconds",
-        "deep_sleep_seconds",
-        "deepSleepSeconds",
-        "deepSleepDuration",
-        "deep_seconds",
-    ))
-    metrics["sueno_ligero_texto"] = _duration_text_from_metric_keys_sleep(metrics, (
-        "sleep_light_seconds",
-        "sleep_light_duration_seconds",
-        "light_sleep_seconds",
-        "lightSleepSeconds",
-        "lightSleepDuration",
-        "light_seconds",
-    ))
-    metrics["sueno_despierto_texto"] = _duration_text_from_metric_keys_sleep(metrics, (
-        "sleep_awake_seconds",
-        "sleep_awake_duration_seconds",
-        "awake_sleep_seconds",
-        "awakeSleepSeconds",
-        "awakeDuration",
-        "sleep_wake_seconds",
-        "awake_seconds",
-    ))
-    sueno_inicio_raw = _first_present_value_sleep(metrics, (
-        "sleep_start_local",
-        "sleep_start_time_local",
-        "sleep_bedtime_local",
-        "sleep_start_timestamp_local",
-        "sleepStartTimestampLocal",
-        "sleepTimeLocal",
-        "sleep_start",
-    ))
-    sueno_fin_raw = _first_present_value_sleep(metrics, (
-        "sleep_end_local",
-        "sleep_end_time_local",
-        "sleep_wake_time_local",
-        "wake_time_local",
-        "sleep_end_timestamp_local",
-        "sleepEndTimestampLocal",
-        "wakeTimeLocal",
-        "sleep_end",
-    ))
+    metrics["sueno_rem_texto"] = _duration_text_from_metric_keys_sleep(
+        metrics,
+        (
+            "sleep_rem_seconds",
+            "sleep_rem_duration_seconds",
+            "sleep_rem_time_seconds",
+            "rem_sleep_seconds",
+            "remSleepSeconds",
+            "remSleepDuration",
+            "rem_seconds",
+        ),
+    )
+    metrics["sueno_profundo_texto"] = _duration_text_from_metric_keys_sleep(
+        metrics,
+        (
+            "sleep_deep_seconds",
+            "sleep_deep_duration_seconds",
+            "deep_sleep_seconds",
+            "deepSleepSeconds",
+            "deepSleepDuration",
+            "deep_seconds",
+        ),
+    )
+    metrics["sueno_ligero_texto"] = _duration_text_from_metric_keys_sleep(
+        metrics,
+        (
+            "sleep_light_seconds",
+            "sleep_light_duration_seconds",
+            "light_sleep_seconds",
+            "lightSleepSeconds",
+            "lightSleepDuration",
+            "light_seconds",
+        ),
+    )
+    metrics["sueno_despierto_texto"] = _duration_text_from_metric_keys_sleep(
+        metrics,
+        (
+            "sleep_awake_seconds",
+            "sleep_awake_duration_seconds",
+            "awake_sleep_seconds",
+            "awakeSleepSeconds",
+            "awakeDuration",
+            "sleep_wake_seconds",
+            "awake_seconds",
+        ),
+    )
+    sueno_inicio_raw = _first_present_value_sleep(
+        metrics,
+        (
+            "sleep_start_local",
+            "sleep_start_time_local",
+            "sleep_bedtime_local",
+            "sleep_start_timestamp_local",
+            "sleepStartTimestampLocal",
+            "sleepTimeLocal",
+            "sleep_start",
+        ),
+    )
+    sueno_fin_raw = _first_present_value_sleep(
+        metrics,
+        (
+            "sleep_end_local",
+            "sleep_end_time_local",
+            "sleep_wake_time_local",
+            "wake_time_local",
+            "sleep_end_timestamp_local",
+            "sleepEndTimestampLocal",
+            "wakeTimeLocal",
+            "sleep_end",
+        ),
+    )
     metrics["sueno_inicio_texto"] = _short_local_dt_text(_isoish_to_local(sueno_inicio_raw))
     metrics["sueno_fin_texto"] = _short_local_dt_text(_isoish_to_local(sueno_fin_raw))
     fases = []
     if metrics.get("sueno_rem_texto"):
-        fases.append(f'REM {metrics.get("sueno_rem_texto")}')
+        fases.append(f"REM {metrics.get('sueno_rem_texto')}")
     if metrics.get("sueno_profundo_texto"):
-        fases.append(f'Profundo {metrics.get("sueno_profundo_texto")}')
+        fases.append(f"Profundo {metrics.get('sueno_profundo_texto')}")
     if metrics.get("sueno_ligero_texto"):
-        fases.append(f'Ligero {metrics.get("sueno_ligero_texto")}')
+        fases.append(f"Ligero {metrics.get('sueno_ligero_texto')}")
     if metrics.get("sueno_despierto_texto"):
-        fases.append(f'Despierto {metrics.get("sueno_despierto_texto")}')
+        fases.append(f"Despierto {metrics.get('sueno_despierto_texto')}")
     metrics["sueno_fases_resumen_humano"] = ", ".join(fases) if fases else None
     return snap
+
+
 def _patch_raw_sleep_canonicalization(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw_sources = snap.get("raw_sources") or {}
     if metrics.get("snapshot_obtenido_texto") is None:
-        metrics["snapshot_obtenido_texto"] = _short_local_dt_text(metrics.get("snapshot_obtenido_local"))
+        metrics["snapshot_obtenido_texto"] = _short_local_dt_text(
+            metrics.get("snapshot_obtenido_local")
+        )
     if metrics.get("datos_hasta_texto") is None:
         metrics["datos_hasta_texto"] = _short_local_dt_text(metrics.get("datos_hasta_local"))
     if metrics.get("body_battery_resumen_humano") is None:
@@ -698,7 +842,9 @@ def _patch_raw_sleep_canonicalization(snap, *args, **kwargs):
         noche = metrics.get("vfc_media_noche_ms")
         media7 = metrics.get("vfc_media_7_dias_ms")
         if estado and noche is not None and media7 is not None:
-            metrics["estado_vfc_resumen_humano"] = f"{estado}, {noche} ms nocturnos, {media7} ms de media 7 días"
+            metrics["estado_vfc_resumen_humano"] = (
+                f"{estado}, {noche} ms nocturnos, {media7} ms de media 7 días"
+            )
         elif estado:
             metrics["estado_vfc_resumen_humano"] = str(estado)
     if metrics.get("sueno_resumen_humano") is None:
@@ -726,14 +872,12 @@ def _patch_raw_sleep_canonicalization(snap, *args, **kwargs):
         light_seconds = daily.get("lightSleepSeconds")
         awake_seconds = daily.get("awakeSleepSeconds")
 
-        start_local_iso = (
-            _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampLocal"))
-            or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampGMT"))
-        )
-        end_local_iso = (
-            _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampLocal"))
-            or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampGMT"))
-        )
+        start_local_iso = _parse_epoch_millis_to_local_iso(
+            daily.get("sleepStartTimestampLocal")
+        ) or _parse_epoch_millis_to_local_iso(daily.get("sleepStartTimestampGMT"))
+        end_local_iso = _parse_epoch_millis_to_local_iso(
+            daily.get("sleepEndTimestampLocal")
+        ) or _parse_epoch_millis_to_local_iso(daily.get("sleepEndTimestampGMT"))
 
         metrics["sueno_fecha_calendario"] = daily.get("calendarDate")
         metrics["sueno_origen_canonico"] = "raw_sources.sleep_raw.dailySleepDTO"
@@ -765,22 +909,30 @@ def _patch_raw_sleep_canonicalization(snap, *args, **kwargs):
 
         fases = []
         if metrics.get("sueno_rem_texto"):
-            fases.append(f'REM {metrics.get("sueno_rem_texto")}')
+            fases.append(f"REM {metrics.get('sueno_rem_texto')}")
         if metrics.get("sueno_profundo_texto"):
-            fases.append(f'Profundo {metrics.get("sueno_profundo_texto")}')
+            fases.append(f"Profundo {metrics.get('sueno_profundo_texto')}")
         if metrics.get("sueno_ligero_texto"):
-            fases.append(f'Ligero {metrics.get("sueno_ligero_texto")}')
+            fases.append(f"Ligero {metrics.get('sueno_ligero_texto')}")
         if metrics.get("sueno_despierto_texto"):
-            fases.append(f'Despierto {metrics.get("sueno_despierto_texto")}')
+            fases.append(f"Despierto {metrics.get('sueno_despierto_texto')}")
         metrics["sueno_fases_resumen_humano"] = ", ".join(fases) if fases else None
 
         # Si el fin del sueño es más reciente que el "datos_hasta_local" previo, lo actualizamos
-        current_datos_hasta = _parse_garmin_datetime(metrics.get("datos_hasta_local")) if metrics.get("datos_hasta_local") else None
+        current_datos_hasta = (
+            _parse_garmin_datetime(metrics.get("datos_hasta_local"))
+            if metrics.get("datos_hasta_local")
+            else None
+        )
         sleep_end_dt = _parse_garmin_datetime(end_local_iso) if end_local_iso else None
-        if sleep_end_dt is not None and (current_datos_hasta is None or sleep_end_dt > current_datos_hasta):
+        if sleep_end_dt is not None and (
+            current_datos_hasta is None or sleep_end_dt > current_datos_hasta
+        ):
             metrics["datos_hasta_local"] = sleep_end_dt.isoformat()
             metrics["datos_hasta_texto"] = _short_local_dt_text(metrics.get("datos_hasta_local"))
     return snap
+
+
 def _patch_sleep_gmt_fix(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw_sources = snap.get("raw_sources") or {}
@@ -798,6 +950,8 @@ def _patch_sleep_gmt_fix(snap, *args, **kwargs):
             metrics["sueno_fin_local"] = end_from_gmt
             metrics["sueno_fin_texto"] = _short_local_dt_text(end_from_gmt)
     return snap
+
+
 def _patch_sleep_freshness(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     snapshot_local = metrics.get("snapshot_obtenido_local") or _now_local().isoformat()
@@ -810,7 +964,9 @@ def _patch_sleep_freshness(snap, *args, **kwargs):
     elif sleep_ref_dt is not None:
         state = "unknown"
     age_hours = _hours_between_local_datetimes(snapshot_local, sleep_ref_local)
-    metrics["sueno_referencia_local"] = sleep_ref_dt.isoformat() if sleep_ref_dt is not None else None
+    metrics["sueno_referencia_local"] = (
+        sleep_ref_dt.isoformat() if sleep_ref_dt is not None else None
+    )
     metrics["sueno_antiguedad_horas"] = age_hours
     metrics["sueno_estado_frescura"] = state
     metrics["sueno_es_actual"] = state == "fresh"
@@ -820,22 +976,34 @@ def _patch_sleep_freshness(snap, *args, **kwargs):
         metrics["sueno_resumen_para_llm"] = summary
         metrics["sueno_fases_para_llm"] = phases
     elif state == "stale":
-        ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or metrics.get("sueno_fecha_calendario")
-        metrics["sueno_resumen_para_llm"] = f"Último sueño disponible del conector: {ref_text}; no asumir que corresponde a anoche"
+        ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or metrics.get(
+            "sueno_fecha_calendario"
+        )
+        metrics["sueno_resumen_para_llm"] = (
+            f"Último sueño disponible del conector: {ref_text}; no asumir que corresponde a anoche"
+        )
         metrics["sueno_fases_para_llm"] = None
     elif state == "unknown":
         ref_text = _short_local_dt_text(metrics.get("sueno_referencia_local")) or "sin fecha clara"
-        metrics["sueno_resumen_para_llm"] = f"Hay un sueño disponible ({ref_text}), pero no se pudo validar si corresponde a hoy"
+        metrics["sueno_resumen_para_llm"] = (
+            f"Hay un sueño disponible ({ref_text}), pero no se pudo validar si corresponde a hoy"
+        )
         metrics["sueno_fases_para_llm"] = None
     else:
         metrics["sueno_resumen_para_llm"] = "No hay sueño usable en el snapshot actual"
         metrics["sueno_fases_para_llm"] = None
     return snap
+
+
 def _patch_multi_day_sleep_selection(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw_sources = snap.setdefault("raw_sources", {})
     client = _find_sleep_client_in_args(*args, **kwargs)
-    snapshot_local_iso = metrics.get("snapshot_obtenido_local") or _isoish_to_local(snap.get("fetched_at")) or _now_local().isoformat()
+    snapshot_local_iso = (
+        metrics.get("snapshot_obtenido_local")
+        or _isoish_to_local(snap.get("fetched_at"))
+        or _now_local().isoformat()
+    )
     selection = None
     if client is not None:
         selection = _pick_latest_sleep_from_client(client, snapshot_local_iso)
@@ -844,21 +1012,27 @@ def _patch_multi_day_sleep_selection(snap, *args, **kwargs):
     selected = selection.get("selected") if isinstance(selection, dict) else None
     if selected is not None:
         raw_sources["sleep_raw"] = selected["raw"]
-        source_label = f'garmin.get_sleep_data({selected["calendar_date"]})'
+        source_label = f"garmin.get_sleep_data({selected['calendar_date']})"
         _apply_sleep_candidate_to_metrics(metrics, selected, source_label)
         _recompute_sleep_freshness_fields(metrics)
     return snap
+
+
 def _patch_sleep_selection_debug_bridge(snap, *args, **kwargs):
     raw_sources = snap.setdefault("raw_sources", {})
     metrics = snap.setdefault("metrics", {})
     if sleep._SLEEP_SELECTION_DEBUG_LAST is not None:
         raw_sources["sleep_selection_debug"] = deepcopy(sleep._SLEEP_SELECTION_DEBUG_LAST)
         selected = sleep._SLEEP_SELECTION_DEBUG_LAST.get("selected") or {}
-        if selected:
+        if isinstance(selected, dict):
             requested_date = selected.get("requested_date")
             calendar_date = selected.get("calendar_date")
-            metrics["sueno_origen_canonico"] = f"garmin.get_sleep_data multi-day ({requested_date} -> {calendar_date})"
+            metrics["sueno_origen_canonico"] = (
+                f"garmin.get_sleep_data multi-day ({requested_date} -> {calendar_date})"
+            )
     return snap
+
+
 def _patch_hrv_selection_debug_bridge(snap, *args, **kwargs):
     raw_sources = snap.setdefault("raw_sources", {})
     metrics = snap.setdefault("metrics", {})
@@ -869,9 +1043,15 @@ def _patch_hrv_selection_debug_bridge(snap, *args, **kwargs):
             requested_date_base = _dep("_get_hrv_debug_last")().get("requested_date_base")
             source_date = selected.get("requested_date")
             metrics["vfc_fecha_api_garmin"] = source_date
-            metrics["vfc_origen_canonico"] = f"garmin.get_hrv_data multi-day ({requested_date_base} -> {source_date})"
+            metrics["vfc_origen_canonico"] = (
+                f"garmin.get_hrv_data multi-day ({requested_date_base} -> {source_date})"
+            )
             try:
-                intuitive_date = (date.fromisoformat(source_date) + timedelta(days=1)).isoformat()
+                if not source_date:
+                    raise ValueError
+                intuitive_date = (
+                    date.fromisoformat(str(source_date)) + timedelta(days=1)
+                ).isoformat()
             except Exception:
                 intuitive_date = None
             metrics["vfc_noche_termina_en_fecha"] = intuitive_date
@@ -884,10 +1064,16 @@ def _patch_hrv_selection_debug_bridge(snap, *args, **kwargs):
                 ref_text = str(ref)
             fecha_api = metrics.get("vfc_fecha_api_garmin")
             if fecha_api and fecha_api != ref:
-                metrics["vfc_referencia_texto"] = f"VFC nocturna de la noche que termina el {ref_text} (fecha API Garmin: {fecha_api})"
+                metrics["vfc_referencia_texto"] = (
+                    f"VFC nocturna de la noche que termina el {ref_text} (fecha API Garmin: {fecha_api})"
+                )
             else:
-                metrics["vfc_referencia_texto"] = f"VFC nocturna de la noche que termina el {ref_text}"
+                metrics["vfc_referencia_texto"] = (
+                    f"VFC nocturna de la noche que termina el {ref_text}"
+                )
     return snap
+
+
 def _patch_presentation_cleanup(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw = snap.setdefault("raw_sources", {})
@@ -941,7 +1127,9 @@ def _patch_presentation_cleanup(snap, *args, **kwargs):
     if daily_weight is not None:
         metrics["peso_referencia_texto"] = "Peso de composición corporal del día"
     elif profile_weight is not None:
-        metrics["peso_referencia_texto"] = "Peso tomado del perfil de Garmin (sin medición corporal del día)"
+        metrics["peso_referencia_texto"] = (
+            "Peso tomado del perfil de Garmin (sin medición corporal del día)"
+        )
     fitness_age_raw = raw.get("fitness_age_raw") or {}
     bmi_component = (fitness_age_raw.get("components") or {}).get("bmi") or {}
     bmi_last_measurement = bmi_component.get("lastMeasurementDate")
@@ -951,6 +1139,8 @@ def _patch_presentation_cleanup(snap, *args, **kwargs):
             txt += f" · IMC con última medición {bmi_last_measurement}"
         metrics["fitness_age_referencia_texto"] = txt
     return snap
+
+
 def _patch_acclimatacion_spo2(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw = snap.setdefault("raw_sources", {})
@@ -1005,6 +1195,8 @@ def _patch_acclimatacion_spo2(snap, *args, **kwargs):
     if resumen:
         metrics["aclimatacion_spo2_resumen_humano"] = resumen
     return snap
+
+
 def _patch_lactato_parcial(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw = snap.setdefault("raw_sources", {})
@@ -1028,11 +1220,17 @@ def _patch_lactato_parcial(snap, *args, **kwargs):
     parts.append("ritmo/potencia/W/kg no disponibles con las fuentes actuales")
     metrics["umbral_lactato_resumen_humano"] = " · ".join(parts)
     return snap
+
+
 def _patch_ui_texts(snap, *args, **kwargs):
     metrics = snap.setdefault("metrics", {})
     raw = snap.setdefault("raw_sources", {})
     summary = raw.get("summary_raw") or {}
-    load_balance_map = (((raw.get("training_status_raw") or {}).get("mostRecentTrainingLoadBalance") or {}).get("metricsTrainingLoadBalanceDTOMap")) or {}
+    load_balance_map = (
+        ((raw.get("training_status_raw") or {}).get("mostRecentTrainingLoadBalance") or {}).get(
+            "metricsTrainingLoadBalanceDTOMap"
+        )
+    ) or {}
     load_balance = None
     if isinstance(load_balance_map, dict):
         for block in load_balance_map.values():
@@ -1127,7 +1325,17 @@ def _patch_ui_texts(snap, *args, **kwargs):
     ah_max = load_balance.get("monthlyLoadAerobicHighTargetMax")
     an_max = load_balance.get("monthlyLoadAnaerobicTargetMax")
     try:
-        if None not in (al, ah, an, al_max, ah_max, an_max) and al > al_max and ah > ah_max and an > an_max:
+        if (
+            al is not None
+            and ah is not None
+            and an is not None
+            and al_max is not None
+            and ah_max is not None
+            and an_max is not None
+            and al > al_max
+            and ah > ah_max
+            and an > an_max
+        ):
             foco = "Por encima de los objetivos"
     except Exception:
         pass
@@ -1163,29 +1371,32 @@ def _patch_ui_texts(snap, *args, **kwargs):
     if et_parts:
         metrics["estado_entreno_resumen_humano"] = " · ".join(et_parts)
     if "ES_FIELD_LABELS" in globals():
-        ES_FIELD_LABELS.update({
-            "calorias_activas": "Calorías activas",
-            "calorias_en_reposo": "Calorías en reposo",
-            "calorias_totales": "Total de calorías quemadas",
-            "calorias_resumen_humano": "Resumen humano de calorías",
-            "pasos_resumen_humano": "Resumen humano de pasos",
-            "pisos_subidos": "Subidos",
-            "pisos_bajados": "Bajados",
-            "pisos_objetivo": "Objetivo de pisos",
-            "pisos_resumen_humano": "Resumen humano de pisos",
-            "minutos_intensidad_total_semanal": "Minutos de intensidad semanales",
-            "minutos_intensidad_moderados_semanal": "Minutos moderados semanales",
-            "minutos_intensidad_altos_semanal": "Minutos altos semanales",
-            "minutos_intensidad_objetivo_semanal": "Objetivo semanal de minutos de intensidad",
-            "minutos_intensidad_resumen_humano": "Resumen humano de minutos de intensidad",
-            "estres_resumen_humano": "Resumen humano de estrés",
-            "foco_de_carga_texto": "Foco de carga",
-            "estado_entreno_resumen_humano": "Resumen humano de estado de entreno",
-        })
+        ES_FIELD_LABELS.update(
+            {
+                "calorias_activas": "Calorías activas",
+                "calorias_en_reposo": "Calorías en reposo",
+                "calorias_totales": "Total de calorías quemadas",
+                "calorias_resumen_humano": "Resumen humano de calorías",
+                "pasos_resumen_humano": "Resumen humano de pasos",
+                "pisos_subidos": "Subidos",
+                "pisos_bajados": "Bajados",
+                "pisos_objetivo": "Objetivo de pisos",
+                "pisos_resumen_humano": "Resumen humano de pisos",
+                "minutos_intensidad_total_semanal": "Minutos de intensidad semanales",
+                "minutos_intensidad_moderados_semanal": "Minutos moderados semanales",
+                "minutos_intensidad_altos_semanal": "Minutos altos semanales",
+                "minutos_intensidad_objetivo_semanal": "Objetivo semanal de minutos de intensidad",
+                "minutos_intensidad_resumen_humano": "Resumen humano de minutos de intensidad",
+                "estres_resumen_humano": "Resumen humano de estrés",
+                "foco_de_carga_texto": "Foco de carga",
+                "estado_entreno_resumen_humano": "Resumen humano de estado de entreno",
+            }
+        )
     return snap
+
+
 def _patch_attach_frontend(snap, *args, **kwargs):
     return _dep("_attach_frontend_view_to_snapshot")(snap)
-
 
 
 # ---------------------------------------------------------------------------
@@ -1210,7 +1421,7 @@ _PATCHES = [
     _patch_acclimatacion_spo2,
     _patch_lactato_parcial,
     _patch_ui_texts,
-    _patch_attach_frontend
+    _patch_attach_frontend,
 ]
 
 

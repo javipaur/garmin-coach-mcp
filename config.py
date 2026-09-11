@@ -14,7 +14,9 @@ GARMIN_LANGUAGE = os.getenv("GARMIN_LANGUAGE", "es").lower()
 
 # Recovery
 RECOVERY_MAX_FRESH_MINUTES = max(15, int(os.getenv("RECOVERY_MAX_FRESH_MINUTES", "360")))
-RECOVERY_CROSS_DAY_STALE_MINUTES = max(15, int(os.getenv("RECOVERY_CROSS_DAY_STALE_MINUTES", "180")))
+RECOVERY_CROSS_DAY_STALE_MINUTES = max(
+    15, int(os.getenv("RECOVERY_CROSS_DAY_STALE_MINUTES", "180"))
+)
 
 # Auth
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
@@ -32,6 +34,7 @@ USERS_DB_FILE = USERS_DB_DIR / "users.json"
 WEB_CONFIG_FILE = DATA_ROOT / "web-config.json"
 CONFIG_SHARES_DIR = DATA_ROOT / "config-shares"
 
+
 # Garmin tokens
 def _resolve_token_dir() -> Path:
     explicit = os.getenv("GARMIN_TOKEN_DIR", "").strip()
@@ -43,6 +46,7 @@ def _resolve_token_dir() -> Path:
         return DATA_ROOT / "garmin"
     return LOCAL_DEBUG_TOKEN_DIR
 
+
 TOKEN_DIR = _resolve_token_dir()
 TOKEN_FILE = TOKEN_DIR / "garmin_tokens.json"
 GARMIN_TOKENS_JSON = os.getenv("GARMIN_TOKENS_JSON", "").strip()
@@ -50,7 +54,16 @@ RESET_GARMIN_TOKENS = os.getenv("RESET_GARMIN_TOKENS", "0").lower() in {"1", "tr
 
 # Config sharing
 WEB_CONFIG_ALLOWED_KEYS = {
-    "run_type", "distance", "duration", "pace", "cadence",
-    "heartRate", "elevation", "weather", "notes",
-    "lactate_threshold", "vo2max", "max_heart_rate",
+    "run_type",
+    "distance",
+    "duration",
+    "pace",
+    "cadence",
+    "heartRate",
+    "elevation",
+    "weather",
+    "notes",
+    "lactate_threshold",
+    "vo2max",
+    "max_heart_rate",
 }

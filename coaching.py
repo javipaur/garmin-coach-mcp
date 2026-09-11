@@ -12,7 +12,9 @@ def _decision_num(value: Any) -> float | None:
         return None
 
 
-def _decision_pick_primary_driver(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> str:
+def _decision_pick_primary_driver(
+    ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None
+) -> str:
     readiness = _decision_num(ctx.get("training_readiness"))
     bb = _decision_num(ctx.get("body_battery_current"))
     sleep = _decision_num(ctx.get("sleep_score"))
@@ -40,7 +42,9 @@ def _decision_pick_primary_driver(ctx: dict[str, Any], latest_run: dict[str, Any
     return "Contexto general de recuperación"
 
 
-def _decision_collect_reasons(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> list[str]:
+def _decision_collect_reasons(
+    ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None
+) -> list[str]:
     reasons: list[str] = []
 
     readiness = _decision_num(ctx.get("training_readiness"))
@@ -95,7 +99,9 @@ def _decision_collect_reasons(ctx: dict[str, Any], latest_run: dict[str, Any] | 
     return reasons
 
 
-def _decision_collect_risks(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> list[str]:
+def _decision_collect_risks(
+    ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None
+) -> list[str]:
     risks: list[str] = []
 
     readiness = _decision_num(ctx.get("training_readiness"))
@@ -134,7 +140,9 @@ def _decision_collect_risks(ctx: dict[str, Any], latest_run: dict[str, Any] | No
     return risks
 
 
-def _decision_level(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> tuple[str, str, str]:
+def _decision_level(
+    ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None
+) -> tuple[str, str, str]:
     readiness = _decision_num(ctx.get("training_readiness"))
     bb = _decision_num(ctx.get("body_battery_current"))
     sleep = _decision_num(ctx.get("sleep_score"))
@@ -142,11 +150,15 @@ def _decision_level(ctx: dict[str, Any], latest_run: dict[str, Any] | None, late
     latest_run_load = _decision_num((latest_run or {}).get("training_load"))
     latest_strength_load = _decision_num((latest_strength or {}).get("training_load"))
 
-    if (readiness is not None and readiness <= 45) or (bb is not None and bb <= 28) or (sleep is not None and sleep <= 50):
+    if (
+        (readiness is not None and readiness <= 45)
+        or (bb is not None and bb <= 28)
+        or (sleep is not None and sleep <= 50)
+    ):
         return (
             "descanso_recuperacion",
             "Descanso o recuperación",
-            "Hoy priorizaría recuperación, movilidad o paseo suave."
+            "Hoy priorizaría recuperación, movilidad o paseo suave.",
         )
 
     if (
@@ -159,17 +171,19 @@ def _decision_level(ctx: dict[str, Any], latest_run: dict[str, Any] | None, late
         return (
             "suave_controlado",
             "Día suave o controlado",
-            "Hoy encaja mejor una sesión suave, técnica o trabajo aeróbico controlado."
+            "Hoy encaja mejor una sesión suave, técnica o trabajo aeróbico controlado.",
         )
 
     return (
         "intensidad_controlada",
         "Intensidad controlada",
-        "Hoy podrías meter calidad, pero con control de volumen y sin encadenar fatiga innecesaria."
+        "Hoy podrías meter calidad, pero con control de volumen y sin encadenar fatiga innecesaria.",
     )
 
 
-def _decision_recommendation_text(level_key: str, latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> str:
+def _decision_recommendation_text(
+    level_key: str, latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None
+) -> str:
     if level_key == "descanso_recuperacion":
         return (
             "Haz descanso, movilidad o paseo muy suave de 20-40 min. "
@@ -224,7 +238,12 @@ def _brief_primary_message(decision: dict[str, Any], ctx: dict[str, Any]) -> str
     return " · ".join(parts)
 
 
-def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> dict[str, Any]:
+def _brief_plan(
+    decision: dict[str, Any],
+    ctx: dict[str, Any],
+    latest_run: dict[str, Any] | None,
+    latest_strength: dict[str, Any] | None,
+) -> dict[str, Any]:
     level_key = decision.get("level_key")
     acute = _brief_int(ctx.get("acute_load"))
     acute_es = ctx.get("acute_load_status_es")
@@ -241,9 +260,11 @@ def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[
             "detalle": [
                 "Nada de series ni fuerza dura.",
                 "Si haces algo, que sea fácil de cortar y sin perseguir métricas.",
-                "Prioriza llegar fresco a mañana."
+                "Prioriza llegar fresco a mañana.",
             ],
-            "contexto_carga": f"Carga aguda {acute} ({acute_es})" if acute is not None and acute_es else acute,
+            "contexto_carga": f"Carga aguda {acute} ({acute_es})"
+            if acute is not None and acute_es
+            else acute,
         }
 
     if level_key == "suave_controlado":
@@ -262,9 +283,11 @@ def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[
             "detalle": [
                 "Mantén margen respiratorio claro.",
                 "No conviertas una sesión suave en una sesión media.",
-                "Mejor una sola pieza principal y terminar con sensación de reserva."
+                "Mejor una sola pieza principal y terminar con sensación de reserva.",
             ],
-            "contexto_carga": f"Carga aguda {acute} ({acute_es})" if acute is not None and acute_es else acute,
+            "contexto_carga": f"Carga aguda {acute} ({acute_es})"
+            if acute is not None and acute_es
+            else acute,
         }
 
     return {
@@ -276,7 +299,9 @@ def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[
         "detalle": [
             "Elige una sola pieza principal y no la dupliques.",
             "Evita empezar fuerte y acabar apagado.",
-            "Termina con una progresión de bajada de pulsaciones."
+            "Termina con una progresión de bajada de pulsaciones.",
         ],
-        "contexto_carga": f"Carga aguda {acute} ({acute_es})" if acute is not None and acute_es else acute,
+        "contexto_carga": f"Carga aguda {acute} ({acute_es})"
+        if acute is not None and acute_es
+        else acute,
     }

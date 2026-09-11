@@ -11,7 +11,6 @@ _GARMIN_ES: dict[str, str] = {
     "LOW": "Bajo",
     "POOR": "Deficiente",
     "NO_STATUS": "Sin estado",
-
     # Estado de entrenamiento (Training Status)
     "PRODUCTIVE": "Productivo",
     "MAINTAINING": "Manteniendo",
@@ -21,14 +20,12 @@ _GARMIN_ES: dict[str, str] = {
     "DETRAINING": "Pérdida de forma",
     "PEAKING": "Pico de forma",
     "OVERLOAD": "Sobrecarga",
-
     # Predisposición para entrenar (Training Readiness)
     "EXCELLENT": "Óptima",
     "GOOD": "Alta",
     "FAIR": "Moderada",
     "BAD": "Baja",
     "VERY_BAD": "Muy baja",
-
     # Fases de sueño (la API puede devolver mayúsculas o minúsculas)
     "AWAKE": "Despierto",
     "LIGHT": "Ligero",
@@ -38,13 +35,11 @@ _GARMIN_ES: dict[str, str] = {
     "light": "Ligero",
     "deep": "Profundo",
     "rem": "REM",
-
     # Puntuación de sueño (Sleep Score)
     # GOOD → "Buena" (se comparte con Training Readiness, forma masculina es "Bueno")
     # FAIR → "Regular" (ya definido arriba)
     # POOR → "Deficiente" (ya definido arriba)
     # EXCELLENT → "Excelente" (ya definido arriba)
-
     # Efecto del entrenamiento (Training Effect)
     "IMPROVING": "Mejorando",
     "HIGHLY_AEROBIC": "Aeróbico intenso",
@@ -53,26 +48,21 @@ _GARMIN_ES: dict[str, str] = {
     "VO2MAX": "Mejora VO2max",
     "ANAEROBIC_CAPACITY": "Capacidad anaeróbica",
     "AEROBIC_BASE": "Base aeróbica",
-
     # Zonas de intensidad
     "ZONE_1": "Calentamiento",
     "ZONE_2": "Suave",
     "ZONE_3": "Aeróbica",
     "ZONE_4": "Umbral",
     "ZONE_5": "Máximo",
-
     # Tipos de actividad
     "treadmill_running": "Carrera en cinta",
     "strength_training": "Fuerza",
-
     # Mensajes Body Battery / feedback UI
     "DAY_STRESSFUL_AND_INACTIVE": "Día estresante e inactivo",
     "SLEEP_TIME_PASSED_STRESSFUL_AND_INACTIVE": "Noche estresante + inactividad",
-
     # Insights de sueño
     "NEGATIVE_STRENUOUS_EXERCISE": "Ejercicio intenso previo",
     "HARD_EXERCISE_NEG_FAIR_OR_POOR_SLEEP": "Entrenamiento duro + mal sueño",
-
     # Estados genéricos de nivel / calidad
     "OPTIMAL": "Óptimo",
     "MODERATE": "Moderado",
@@ -80,7 +70,6 @@ _GARMIN_ES: dict[str, str] = {
     "NORMAL": "Normal",
     "ABOVE_NORMAL": "Por encima de lo normal",
     "BELOW_NORMAL": "Por debajo de lo normal",
-
     # Tendencias (composición corporal, peso, VO2max…)
     "STABLE": "Estable",
     "INCREASING": "En aumento",
@@ -90,7 +79,6 @@ _GARMIN_ES: dict[str, str] = {
     "UNCHANGED": "Sin cambios",
     "INCREASED": "Aumentado",
     "DECREASED": "Disminuido",
-
     # Estado de retos / objetivos
     "ACTIVE": "Activo",
     "INACTIVE": "Inactivo",
@@ -99,16 +87,13 @@ _GARMIN_ES: dict[str, str] = {
     "PENDING": "Pendiente",
     "FAILED": "No completado",
     "AVAILABLE": "Disponible",
-
     # Sistema de unidades
     "METRIC": "Métrico",
     "STATUTE": "Imperial",
     "MARINE": "Náutico",
-
     # Perfil / género
     "MALE": "Masculino",
     "FEMALE": "Femenino",
-
     # SPO2
     "STANDARD": "Estándar",
     "CONTINUOUS": "Continuo",
@@ -117,11 +102,9 @@ _GARMIN_ES: dict[str, str] = {
     "HIGH_ALTITUDE": "Altitud elevada",
     "ENABLED": "Activo",
     "DISABLED": "Desactivado",
-
     # Respiración
     "TACHYPNEA": "Taquipnea",
     "BRADYPNEA": "Bradipnea",
-
     # Tipos de actividad adicionales
     "running": "Correr",
     "cycling": "Ciclismo",
@@ -152,7 +135,6 @@ _GARMIN_ES: dict[str, str] = {
     "football": "Fútbol americano",
     "soccer": "Fútbol",
     "other": "Otro",
-
     # Workout — tipos de paso
     "WARMUP": "Calentamiento",
     "COOLDOWN": "Vuelta a la calma",
@@ -161,7 +143,6 @@ _GARMIN_ES: dict[str, str] = {
     "RECOVER": "Recuperación",
     "REPEAT": "Repetición",
     "REPEAT_STEP": "Bloque de repetición",
-
     # Workout — tipos de objetivo (target)
     "NO_TARGET": "Sin objetivo",
     "OPEN": "Abierto",
@@ -173,12 +154,10 @@ _GARMIN_ES: dict[str, str] = {
     "SPEED": "Velocidad",
     "GRADE": "Pendiente",
     "ITERATIONS": "Repeticiones",
-
     # Workout — tipos de duración
     "TIME": "Tiempo",
     "REPS": "Repeticiones",
     "FIXED_REST": "Descanso fijo",
-
     # Workout — deportes
     "RUNNING": "Correr",
     "CYCLING": "Ciclismo",
@@ -187,18 +166,15 @@ _GARMIN_ES: dict[str, str] = {
     "STRENGTH_TRAINING": "Fuerza",
     "CARDIO_TRAINING": "Cardio",
     "WALK": "Caminar",
-
     # Workout — estado en calendario
     "SCHEDULED": "Planificado",
     "SKIPPED": "Omitido",
     "MISSED": "No realizado",
-
     # Calendario — tipo de elemento
     "workout": "Entrenamiento",
     "race": "Carrera",
     "note": "Nota",
     "garmincoach": "Garmin Coach",
-
     # Nutrición — comidas
     "BREAKFAST": "Desayuno",
     "LUNCH": "Almuerzo",
@@ -207,7 +183,6 @@ _GARMIN_ES: dict[str, str] = {
     "WATER": "Agua",
     "SUPPLEMENT": "Suplemento",
     "ANYTIME": "En cualquier momento",
-
     # Genéricos
     "UNKNOWN": "Desconocido",
     "NONE": "Sin datos",
@@ -225,6 +200,7 @@ _GARMIN_ES: dict[str, str] = {
     "STEPS": "Pasos",
 }
 
+
 def _translate_garmin(obj: Any, _depth: int = 0) -> Any:
     """Traduce recursivamente los enums de Garmin al español de Garmin Connect."""
     if not GARMIN_LANGUAGE.startswith("es"):
@@ -238,7 +214,6 @@ def _translate_garmin(obj: Any, _depth: int = 0) -> Any:
     if isinstance(obj, str) and obj in _GARMIN_ES:
         return _GARMIN_ES[obj]
     return obj
-
 
 
 def _normalize_readiness_status_es(value: Any) -> str | None:
@@ -270,7 +245,6 @@ def _normalize_readiness_status_es(value: Any) -> str | None:
     return mapping.get(raw.casefold(), raw)
 
 
-
 def _build_sleep_safe_text(score: Any, duration_text: Any) -> str | None:
     if score is None and not duration_text:
         return None
@@ -279,7 +253,6 @@ def _build_sleep_safe_text(score: Any, duration_text: Any) -> str | None:
     if score is not None:
         return f"{score} puntos"
     return str(duration_text)
-
 
 
 # === GARMIN_ES_TRANSLATIONS_PATCH_START ===
@@ -344,16 +317,19 @@ _GARMIN_TRAINING_STATUS_ES = {
     "NO_STATUS": "Sin estado",
 }
 
+
 def _translate_metric_status_es(field_name, value):
     if not value or not isinstance(value, str):
         return None
     field_map = _GARMIN_STATUS_ES_BY_FIELD.get(field_name) or {}
     return field_map.get(value) or _GARMIN_STATUS_ES_GENERIC.get(value)
 
+
 def _translate_training_readiness_message_es(value):
     if not value or not isinstance(value, str):
         return None
     return _GARMIN_TRAINING_READINESS_MESSAGE_ES.get(value)
+
 
 def _translate_training_status_es(value):
     if not value or not isinstance(value, str):
@@ -361,11 +337,12 @@ def _translate_training_status_es(value):
     base = value.split("_", 1)[0]
     return _GARMIN_TRAINING_STATUS_ES.get(base)
 
+
 def _extract_training_status_code(raw):
     if not isinstance(raw, dict):
         return None
 
-    latest = ((raw.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {})
+    latest = (raw.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}
     if not isinstance(latest, dict) or not latest:
         return None
 
@@ -485,11 +462,13 @@ _FINAL_MESSAGE_ES = {
     "OVERREACHING": "Exceso de carga",
 }
 
+
 def _translate_status_es(value):
     if value is None:
         return None
     value = str(value).strip().upper()
     return _FINAL_STATUS_ES.get(value, value)
+
 
 def _translate_message_es(value):
     if value is None:

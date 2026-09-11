@@ -16,6 +16,7 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff
       - run: ruff check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py
+      - run: ruff format --check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py
 
   typecheck:
     name: Typecheck (mypy)
@@ -38,3 +39,14 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest
       - run: python -m pytest tests/ -q
+
+  smoke:
+    name: Smoke (import server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -c "import server, snapshot; assert server._collect_day_snapshot is snapshot._collect_day_snapshot"
