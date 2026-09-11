@@ -2,7 +2,7 @@ fastmcp==3.2.4
 garminconnect==0.3.2
 curl_cffi==0.13.0
 osmnx>=2.0
-networkx>=3.0
+networkx>=3.6.1
 scikit-learn>=1.0
 gpxpy>=1.6
 requests>=2.28
