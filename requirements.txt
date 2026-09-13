@@ -1,4 +1,4 @@
-fastmcp==3.2.4
+fastmcp==4.0.3
 garminconnect==0.3.13
 curl_cffi>=0.15.0
 osmnx>=2.1.1
@@ -9,3 +9,4 @@ requests>=2.28
 qrcode>=8.2
 Pillow>=12.3.0
 pypdf>=6.18.0
+httpx>=0.24
