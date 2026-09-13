@@ -189,50 +189,88 @@ def _gfmt_km(v):
 # ---------------------------------------------------------------------------
 # Fetch base del snapshot (extraído de server.py)
 # ---------------------------------------------------------------------------
+_FETCH_LOG = None
+_CURRENT_FETCH_STEP = None
+
+
+def _init_fetch_log() -> None:
+    global _FETCH_LOG
+    if _FETCH_LOG is None:
+        _FETCH_LOG = _dep("_get_fetch_logger")()
+
+
+def _step_fetch(label: str):
+    global _CURRENT_FETCH_STEP
+    _CURRENT_FETCH_STEP = label
+    if _FETCH_LOG:
+        _FETCH_LOG.info("[snapshot] paso: %s", label)
+
+
+def _current_fetch_step() -> str | None:
+    return _CURRENT_FETCH_STEP
+
+
 def _snapshot_base(target_date, include_recent_activities=False):
+    global _CURRENT_FETCH_STEP
     target_date = _parse_date(target_date)
     sleep_reference_day = target_date
-    with _dep("_fetch_lock_fn")():
-        api = _dep("_get_api")()
+    _init_fetch_log()
+    try:
+        with _dep("_fetch_lock_fn")():
+            _step_fetch("conexión/login")
+            api = _dep("_get_api")()
 
-        summary, summary_err = _dep("_optional_call_first")(
-            api, ("get_user_summary", "get_stats"), target_date
-        )
-        heart, heart_err = _dep("_optional_call_first")(
-            api, ("get_heart_rates", "get_rhr_day"), target_date
-        )
-        sleep, sleep_err = _dep("_optional_call_first")(
-            api, ("get_sleep_data",), sleep_reference_day
-        )
-        stress, stress_err = _dep("_optional_call_first")(api, ("get_stress_data",), target_date)
-        body_battery, bb_err = _dep("_optional_call_first")(api, ("get_body_battery",), target_date)
-        hrv, hrv_err = _dep("_optional_call_first")(api, ("get_hrv_data",), target_date)
-        max_metrics, vo2_err = _dep("_optional_call_first")(api, ("get_max_metrics",), target_date)
-        training_readiness, tr_err = _dep("_optional_call_first")(
-            api, ("get_training_readiness",), target_date
-        )
-        training_status, ts_err = _dep("_optional_call_first")(
-            api, ("get_training_status",), target_date
-        )
-
-        activities = []
-        activities_raw = []
-        activities_err = None
-        if include_recent_activities:
-            recent, activities_err = _dep("_optional_call_first")(
-                api, ("get_activities",), 0, _dep("ACTIVITY_LIMIT")
+            _step_fetch("resumen")
+            summary, summary_err = _dep("_optional_call_first")(
+                api, ("get_user_summary", "get_stats"), target_date
             )
-            if isinstance(recent, list):
-                activities_raw = recent[: _dep("ACTIVITY_LIMIT")]
-                activities = [
-                    _dep("_normalize_activity")(a)
-                    for a in recent[: _dep("ACTIVITY_LIMIT")]
-                    if isinstance(a, dict)
-                ]
+            _step_fetch("frecuencia cardiaca")
+            heart, heart_err = _dep("_optional_call_first")(
+                api, ("get_heart_rates", "get_rhr_day"), target_date
+            )
+            _step_fetch("sueño")
+            sleep, sleep_err = _dep("_optional_call_first")(
+                api, ("get_sleep_data",), sleep_reference_day
+            )
+            _step_fetch("estrés")
+            stress, stress_err = _dep("_optional_call_first")(api, ("get_stress_data",), target_date)
+            _step_fetch("body battery")
+            body_battery, bb_err = _dep("_optional_call_first")(api, ("get_body_battery",), target_date)
+            _step_fetch("VFC")
+            hrv, hrv_err = _dep("_optional_call_first")(api, ("get_hrv_data",), target_date)
+            _step_fetch("métricas máximas")
+            max_metrics, vo2_err = _dep("_optional_call_first")(api, ("get_max_metrics",), target_date)
+            _step_fetch("predisposición para entrenar")
+            training_readiness, tr_err = _dep("_optional_call_first")(
+                api, ("get_training_readiness",), target_date
+            )
+            _step_fetch("estado de entreno")
+            training_status, ts_err = _dep("_optional_call_first")(
+                api, ("get_training_status",), target_date
+            )
 
-        extra_raw, extra_errors, device_info = _dep("_collect_extra_raw")(
-            api, target_date, training_status
-        )
+            activities = []
+            activities_raw = []
+            activities_err = None
+            if include_recent_activities:
+                _step_fetch("actividades recientes")
+                recent, activities_err = _dep("_optional_call_first")(
+                    api, ("get_activities",), 0, _dep("ACTIVITY_LIMIT")
+                )
+                if isinstance(recent, list):
+                    activities_raw = recent[: _dep("ACTIVITY_LIMIT")]
+                    activities = [
+                        _dep("_normalize_activity")(a)
+                        for a in recent[: _dep("ACTIVITY_LIMIT")]
+                        if isinstance(a, dict)
+                    ]
+
+            _step_fetch("datos extra")
+            extra_raw, extra_errors, device_info = _dep("_collect_extra_raw")(
+                api, target_date, training_status
+            )
+    finally:
+        _CURRENT_FETCH_STEP = None
     metrics: dict[str, Any] = {
         "steps": (summary or {}).get("totalSteps"),
         "distance_km": round(((summary or {}).get("totalDistanceMeters") or 0) / 1000, 2),

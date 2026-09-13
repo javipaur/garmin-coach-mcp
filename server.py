@@ -2721,6 +2721,8 @@ async def debug_audit(_: Request) -> JSONResponse:
         "last_refresh_local": _isoish_to_local(last_refresh),
         "last_error": last_error,
         "snapshot_exists": isinstance(snapshot, dict),
+        "current_fetch_step": _current_fetch_step(),
+        "prewarm_elapsed_s": _prewarm_elapsed(),
         "metrics": {k: metrics.get(k) for k in keys},
     }
     return JSONResponse(payload)
@@ -9532,6 +9534,7 @@ import snapshot
 snapshot.configure(
     FETCH_LOCK=FETCH_LOCK,
     _fetch_lock_fn=_fetch_lock,
+    _get_fetch_logger=lambda: logging.getLogger("fetch"),
     ACTIVITY_LIMIT=ACTIVITY_LIMIT,
     _get_api=_get_api,
     _optional_call_first=_optional_call_first,
@@ -9549,6 +9552,7 @@ snapshot.configure(
     _get_hrv_debug_last=lambda: _HRV_SELECTION_DEBUG_LAST,
 )
 _collect_day_snapshot = snapshot._collect_day_snapshot
+_current_fetch_step = snapshot._current_fetch_step
 
 
 if __name__ == "__main__":
