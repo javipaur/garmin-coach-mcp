@@ -241,13 +241,14 @@ def _current_fetch_step() -> str | None:
     return _CURRENT_FETCH_STEP
 
 
-def _snapshot_base(target_date, include_recent_activities=False):
+def _snapshot_base(target_date, include_recent_activities=False, _lock_fn=None):
     global _CURRENT_FETCH_STEP
     target_date = _parse_date(target_date)
     sleep_reference_day = target_date
     _init_fetch_log()
+    lock_cm = _lock_fn or _dep("_fetch_lock_fn")
     try:
-        with _dep("_fetch_lock_fn")():
+        with lock_cm():
             _step_fetch("conexión/login")
             api = _dep("_get_api")()
 
@@ -1520,8 +1521,8 @@ _PATCHES = [
 ]
 
 
-def _collect_day_snapshot(target_date, include_recent_activities=False, *args, **kwargs):
-    snap = _snapshot_base(target_date, include_recent_activities)
+def _collect_day_snapshot(target_date, include_recent_activities=False, _lock_fn=None, *args, **kwargs):
+    snap = _snapshot_base(target_date, include_recent_activities, _lock_fn=_lock_fn)
     for patch in _PATCHES:
         snap = patch(snap, *args, **kwargs)
     return snap

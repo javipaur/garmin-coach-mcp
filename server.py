@@ -128,6 +128,11 @@ _SERVER_START_TIME: float = time.time()
 
 CACHE_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
+# Lock dedicado al refresh de fondo del snapshot. Es INDEPENDIENTE de FETCH_LOCK
+# (el que usan las tool calls). Sin esto, el refresh retenía FETCH_LOCK durante
+# todo el snapshot (puede tardar varios minutos con timeouts por paso) y todas
+# las tool calls fallaban con "servidor ocupado".
+REFRESH_LOCK = threading.Lock()
 
 # Las llamadas a garminconnect (requests) no traen timeout y pueden colgarse a
 # nivel de socket. Un timeout global de socket garantiza que ninguna llamada
@@ -137,15 +142,16 @@ socket.setdefaulttimeout(GARMIN_TIMEOUT_SECONDS)
 
 
 def _rotate_fetch_lock() -> None:
-    """Sustituye FETCH_LOCK por uno nuevo.
+    """Sustituye FETCH_LOCK y REFRESH_LOCK por locks nuevos.
 
     Uso: si el prewarm se queda colgado más de PREWARM_MAX_SECONDS, el watchdog
     rota el lock para que las tool calls y siguientes refrescos no esperen a un
     hilo zombi. El hilo viejo conserva el lock antiguo pero nadie lo consulta.
     """
-    global FETCH_LOCK
+    global FETCH_LOCK, REFRESH_LOCK
     with CACHE_LOCK:
         FETCH_LOCK = threading.Lock()
+        REFRESH_LOCK = threading.Lock()
 
 
 class _FetchLockTimeoutError(RuntimeError):
@@ -180,6 +186,21 @@ def _fetch_lock(timeout: float | None = None):
         yield
     finally:
         FETCH_LOCK.release()
+
+
+@contextmanager
+def _refresh_lock(timeout: float | None = None):
+    """CM para el refresh de fondo. No bloquea las tool calls (lock separado)."""
+    t = PREWARM_MAX_SECONDS if timeout is None else timeout
+    if not REFRESH_LOCK.acquire(timeout=t):
+        raise _FetchLockTimeoutError(
+            "El servidor está ocupado con otra consulta a Garmin. "
+            "Inténtalo de nuevo en unos segundos."
+        )
+    try:
+        yield
+    finally:
+        REFRESH_LOCK.release()
 
 
 def _publish_busy_error() -> None:
@@ -1107,7 +1128,11 @@ def _collect_day_snapshot(target_date: str, include_recent_activities: bool = Fa
 
 def _refresh_cache_sync() -> dict[str, Any]:
     try:
-        snapshot = _collect_day_snapshot(_today_local().isoformat(), include_recent_activities=True)
+        snapshot = _collect_day_snapshot(
+            _today_local().isoformat(),
+            include_recent_activities=True,
+            _lock_fn=_refresh_lock,
+        )
         with CACHE_LOCK:
             CACHE["status"] = "ok"
             CACHE["last_refresh"] = _now_iso()
@@ -1186,7 +1211,8 @@ def _background_refresh_loop() -> None:
 
         def _run_refresh(_box: dict[str, Any] = box):
             try:
-                _refresh_cache_sync()
+                with _refresh_lock():
+                    _refresh_cache_sync()
                 with CACHE_LOCK:
                     _box["ok"] = CACHE.get("status") == "ok"
             except Exception as exc:
