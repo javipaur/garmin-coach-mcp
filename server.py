@@ -15,6 +15,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -78,11 +79,14 @@ from config import (
     APP_NAME,
     CACHE_MINUTES,
     DATA_ROOT,
+    FETCH_TOOL_TIMEOUT_SECONDS,
     GARMIN_LANGUAGE,
+    GARMIN_SKIP_STRATEGIES,
     GARMIN_TIMEOUT_SECONDS,
     GARMIN_TOKENS_JSON,
     LOGIN_MFA_TIMEOUT_SECONDS,
     PORT,
+    PREWARM_MAX_SECONDS,
     RESET_GARMIN_TOKENS,
     TOKEN_DIR,
     TOKEN_FILE,
@@ -130,6 +134,62 @@ FETCH_LOCK = threading.Lock()
 # retenga FETCH_LOCK para siempre (síntoma: /health en "busy" eterno y el
 # cliente MCP reporta que "el servidor no responde").
 socket.setdefaulttimeout(GARMIN_TIMEOUT_SECONDS)
+
+
+class _FetchLockTimeoutError(RuntimeError):
+    """Se lanza cuando una tool call no consigue FETCH_LOCK a tiempo."""
+
+
+def _acquire_fetch_lock(timeout: float | None = None) -> bool:
+    """Adquiere FETCH_LOCK sin bloquear para siempre."""
+    t = FETCH_TOOL_TIMEOUT_SECONDS if timeout is None else timeout
+    return FETCH_LOCK.acquire(timeout=t)
+
+
+def _fetch_lock_or_raise(timeout: float | None = None) -> None:
+    """Helpers para sites de tool calls: o coges el lock a tiempo o fallas rápido."""
+    if not _acquire_fetch_lock(timeout):
+        _publish_busy_error()
+        raise _FetchLockTimeoutError(
+            "El servidor está ocupado con otra consulta a Garmin. "
+            "Inténtalo de nuevo en unos segundos."
+        )
+
+
+@contextmanager
+def _fetch_lock(timeout: float | None = None):
+    """CM timeout-aware equivalente a `with _fetch_lock():`. Evita colgar hilos."""
+    if not _acquire_fetch_lock(timeout):
+        raise _FetchLockTimeoutError(
+            "El servidor está ocupado con otra consulta a Garmin. "
+            "Inténtalo de nuevo en unos segundos."
+        )
+    try:
+        yield
+    finally:
+        FETCH_LOCK.release()
+
+
+def _publish_busy_error() -> None:
+    """Marca la caché con un error legible para que /health no muestre 'busy' eterno."""
+    with CACHE_LOCK:
+        CACHE["status"] = "error"
+        CACHE["last_error"] = "FETCH_LOCK ocupado: una operación Garmin excede el timeout"
+
+
+def _skip_garmin_cffi_strategies(api: Garmin) -> None:
+    """Fuerza estrategias de login solo-requests (respetan socket timeouts).
+
+    curl_cffi (libcurl) ignora socket.setdefaulttimeout y una llamada suya puede
+    colgar un hilo reteniendo FETCH_LOCK indefinidamente.
+    """
+    try:
+        skip = {s.strip() for s in GARMIN_SKIP_STRATEGIES.split(",") if s.strip()}
+        if skip:
+            existing = set(getattr(api, "skip_strategies", set()) or set())
+            api.skip_strategies = existing | skip
+    except Exception:
+        pass
 
 CACHE: dict[str, Any] = {
     "status": "starting",
@@ -461,10 +521,12 @@ def _get_api(user_id: str | None = None) -> Garmin:
             token_dir = _user_token_dir(user_id)
             _seed_user_token_file(user_id, token_dir)
             api = Garmin(**api_kwargs)
+            _skip_garmin_cffi_strategies(api)
             api.login(str(token_dir))
             return api
         _seed_token_file_if_needed()
         api = Garmin(**api_kwargs)
+        _skip_garmin_cffi_strategies(api)
         api.login(str(TOKEN_DIR))
         return api
     except RuntimeError:
@@ -933,7 +995,7 @@ def _collect_day_snapshot(target_date: str, include_recent_activities: bool = Fa
     target_date = _parse_input_date(target_date)
     sleep_reference_day = target_date
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
 
         summary, summary_err = _optional_call_first(api, ("get_user_summary", "get_stats"), target_date)
@@ -1062,15 +1124,56 @@ def _refresh_cache_sync() -> dict[str, Any]:
         return deepcopy(CACHE)
 
 
+_PREWARM_START: float | None = None
+_PREWARM_LOCK = threading.Lock()
+
+
+def _mark_prewarm_started() -> None:
+    global _PREWARM_START
+    with _PREWARM_LOCK:
+        _PREWARM_START = time.monotonic()
+
+
+def _prewarm_elapsed() -> float | None:
+    with _PREWARM_LOCK:
+        if _PREWARM_START is None:
+            return None
+        return time.monotonic() - _PREWARM_START
+
+
+def _prewarm_watchdog() -> None:
+    """Si el prewarm inicial supera PREWARM_MAX_SECONDS, lo marca como error."""
+    loop_int = PREWARM_MAX_SECONDS / 2
+    while True:
+        time.sleep(max(10, loop_int))
+        elapsed = _prewarm_elapsed()
+        if elapsed is None:
+            continue
+        if elapsed > PREWARM_MAX_SECONDS:
+            with CACHE_LOCK:
+                if CACHE.get("status") == "ok":
+                    continue
+                if not CACHE.get("last_error"):
+                    CACHE["status"] = "error"
+                    CACHE["last_error"] = (
+                        f"Prewarm inicial agotó el tope de {PREWARM_MAX_SECONDS}s; "
+                        "intentando de nuevo"
+                    )
+            _mark_prewarm_started()
+
+
 def _background_refresh_loop() -> None:
     retry_seconds = 30
     while True:
+        _mark_prewarm_started()
         try:
             _refresh_cache_sync()
             with CACHE_LOCK:
                 ok = CACHE.get("status") == "ok"
         except Exception:
             ok = False
+        with _PREWARM_LOCK:
+            _PREWARM_START = None
         log = logging.getLogger("prewarm")
         if ok:
             log.info("snapshot del día pre-caliente")
@@ -2354,7 +2457,7 @@ async def download_activity_fit(request: Request) -> Response:
 
     # Intenta primero con tokens locales
     try:
-        with FETCH_LOCK:
+        with _fetch_lock():
             api = _get_api()
             data = None
             fmt_name = "zip"
@@ -2548,7 +2651,7 @@ async def list_activities_web(request: Request) -> JSONResponse:
 
     # Intenta primero con tokens locales
     try:
-        with FETCH_LOCK:
+        with _fetch_lock():
             api = _get_api()
             if start_date:
                 end = end_date if end_date else date.today().isoformat()
@@ -2625,7 +2728,7 @@ async def debug_audit(_: Request) -> JSONResponse:
 
 @mcp.custom_route("/debug/activities", methods=["GET"])
 async def debug_activities(_: Request) -> JSONResponse:
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), 0, 5)
         if err:
@@ -3079,7 +3182,7 @@ def get_recent_activities(limit: int = 100, days: int | None = None) -> list[dic
         # Fetch more to cover the date range, then filter
         fetch_limit = max(limit * days, 200)
         fetch_limit = min(fetch_limit, 9999)
-        with FETCH_LOCK:
+        with _fetch_lock():
             api = _get_api()
             activities, err = _optional_call_first(api, ("get_activities",), 0, fetch_limit)
             if activities is None:
@@ -3099,7 +3202,7 @@ def get_recent_activities(limit: int = 100, days: int | None = None) -> list[dic
             return [_normalize_activity(a) for a in filtered[:limit]]
 
     limit = max(1, min(200, int(limit)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), 0, limit)
         if activities is None:
@@ -3252,6 +3355,8 @@ def _run_server() -> None:
 
     thread = threading.Thread(target=_background_refresh_loop, daemon=True)
     thread.start()
+    watchdog = threading.Thread(target=_prewarm_watchdog, daemon=True)
+    watchdog.start()
 
     # First-run banner so the user finds the setup wizard quickly from logs.
     if _is_first_run():
@@ -3858,7 +3963,7 @@ def _fetch_activity_bundle(api: Garmin, activity_id: str, include_time_series: b
 def get_activity_full(activity_id: str, include_time_series: bool = False, max_samples: int = 200) -> dict[str, Any]:
     """Actividad completa con resumen, vueltas, clima, zonas, material y series temporales opcionales."""
     max_samples = max(1, min(2000, int(max_samples)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         return _fetch_activity_bundle(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
 
@@ -3867,7 +3972,7 @@ def get_activity_full(activity_id: str, include_time_series: bool = False, max_s
 def get_activity_time_series(activity_id: str, max_samples: int = 300) -> dict[str, Any]:
     """Serie temporal compacta de una actividad con métricas por muestra."""
     max_samples = max(1, min(2000, int(max_samples)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         details, err = _call_with_retries(api, "get_activity_details", str(activity_id), retries=2)
         if details is None:
@@ -3882,7 +3987,7 @@ def get_activity_time_series(activity_id: str, max_samples: int = 300) -> dict[s
 def get_recent_activities_full(limit: int = 8) -> list[dict[str, Any]]:
     """Actividades recientes con resumen completo, vueltas, clima, zonas, material y sets."""
     limit = max(1, min(12, int(limit)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), 0, limit)
         if activities is None:
@@ -3985,7 +4090,7 @@ def _fetch_activity_all_data(api: Garmin, activity_id: str, include_time_series:
 def get_activity_all_data(activity_id: str, include_time_series: bool = False, max_samples: int = 500) -> dict[str, Any]:
     """Devuelve todos los payloads crudos y el bundle compacto de una actividad, sin filtrar por deporte."""
     max_samples = max(1, min(2000, int(max_samples)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         return _fetch_activity_all_data(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
 
@@ -3994,7 +4099,7 @@ def get_activity_all_data(activity_id: str, include_time_series: bool = False, m
 def get_recent_activities_catalog(limit: int = 12) -> list[dict[str, Any]]:
     """Catálogo reciente de actividades para elegir activity_id y deporte."""
     limit = max(1, min(30, int(limit)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), 0, limit)
         if activities is None:
@@ -4020,7 +4125,7 @@ def get_recent_activities_all_data(limit: int = 3, include_time_series: bool = F
     """Devuelve todos los payloads crudos para varias actividades recientes. Úsalo con límites pequeños."""
     limit = max(1, min(8, int(limit)))
     max_samples = max(1, min(2000, int(max_samples)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), 0, limit)
         if activities is None:
@@ -4244,7 +4349,7 @@ def _build_sport_profile(bundle: dict[str, Any]) -> dict[str, Any]:
 def get_activity_sport_profile(activity_id: str, include_time_series: bool = False, max_samples: int = 300) -> dict[str, Any]:
     """Perfil interpretado por deporte usando todos los datos disponibles de la actividad."""
     max_samples = max(1, min(2000, int(max_samples)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         bundle = _fetch_activity_all_data(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
         profile = _build_sport_profile(bundle)
@@ -4264,7 +4369,7 @@ def get_activity_sport_profile(activity_id: str, include_time_series: bool = Fal
 def get_recent_activity_sport_profiles(limit: int = 8) -> list[dict[str, Any]]:
     """Perfiles interpretados por deporte para actividades recientes."""
     limit = max(1, min(12, int(limit)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), 0, limit)
         if activities is None:
@@ -4998,7 +5103,7 @@ def _build_visible_metrics(bundle: dict[str, Any]) -> dict[str, Any]:
 def get_activity_visible_profile(activity_id: str, include_time_series: bool = False, max_samples: int = 300) -> dict[str, Any]:
     """Perfil con nombres visibles estilo Garmin Connect según el tipo de actividad."""
     max_samples = max(1, min(2000, int(max_samples)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         bundle = _fetch_activity_all_data(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
         return {
@@ -5135,7 +5240,7 @@ def get_hybrid_recent_overview(limit: int = 12) -> dict[str, Any]:
     """Resumen agregado reciente para entrenamiento híbrido usando actividades completas."""
     limit = max(1, min(20, int(limit)))
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), 0, limit)
         if activities is None:
@@ -5918,7 +6023,7 @@ def get_activities_paged(limit: int = 100, offset: int = 0) -> dict:
     limit = max(1, min(_HISTORY_MAX_ACTIVITIES_PER_PAGE, int(limit)))
     offset = max(0, int(offset))
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         activities, err = _optional_call_first(api, ("get_activities",), offset, limit)
 
@@ -5961,7 +6066,7 @@ def get_activities_in_range(
     if start > end:
         start, end = end, start
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         if activity_type:
             activities, err = _optional_call_first(
@@ -6071,7 +6176,7 @@ def get_wellness_range(
         end_dt = start_dt + timedelta(days=_HISTORY_MAX_WELLNESS_DAYS - 1)
         total_days = _HISTORY_MAX_WELLNESS_DAYS
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
 
     days_data = []
@@ -6080,7 +6185,7 @@ def get_wellness_range(
     for i in range(total_days):
         target = (start_dt + timedelta(days=i)).isoformat()
         try:
-            with FETCH_LOCK:
+            with _fetch_lock():
                 day = _compact_wellness_for_range(api, target)
             days_data.append(day)
         except Exception as exc:
@@ -6116,7 +6221,7 @@ def get_race_predictions(
     sd = _parse_input_date(start_date) if start_date else None
     ed = _parse_input_date(end_date) if end_date else None
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         if sd and ed:
             data, err = _optional_call_first(api, ("get_race_predictions",), sd, ed)
@@ -6134,7 +6239,7 @@ def get_personal_records() -> dict:
     """Récords personales del usuario por distancia y tipo de actividad.
     Incluye mejores tiempos en carrera, ciclismo y otros deportes registrados en Garmin.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_personal_record", "get_personal_records"))
 
@@ -6152,7 +6257,7 @@ def get_fitness_age(target_date: str | None = None) -> dict:
     """
     parsed = _parse_input_date(target_date)
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(
             api, ("get_fitnessage_data", "get_fitness_age"), parsed
@@ -6178,7 +6283,7 @@ def get_endurance_score(
         date.fromisoformat(ed) - timedelta(days=27)
     ).isoformat()
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_endurance_score",), sd, ed)
 
@@ -6202,7 +6307,7 @@ def get_hill_score(
         date.fromisoformat(ed) - timedelta(days=27)
     ).isoformat()
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_hill_score",), sd, ed)
 
@@ -6220,7 +6325,7 @@ def get_goals(status: str = "active") -> dict:
     if status not in ("active", "future", "past"):
         status = "active"
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_goals",), status, 1, 50)
 
@@ -6235,7 +6340,7 @@ def get_gear(include_stats: bool = True) -> dict:
     """Material deportivo registrado en Garmin (zapatillas, bicicletas, etc.) con kilometraje y estadísticas.
     include_stats=True añade actividades y distancias acumuladas por cada pieza de material.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         profile, _ = _optional_call_first(api, ("get_user_profile",))
         profile_number = None
@@ -6272,7 +6377,7 @@ def get_activity_evaluation(activity_id: str) -> dict:
     Incluye retroalimentación sobre el rendimiento, esfuerzo y consejos de recuperación.
     activity_id: identificador numérico de la actividad.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_evaluation",), activity_id)
         if data is None and hasattr(api, "connectapi"):
@@ -6306,7 +6411,7 @@ def get_weigh_ins(
         date.fromisoformat(ed) - timedelta(days=29)
     ).isoformat()
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_weigh_ins",), sd, ed)
 
@@ -6327,7 +6432,7 @@ def add_weigh_in(
     """
     parsed = _parse_input_date(target_date) if target_date else _today_local().isoformat()
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(
             api, ("add_weigh_in",), weight_kg, "kg", parsed
@@ -6348,7 +6453,7 @@ def get_activity_splits(activity_id: str) -> dict:
     Incluye ritmo, FC, distancia y tiempo por cada split.
     activity_id: identificador numérico de la actividad.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_splits",), activity_id)
     if data is None:
@@ -6362,7 +6467,7 @@ def get_activity_split_summaries(activity_id: str) -> dict:
     Complementa get_activity_splits con totales por bloque.
     activity_id: identificador numérico de la actividad.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_split_summaries",), activity_id)
     if data is None:
@@ -6376,7 +6481,7 @@ def get_activity_hr_in_timezones(activity_id: str) -> dict:
     Muestra cuánto tiempo se pasó en cada zona Z1-Z5.
     activity_id: identificador numérico de la actividad.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_hr_in_timezones",), activity_id)
     if data is None:
@@ -6390,7 +6495,7 @@ def get_activity_exercise_sets(activity_id: str) -> dict:
     Incluye nombre del ejercicio, series, repeticiones, peso y duración.
     activity_id: identificador numérico de la actividad.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_exercise_sets",), activity_id)
     if data is None:
@@ -6404,7 +6509,7 @@ def get_activity_weather(activity_id: str) -> dict:
     Incluye temperatura, humedad, viento y condición general.
     activity_id: identificador numérico de la actividad.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_weather",), activity_id)
     if data is None:
@@ -6418,7 +6523,7 @@ def get_activity_gear(activity_id: str) -> dict:
     Útil para saber qué zapatillas o bicicleta se usó en cada entreno.
     activity_id: identificador numérico de la actividad.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_gear",), activity_id)
     if data is None:
@@ -6431,7 +6536,7 @@ def get_last_activity() -> dict:
     """Última actividad registrada en Garmin Connect.
     Acceso rápido sin necesidad de conocer el activity_id.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_last_activity",))
     if data is None:
@@ -6444,7 +6549,7 @@ def get_activity_types() -> dict:
     """Lista de todos los tipos de actividad disponibles en Garmin Connect.
     Útil para conocer los valores válidos del filtro activity_type.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_types",))
     if data is None:
@@ -6459,7 +6564,7 @@ def get_all_day_stress(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_all_day_stress",), parsed)
     if data is None:
@@ -6474,7 +6579,7 @@ def get_steps_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_steps_data",), parsed)
     if data is None:
@@ -6494,7 +6599,7 @@ def get_daily_steps(
     sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=6)
     ).isoformat()
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_daily_steps",), sd, ed)
     if data is None:
@@ -6508,7 +6613,7 @@ def get_floors(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_floors", "get_floors_data"), parsed)
     if data is None:
@@ -6529,7 +6634,7 @@ def get_blood_pressure(
     sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=6)
     ).isoformat()
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(
             api, ("get_blood_pressure", "get_blood_pressure_data"), sd, ed
@@ -6546,7 +6651,7 @@ def get_stats_and_body(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_stats_and_body",), parsed)
     if data is None:
@@ -6572,7 +6677,7 @@ def get_progress_summary(
     valid = {"distance","duration","elevationGain","movingDuration","calories","bmrCalories","steps"}
     if metric not in valid:
         metric = "distance"
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(
             api, ("get_progress_summary_between_dates",), sd, ed, metric
@@ -6587,7 +6692,7 @@ def get_earned_badges() -> dict:
     """Insignias y logros conseguidos en Garmin Connect.
     Muestra todos los badges desbloqueados hasta la fecha.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_earned_badges",))
     if data is None:
@@ -6600,7 +6705,7 @@ def get_badge_challenges(start: int = 1, limit: int = 20) -> dict:
     """Retos de insignias activos en Garmin Connect.
     start: índice inicial (paginación). limit: máximo de resultados.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_badge_challenges",), start, limit)
     if data is None:
@@ -6613,7 +6718,7 @@ def get_adhoc_challenges(start: int = 1, limit: int = 20) -> dict:
     """Retos espontáneos activos en Garmin Connect.
     start: índice inicial (paginación). limit: máximo de resultados.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_adhoc_challenges",), start, limit)
     if data is None:
@@ -6626,7 +6731,7 @@ def get_available_badge_challenges(start: int = 1, limit: int = 20) -> dict:
     """Retos de insignias disponibles para unirse en Garmin Connect.
     start: índice inicial (paginación). limit: máximo de resultados.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_available_badge_challenges",), start, limit)
     if data is None:
@@ -6639,7 +6744,7 @@ def get_device_last_used() -> dict:
     """Información del último dispositivo Garmin utilizado para sincronizar.
     Incluye modelo, firmware y fecha de última conexión.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_device_last_used",))
     if data is None:
@@ -6653,7 +6758,7 @@ def get_gear_stats(gear_uuid: str) -> dict:
     Devuelve actividades totales, distancia acumulada y tiempo de uso.
     gear_uuid: identificador UUID del material (obtenible con get_gear).
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_gear_stats",), gear_uuid)
     if data is None:
@@ -6666,7 +6771,7 @@ def get_gear_defaults() -> dict:
     """Material por defecto asignado a cada tipo de actividad (correr, ciclismo, etc.).
     Útil para saber qué zapatilla o bici tiene Garmin asignada por defecto en cada deporte.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         profile, _ = _optional_call_first(api, ("get_user_profile",))
         profile_number = None
@@ -6692,7 +6797,7 @@ def get_daily_weigh_ins(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_daily_weigh_ins",), parsed)
     if data is None:
@@ -6705,7 +6810,7 @@ def get_inprogress_virtual_challenges(start: int = 1, limit: int = 20) -> dict:
     """Retos virtuales en curso en Garmin Connect (por ejemplo Garmin Challenges de km).
     start: índice inicial (paginación). limit: máximo de resultados.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_inprogress_virtual_challenges",), start, limit)
     if data is None:
@@ -6719,7 +6824,7 @@ def get_non_completed_badge_challenges(start: int = 1, limit: int = 20) -> dict:
     Complementa get_badge_challenges mostrando los pendientes.
     start: índice inicial (paginación). limit: máximo de resultados.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_non_completed_badge_challenges",), start, limit)
     if data is None:
@@ -6732,7 +6837,7 @@ def get_device_alarms() -> dict:
     """Alarmas configuradas en los dispositivos Garmin vinculados a la cuenta.
     Devuelve las alarmas activas y sus configuraciones.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_device_alarms",))
     if data is None:
@@ -6745,7 +6850,7 @@ def get_user_profile_info() -> dict:
     """Información básica del perfil de usuario: nombre completo y sistema de unidades.
     Útil para saber si Garmin trabaja en km/kg o millas/libras.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         full_name, name_err = _optional_call_first(api, ("get_full_name",))
         unit_system, unit_err = _optional_call_first(api, ("get_unit_system",))
@@ -6763,7 +6868,7 @@ def delete_weigh_in(weight_pk: str, target_date: str) -> dict:
     target_date: fecha del pesaje en formato YYYY-MM-DD.
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("delete_weigh_in",), weight_pk, parsed)
     if data is None and err:
@@ -6778,7 +6883,7 @@ def delete_weigh_ins(target_date: str, delete_all: bool = False) -> dict:
     target_date: fecha en formato YYYY-MM-DD.
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("delete_weigh_ins",), parsed, delete_all)
     if data is None and err:
@@ -6797,7 +6902,7 @@ def set_gear_default(activity_type: str, gear_uuid: str, is_default: bool = True
     if not user:
         raise RuntimeError("No autenticado")
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         profile, _ = _optional_call_first(api, ("get_user_profile",))
         profile_number = None
@@ -6840,7 +6945,7 @@ def get_spo2_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_spo2_data", "get_pulse_ox_data"), parsed)
     if data is None:
@@ -6855,7 +6960,7 @@ def get_respiration_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_respiration_data",), parsed)
     if data is None:
@@ -6870,7 +6975,7 @@ def get_hydration_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_hydration_data",), parsed)
     if data is None:
@@ -6890,7 +6995,7 @@ def get_body_composition(
     sd = _parse_input_date(start_date) if start_date else (
         date.fromisoformat(ed) - timedelta(days=29)
     ).isoformat()
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(
             api, ("get_body_composition", "get_weight_data"), sd, ed
@@ -6912,7 +7017,7 @@ def get_scheduled_workouts(year: int | None = None, month: int | None = None) ->
     y = int(year) if year else today.year
     m = int(month) if month else today.month
     # La API de Garmin usa mes 0-indexado (enero=0)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             # Intentar con el método de la librería si existe, si no usar connectapi
@@ -6940,7 +7045,7 @@ def get_todays_workout() -> dict:
     Acceso rápido sin necesidad de especificar fecha.
     """
     today = _today_local()
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             if hasattr(api, "get_workouts_calendar"):
@@ -6969,7 +7074,7 @@ def get_workout_for_date(target_date: str) -> dict:
     parsed = _parse_input_date(target_date)
     target = date.fromisoformat(parsed)
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             if hasattr(api, "get_workouts_calendar"):
@@ -7041,7 +7146,7 @@ def get_workout_library(start: int = 0, limit: int = 20) -> dict:
     start: offset para paginación. limit: máximo de resultados (máx 100).
     """
     limit = max(1, min(100, int(limit)))
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             if hasattr(api, "get_workouts"):
@@ -7058,7 +7163,7 @@ def get_workout_detail(workout_id: str) -> dict:
     """Detalle completo de un entrenamiento: pasos, series, zonas de FC/potencia y objetivos.
     workout_id: ID numérico del entrenamiento (obtenible con get_workout_library o get_scheduled_workouts).
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             if hasattr(api, "get_workout_by_id"):
@@ -7075,7 +7180,7 @@ def get_training_plans() -> dict:
     """Planes de entrenamiento activos en Garmin Connect.
     Incluye el nombre del plan, deporte, fase actual y fechas.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             if hasattr(api, "get_training_plans"):
@@ -7092,7 +7197,7 @@ def get_training_plan_detail(plan_id: str) -> dict:
     """Detalle completo de un plan de entrenamiento: fases, semanas y workouts programados.
     plan_id: ID del plan (obtenible con get_training_plans).
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data = None
         for path in (f"/trainingplan-service/trainingplan/phased/{plan_id}",
@@ -7115,7 +7220,7 @@ def schedule_workout(workout_id: str, target_date: str) -> dict:
     target_date: fecha en formato YYYY-MM-DD.
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             if hasattr(api, "schedule_workout"):
@@ -7132,7 +7237,7 @@ def unschedule_workout(schedule_id: str) -> dict:
     """Elimina un entrenamiento de la planificación por su schedule ID.
     schedule_id: ID de la entrada en el calendario (campo scheduledWorkoutId en get_scheduled_workouts).
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             if hasattr(api, "unschedule_workout"):
@@ -7173,7 +7278,7 @@ def push_workout_to_device(workout_id: str) -> dict:
     workout_id: ID del entrenamiento (obtenible con get_workout_library o get_workout_for_date).
     El reloj debe estar emparejado y encendido para recibir el entrenamiento.
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             result = _push_workout(api, workout_id)
@@ -7189,7 +7294,7 @@ def get_nutrition_log(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         food_log, meals, settings = None, None, None
         for method, path in (
@@ -7239,7 +7344,7 @@ def upload_activity(file_base64: str, name: str = "", description: str = "", act
         data = _b64.b64decode(file_base64)
     except Exception as e:
         raise ValueError(f"file_base64 no es base64 válido: {e}")
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as f:
             f.write(data)
@@ -7273,7 +7378,7 @@ def download_activity(activity_id: str, format: str = "gpx") -> dict:
     fmt_enum = getattr(Garmin.ActivityDownloadFormat, fmt_key, None)
     if fmt_enum is None:
         raise ValueError(f"ActivityDownloadFormat.{fmt_key} no existe en esta versión de garminconnect.")
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         try:
             data = api.download_activity(int(activity_id), dl_fmt=fmt_enum)
@@ -7290,7 +7395,7 @@ def download_activity(activity_id: str, format: str = "gpx") -> dict:
 @mcp.tool
 def get_devices() -> dict:
     """Lista todos los dispositivos Garmin registrados en la cuenta (relojes, sensores, etc.)."""
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_devices",))
     if data is None:
@@ -7303,7 +7408,7 @@ def get_device_settings(device_id: str) -> dict:
     """Configuración detallada de un dispositivo Garmin.
     device_id: identificador del dispositivo (obtenible con get_devices).
     """
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_device_settings",), device_id)
     if data is None:
@@ -7317,7 +7422,7 @@ def get_max_metrics(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_max_metrics",), parsed)
     if data is None:
@@ -7332,7 +7437,7 @@ def get_body_battery(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_body_battery",), parsed)
     if data is None:
@@ -7346,7 +7451,7 @@ def get_heart_rates(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_heart_rates",), parsed)
     if data is None:
@@ -7360,7 +7465,7 @@ def get_sleep_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD de la noche (por defecto ayer).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_sleep_data",), parsed)
     if data is None:
@@ -7374,7 +7479,7 @@ def get_hrv_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_hrv_data",), parsed)
     if data is None:
@@ -7388,7 +7493,7 @@ def get_training_status(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_training_status",), parsed)
     if data is None:
@@ -7402,7 +7507,7 @@ def get_training_readiness(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_training_readiness",), parsed)
     if data is None:
@@ -7416,7 +7521,7 @@ def get_rhr_day(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_rhr_day",), parsed)
     if data is None:
@@ -7430,7 +7535,7 @@ def get_stress_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_stress_data",), parsed)
     if data is None:
@@ -7444,7 +7549,7 @@ def get_user_summary(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_user_summary",), parsed)
     if data is None:
@@ -7458,7 +7563,7 @@ def get_stats(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_stats",), parsed)
     if data is None:
@@ -7839,20 +7944,20 @@ def create_workout_from_description(
         ],
     }
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         result = api.upload_workout(workout_json)
 
     workout_id = result.get("workoutId") if isinstance(result, dict) else None
     schedule_result = None
     if workout_id and target_date:
-        with FETCH_LOCK:
+        with _fetch_lock():
             api = _get_api(user["id"])
             schedule_result = api.schedule_workout(workout_id, target_date)
 
     push_result = None
     if workout_id and auto_push_to_device:
-        with FETCH_LOCK:
+        with _fetch_lock():
             api = _get_api(user["id"])
             try:
                 push_result = _push_workout(api, workout_id)
@@ -8042,7 +8147,7 @@ def check_plan_adherence(
     if not end_date:
         end_date = start_date
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         try:
             start_parts = start_date.split("-")
@@ -8058,7 +8163,7 @@ def check_plan_adherence(
         scheduled_list = scheduled
 
     completed = []
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         try:
             activities, _ = _optional_call_first(api, ("get_activities_by_date",), start_date, end_date)
@@ -8088,7 +8193,7 @@ def get_weekly_report() -> dict[str, Any]:
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         try:
             activities, _ = _optional_call_first(api, ("get_activities_by_date",), monday.isoformat(), sunday.isoformat())
@@ -8134,7 +8239,7 @@ def predict_race_distance(distance_km: float) -> dict[str, Any]:
     if not user:
         raise RuntimeError("No autenticado")
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         max_metrics, _ = _optional_call_first(api, ("get_max_metrics",), _today_local().isoformat())
         ts, _ = _optional_call_first(api, ("get_training_status",), _today_local().isoformat())
@@ -8483,7 +8588,7 @@ def upload_route_to_garmin(
             f.write(gpx_xml)
             tmp_path = f.name
 
-        with FETCH_LOCK:
+        with _fetch_lock():
             api = _get_api(user["id"])
             try:
                 result = api.upload_activity(tmp_path)
@@ -8505,7 +8610,7 @@ def get_gear_list() -> dict:
     if not user:
         raise RuntimeError("No autenticado")
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         profile, _ = _optional_call_first(api, ("get_user_profile",))
         profile_number = None
@@ -8549,7 +8654,7 @@ def get_sync_status() -> dict:
     if not user:
         raise RuntimeError("No autenticado")
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         data, err = _optional_call_first(api, ("get_device_last_used",))
 
@@ -8579,7 +8684,7 @@ def calculate_training_load(target_date: str | None = None) -> dict:
     if not user:
         raise RuntimeError("No autenticado")
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         data, err = _optional_call_first(api, ("get_training_status",), parsed)
 
@@ -8638,7 +8743,7 @@ def detect_fatigue_risk(target_date: str | None = None) -> dict:
     if not user:
         raise RuntimeError("No autenticado")
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         hrv, hrv_err = _optional_call_first(api, ("get_hrv_data",), parsed)
         ready, ready_err = _optional_call_first(api, ("get_morning_training_readiness",), parsed)
@@ -8744,7 +8849,7 @@ def summarize_period(start_date: str, end_date: str | None = None) -> dict:
     start_ts = start.isoformat()
     end_ts = end.isoformat()
 
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         activities, err = _optional_call_first(api, ("get_activities",), 0, 500)
 
@@ -8805,7 +8910,7 @@ def calculate_pace_zones(target_date: str | None = None) -> dict:
         raise RuntimeError("No autenticado")
 
     vo2 = None
-    with FETCH_LOCK:
+    with _fetch_lock():
         api = _get_api(user["id"])
         ts, ts_err = _optional_call_first(api, ("get_training_status",), parsed)
 
@@ -8962,7 +9067,7 @@ def get_todays_schedule(plan_start_date: str | None = None) -> dict:
 
     scheduled = None
     try:
-        with FETCH_LOCK:
+        with _fetch_lock():
             api = _get_api(user["id"])
             today_parts = today.split("-")
             sched, sched_err = _optional_call_first(api, ("get_scheduled_workouts",), today_parts[0], today_parts[1])
@@ -9426,6 +9531,7 @@ import snapshot
 
 snapshot.configure(
     FETCH_LOCK=FETCH_LOCK,
+    _fetch_lock_fn=_fetch_lock,
     ACTIVITY_LIMIT=ACTIVITY_LIMIT,
     _get_api=_get_api,
     _optional_call_first=_optional_call_first,

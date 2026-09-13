@@ -14,6 +14,17 @@ GARMIN_LANGUAGE = os.getenv("GARMIN_LANGUAGE", "es").lower()
 
 # Recovery
 GARMIN_TIMEOUT_SECONDS = max(15, int(os.getenv("GARMIN_TIMEOUT_SECONDS", "45")))
+# Tope máximo (segundos) que una tool call espera por FETCH_LOCK antes de
+# responder "servidor ocupado" en lugar de bloquear a Claude Desktop para siempre.
+FETCH_TOOL_TIMEOUT_SECONDS = max(5, int(os.getenv("FETCH_TOOL_TIMEOUT_SECONDS", "25")))
+# Tope global (segundos) del prewarm inicial; pasado ese tiempo se aborta el
+# primer refresh y se marca error para que /health no quede "busy" eterno.
+PREWARM_MAX_SECONDS = max(60, int(os.getenv("PREWARM_MAX_SECONDS", "420")))
+# Estrategias de login garminconnect que usan curl_cffi (libcurl no respeta
+# socket.setdefaulttimeout y puede colgar un hilo para siempre).
+GARMIN_SKIP_STRATEGIES = os.getenv(
+    "GARMIN_SKIP_STRATEGIES", "mobile+cffi,widget+cffi,portal+cffi"
+).strip()
 
 RECOVERY_MAX_FRESH_MINUTES = max(15, int(os.getenv("RECOVERY_MAX_FRESH_MINUTES", "360")))
 RECOVERY_CROSS_DAY_STALE_MINUTES = max(

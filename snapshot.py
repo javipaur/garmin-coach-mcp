@@ -192,7 +192,7 @@ def _gfmt_km(v):
 def _snapshot_base(target_date, include_recent_activities=False):
     target_date = _parse_date(target_date)
     sleep_reference_day = target_date
-    with _dep("FETCH_LOCK"):
+    with _dep("_fetch_lock_fn")():
         api = _dep("_get_api")()
 
         summary, summary_err = _dep("_optional_call_first")(
