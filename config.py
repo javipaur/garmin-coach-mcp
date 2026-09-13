@@ -13,6 +13,8 @@ APP_TIMEZONE = ZoneInfo(os.getenv("GARMIN_TIMEZONE", "Europe/Madrid"))
 GARMIN_LANGUAGE = os.getenv("GARMIN_LANGUAGE", "es").lower()
 
 # Recovery
+GARMIN_TIMEOUT_SECONDS = max(15, int(os.getenv("GARMIN_TIMEOUT_SECONDS", "45")))
+
 RECOVERY_MAX_FRESH_MINUTES = max(15, int(os.getenv("RECOVERY_MAX_FRESH_MINUTES", "360")))
 RECOVERY_CROSS_DAY_STALE_MINUTES = max(
     15, int(os.getenv("RECOVERY_CROSS_DAY_STALE_MINUTES", "180"))

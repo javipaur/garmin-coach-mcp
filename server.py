@@ -10,6 +10,7 @@ import logging
 import logging.config
 import os
 import re
+import socket
 import threading
 import time
 from collections import deque
@@ -78,6 +79,7 @@ from config import (
     CACHE_MINUTES,
     DATA_ROOT,
     GARMIN_LANGUAGE,
+    GARMIN_TIMEOUT_SECONDS,
     GARMIN_TOKENS_JSON,
     LOGIN_MFA_TIMEOUT_SECONDS,
     PORT,
@@ -122,6 +124,12 @@ _SERVER_START_TIME: float = time.time()
 
 CACHE_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
+
+# Las llamadas a garminconnect (requests) no traen timeout y pueden colgarse a
+# nivel de socket. Un timeout global de socket garantiza que ninguna llamada
+# retenga FETCH_LOCK para siempre (síntoma: /health en "busy" eterno y el
+# cliente MCP reporta que "el servidor no responde").
+socket.setdefaulttimeout(GARMIN_TIMEOUT_SECONDS)
 
 CACHE: dict[str, Any] = {
     "status": "starting",
