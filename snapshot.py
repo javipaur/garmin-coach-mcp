@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from copy import deepcopy
 from datetime import date, timedelta
 from typing import Any
@@ -206,6 +207,36 @@ def _step_fetch(label: str):
         _FETCH_LOG.info("[snapshot] paso: %s", label)
 
 
+def _bounded_optional_call_first(api, methods, *args, timeout: float = 30.0, label: str = ""):
+    """Llama a _optional_call_first en un hilo y espera hasta `timeout` segundos.
+
+    Una sola llamada de datos Garmin (p. ej. get_sleep_data devolviendo un
+    payload enorme que llega en goteo) puede durar más que el socket timeout
+    por-chunk pero colgar para siempre en tiempo total. Este helper acota el
+    tiempo total: si el hilo no termina en `timeout`, se abandona (daemon) y el
+    snapshot sigue con el resto de pasos, liberando el lock.
+    """
+    box: dict[str, Any] = {}
+
+    def _worker():
+        try:
+            box["result"] = _dep("_optional_call_first")(api, methods, *args)
+        except Exception as exc:
+            box["error"] = exc
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        name = label or (methods[0] if methods else "garmin")
+        if _FETCH_LOG:
+            _FETCH_LOG.warning("[snapshot] paso '%s' agotó %ss; se abandona el hilo", name, timeout)
+        return None, f"{name}: timeout de {timeout}s agotado (respuesta demasiado lenta)"
+    if "error" in box:
+        raise box["error"]
+    return box["result"][0], box["result"][1]
+
+
 def _current_fetch_step() -> str | None:
     return _CURRENT_FETCH_STEP
 
@@ -221,32 +252,40 @@ def _snapshot_base(target_date, include_recent_activities=False):
             api = _dep("_get_api")()
 
             _step_fetch("resumen")
-            summary, summary_err = _dep("_optional_call_first")(
-                api, ("get_user_summary", "get_stats"), target_date
+            summary, summary_err = _bounded_optional_call_first(
+                api, ("get_user_summary", "get_stats"), target_date, label="resumen"
             )
             _step_fetch("frecuencia cardiaca")
-            heart, heart_err = _dep("_optional_call_first")(
-                api, ("get_heart_rates", "get_rhr_day"), target_date
+            heart, heart_err = _bounded_optional_call_first(
+                api, ("get_heart_rates", "get_rhr_day"), target_date, label="fc"
             )
             _step_fetch("sueño")
-            sleep, sleep_err = _dep("_optional_call_first")(
-                api, ("get_sleep_data",), sleep_reference_day
+            sleep, sleep_err = _bounded_optional_call_first(
+                api, ("get_sleep_data",), sleep_reference_day, label="sueño"
             )
             _step_fetch("estrés")
-            stress, stress_err = _dep("_optional_call_first")(api, ("get_stress_data",), target_date)
+            stress, stress_err = _bounded_optional_call_first(
+                api, ("get_stress_data",), target_date, label="estrés"
+            )
             _step_fetch("body battery")
-            body_battery, bb_err = _dep("_optional_call_first")(api, ("get_body_battery",), target_date)
+            body_battery, bb_err = _bounded_optional_call_first(
+                api, ("get_body_battery",), target_date, label="body_battery"
+            )
             _step_fetch("VFC")
-            hrv, hrv_err = _dep("_optional_call_first")(api, ("get_hrv_data",), target_date)
+            hrv, hrv_err = _bounded_optional_call_first(
+                api, ("get_hrv_data",), target_date, label="VFC"
+            )
             _step_fetch("métricas máximas")
-            max_metrics, vo2_err = _dep("_optional_call_first")(api, ("get_max_metrics",), target_date)
+            max_metrics, vo2_err = _bounded_optional_call_first(
+                api, ("get_max_metrics",), target_date, label="max_metrics"
+            )
             _step_fetch("predisposición para entrenar")
-            training_readiness, tr_err = _dep("_optional_call_first")(
-                api, ("get_training_readiness",), target_date
+            training_readiness, tr_err = _bounded_optional_call_first(
+                api, ("get_training_readiness",), target_date, label="training_readiness"
             )
             _step_fetch("estado de entreno")
-            training_status, ts_err = _dep("_optional_call_first")(
-                api, ("get_training_status",), target_date
+            training_status, ts_err = _bounded_optional_call_first(
+                api, ("get_training_status",), target_date, label="training_status"
             )
 
             activities = []
@@ -254,8 +293,8 @@ def _snapshot_base(target_date, include_recent_activities=False):
             activities_err = None
             if include_recent_activities:
                 _step_fetch("actividades recientes")
-                recent, activities_err = _dep("_optional_call_first")(
-                    api, ("get_activities",), 0, _dep("ACTIVITY_LIMIT")
+                recent, activities_err = _bounded_optional_call_first(
+                    api, ("get_activities",), 0, _dep("ACTIVITY_LIMIT"), label="actividades"
                 )
                 if isinstance(recent, list):
                     activities_raw = recent[: _dep("ACTIVITY_LIMIT")]
@@ -266,9 +305,27 @@ def _snapshot_base(target_date, include_recent_activities=False):
                     ]
 
             _step_fetch("datos extra")
-            extra_raw, extra_errors, device_info = _dep("_collect_extra_raw")(
-                api, target_date, training_status
-            )
+            _extra_box: dict[str, Any] = {}
+
+            def _worker_extra():
+                try:
+                    _extra_box["result"] = _dep("_collect_extra_raw")(
+                        api, target_date, training_status
+                    )
+                except Exception as exc:
+                    _extra_box["error"] = exc
+
+            _extra_t = threading.Thread(target=_worker_extra, daemon=True)
+            _extra_t.start()
+            _extra_t.join(75)
+            if _extra_t.is_alive():
+                if _FETCH_LOG:
+                    _FETCH_LOG.warning("[snapshot] paso 'datos extra' agotó 75s; se abandona")
+                extra_raw, extra_errors, device_info = {}, {"extra": "timeout 75s"}, {}
+            elif "error" in _extra_box:
+                raise _extra_box["error"]
+            else:
+                extra_raw, extra_errors, device_info = _extra_box["result"]
     finally:
         _CURRENT_FETCH_STEP = None
     metrics: dict[str, Any] = {

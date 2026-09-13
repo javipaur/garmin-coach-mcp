@@ -136,6 +136,18 @@ FETCH_LOCK = threading.Lock()
 socket.setdefaulttimeout(GARMIN_TIMEOUT_SECONDS)
 
 
+def _rotate_fetch_lock() -> None:
+    """Sustituye FETCH_LOCK por uno nuevo.
+
+    Uso: si el prewarm se queda colgado más de PREWARM_MAX_SECONDS, el watchdog
+    rota el lock para que las tool calls y siguientes refrescos no esperen a un
+    hilo zombi. El hilo viejo conserva el lock antiguo pero nadie lo consulta.
+    """
+    global FETCH_LOCK
+    with CACHE_LOCK:
+        FETCH_LOCK = threading.Lock()
+
+
 class _FetchLockTimeoutError(RuntimeError):
     """Se lanza cuando una tool call no consigue FETCH_LOCK a tiempo."""
 
@@ -1142,7 +1154,7 @@ def _prewarm_elapsed() -> float | None:
 
 
 def _prewarm_watchdog() -> None:
-    """Si el prewarm inicial supera PREWARM_MAX_SECONDS, lo marca como error."""
+    """Si el prewarm inicial supera PREWARM_MAX_SECONDS, lo marca como error y rota el lock."""
     loop_int = PREWARM_MAX_SECONDS / 2
     while True:
         time.sleep(max(10, loop_int))
@@ -1150,30 +1162,56 @@ def _prewarm_watchdog() -> None:
         if elapsed is None:
             continue
         if elapsed > PREWARM_MAX_SECONDS:
+            rotated = False
             with CACHE_LOCK:
-                if CACHE.get("status") == "ok":
-                    continue
-                if not CACHE.get("last_error"):
-                    CACHE["status"] = "error"
-                    CACHE["last_error"] = (
-                        f"Prewarm inicial agotó el tope de {PREWARM_MAX_SECONDS}s; "
-                        "intentando de nuevo"
-                    )
-            _mark_prewarm_started()
+                if CACHE.get("status") != "ok":
+                    if not CACHE.get("last_error"):
+                        CACHE["status"] = "error"
+                        CACHE["last_error"] = (
+                            f"Prewarm inicial agotó el tope de {PREWARM_MAX_SECONDS}s; "
+                            "rotando lock y reintentando"
+                        )
+                    _rotate_fetch_lock()
+                    rotated = True
+            if rotated:
+                _mark_prewarm_started()
 
 
 def _background_refresh_loop() -> None:
     retry_seconds = 30
     while True:
         _mark_prewarm_started()
-        try:
-            _refresh_cache_sync()
-            with CACHE_LOCK:
-                ok = CACHE.get("status") == "ok"
-        except Exception:
-            ok = False
+        ok = False
+        box: dict[str, Any] = {"ok": False}
+
+        def _run_refresh(_box: dict[str, Any] = box):
+            try:
+                _refresh_cache_sync()
+                with CACHE_LOCK:
+                    _box["ok"] = CACHE.get("status") == "ok"
+            except Exception as exc:
+                _box["error"] = exc
+
+        worker = threading.Thread(target=_run_refresh, daemon=True)
+        worker.start()
+        worker.join(PREWARM_MAX_SECONDS)
         with _PREWARM_LOCK:
             _PREWARM_START = None
+        if worker.is_alive():
+            log = logging.getLogger("prewarm")
+            log.warning(
+                "refresco superó %ss; rotando lock y reintentando",
+                PREWARM_MAX_SECONDS,
+            )
+            with CACHE_LOCK:
+                CACHE["status"] = "error"
+                CACHE["last_error"] = (
+                    f"Refresco agotó el tope de {PREWARM_MAX_SECONDS}s; se rotó el lock"
+                )
+            _rotate_fetch_lock()
+            time.sleep(retry_seconds)
+            continue
+        ok = bool(box.get("ok"))
         log = logging.getLogger("prewarm")
         if ok:
             log.info("snapshot del día pre-caliente")
