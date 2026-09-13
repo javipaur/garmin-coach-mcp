@@ -18,7 +18,7 @@ jobs:
       - run: pip install ruff
       - run: ruff check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py server.py
       - run: ruff format --check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         if: github.actor != 'dependabot[bot]'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
