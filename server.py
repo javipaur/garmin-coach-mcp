@@ -1211,8 +1211,10 @@ def _background_refresh_loop() -> None:
 
         def _run_refresh(_box: dict[str, Any] = box):
             try:
-                with _refresh_lock():
-                    _refresh_cache_sync()
+                # _refresh_cache_sync() adquiere REFRESH_LOCK internamente
+                # (_lock_fn=_refresh_lock), así que NO hay que envolverlo aquí;
+                # envolverlo también generaría un deadlock (lock no reentrante).
+                _refresh_cache_sync()
                 with CACHE_LOCK:
                     _box["ok"] = CACHE.get("status") == "ok"
             except Exception as exc:
