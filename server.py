@@ -84,9 +84,11 @@ from config import (
     GARMIN_SKIP_STRATEGIES,
     GARMIN_TIMEOUT_SECONDS,
     GARMIN_TOKENS_JSON,
+    LOCK_ROTATE_AFTER_SECONDS,
     LOGIN_MFA_TIMEOUT_SECONDS,
     PORT,
     PREWARM_MAX_SECONDS,
+    REFRESH_LOCK_ROTATE_AFTER_SECONDS,
     RESET_GARMIN_TOKENS,
     TOKEN_DIR,
     TOKEN_FILE,
@@ -144,14 +146,20 @@ socket.setdefaulttimeout(GARMIN_TIMEOUT_SECONDS)
 def _rotate_fetch_lock() -> None:
     """Sustituye FETCH_LOCK y REFRESH_LOCK por locks nuevos.
 
-    Uso: si el prewarm se queda colgado más de PREWARM_MAX_SECONDS, el watchdog
-    rota el lock para que las tool calls y siguientes refrescos no esperen a un
-    hilo zombi. El hilo viejo conserva el lock antiguo pero nadie lo consulta.
+    Uso: si el prewarm se queda colgado más de PREWARM_MAX_SECONDS (o el watchdog
+    de locks detecta un lock retenido demasiado tiempo), se rota el lock para que
+    las tool calls y siguientes refrescos no esperen a un hilo zombi. El hilo
+    viejo conserva el lock antiguo, pero `_fetch_lock`/`_refresh_lock` lo liberan
+    de forma defensiva contra el objeto capturado, así que la rotación nunca
+    produce `RuntimeError: release unlocked lock`.
     """
     global FETCH_LOCK, REFRESH_LOCK
     with CACHE_LOCK:
         FETCH_LOCK = threading.Lock()
         REFRESH_LOCK = threading.Lock()
+    with _LOCK_STATE_LOCK:
+        for name in _LOCK_STATES:
+            _LOCK_STATES[name] = {}
 
 
 class _FetchLockTimeoutError(RuntimeError):
@@ -174,33 +182,164 @@ def _fetch_lock_or_raise(timeout: float | None = None) -> None:
         )
 
 
+# Estado de los locks para el watchdog y para /health. Persiste quién tiene cada
+# lock, desde cuándo (monotonic) y en qué paso del snapshot se quedó retenido.
+_LOCK_STATE_LOCK = threading.Lock()
+_LOCK_STATES: dict[str, dict[str, Any]] = {"fetch": {}, "refresh": {}}
+
+
+def _mark_lock_acquired(name: str, lock: threading.Lock) -> None:
+    with _LOCK_STATE_LOCK:
+        _LOCK_STATES[name] = {
+            "held": True,
+            "since": time.monotonic(),
+            "thread": threading.current_thread().name,
+            "lock_id": id(lock),
+        }
+
+
+def _mark_lock_released(name: str, lock: threading.Lock) -> None:
+    with _LOCK_STATE_LOCK:
+        st = _LOCK_STATES.get(name)
+        if st and st.get("lock_id") == id(lock):
+            st["held"] = False
+            st.pop("since", None)
+
+
+def _lock_held_seconds(name: str) -> float | None:
+    """Segundos que el lock `name` lleva retenido de forma continuada (o None)."""
+    with _LOCK_STATE_LOCK:
+        st = _LOCK_STATES.get(name) or {}
+    if not st.get("held"):
+        _mark_lock_observed_not_held(name)
+        return None
+    now = time.monotonic()
+    since = st.get("since")
+    if since is None:
+        _mark_lock_observed_not_held(name)
+        return None
+    return now - since
+
+
+def _mark_lock_observed_not_held(name: str) -> None:
+    with _LOCK_STATE_LOCK:
+        st = _LOCK_STATES.get(name)
+        if st and st.get("held"):
+            st["held"] = False
+            st.pop("since", None)
+
+
+def _lock_holder_info(name: str) -> dict[str, Any]:
+    """Snapshot legible del estado de un lock para /health."""
+    with _LOCK_STATE_LOCK:
+        st = dict(_LOCK_STATES.get(name) or {})
+    held_seconds = _lock_held_seconds(name)
+    info: dict[str, Any] = {
+        "locked": bool(FETCH_LOCK.locked() if name == "fetch" else REFRESH_LOCK.locked()),
+        "held_seconds": held_seconds,
+        "thread": st.get("thread"),
+        "fetch_step": None,
+    }
+    if name == "fetch":
+        step_fn = globals().get("_current_fetch_step")
+        try:
+            info["fetch_step"] = step_fn() if callable(step_fn) else None
+        except Exception:
+            info["fetch_step"] = None
+    return info
+
+
 @contextmanager
 def _fetch_lock(timeout: float | None = None):
-    """CM timeout-aware equivalente a `with _fetch_lock():`. Evita colgar hilos."""
-    if not _acquire_fetch_lock(timeout):
+    """CM timeout-aware equivalente a `with _fetch_lock():`. Evita colgar hilos.
+
+    Libera el lock de forma defensiva contra el objeto capturado en la
+    adquisición: si el watchdog rota el lock mientras esta sección está activa,
+    se libera el lock viejo (que es el que realmente se adquirió) en lugar de
+    romper con `RuntimeError: release unlocked lock`.
+    """
+    t = FETCH_TOOL_TIMEOUT_SECONDS if timeout is None else timeout
+    lock = FETCH_LOCK
+    if not lock.acquire(timeout=t):
         raise _FetchLockTimeoutError(
             "El servidor está ocupado con otra consulta a Garmin. "
             "Inténtalo de nuevo en unos segundos."
         )
+    _mark_lock_acquired("fetch", lock)
     try:
         yield
     finally:
-        FETCH_LOCK.release()
+        _mark_lock_released("fetch", lock)
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
 
 
 @contextmanager
 def _refresh_lock(timeout: float | None = None):
     """CM para el refresh de fondo. No bloquea las tool calls (lock separado)."""
     t = PREWARM_MAX_SECONDS if timeout is None else timeout
-    if not REFRESH_LOCK.acquire(timeout=t):
+    lock = REFRESH_LOCK
+    if not lock.acquire(timeout=t):
         raise _FetchLockTimeoutError(
             "El servidor está ocupado con otra consulta a Garmin. "
             "Inténtalo de nuevo en unos segundos."
         )
+    _mark_lock_acquired("refresh", lock)
     try:
         yield
     finally:
-        REFRESH_LOCK.release()
+        _mark_lock_released("refresh", lock)
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
+
+
+def _lock_watchdog_tick(now: float | None = None) -> bool:
+    """Una pasada del watchdog de locks: rota todo lock retenido más de su tope.
+
+    Devuelve True si rotó algún lock. Separada del bucle para poder testearla.
+    """
+    if now is None:
+        now = time.monotonic()
+    stale: list[tuple[str, float]] = []
+    with _LOCK_STATE_LOCK:
+        for name, limit in (
+            ("fetch", LOCK_ROTATE_AFTER_SECONDS),
+            ("refresh", REFRESH_LOCK_ROTATE_AFTER_SECONDS),
+        ):
+            st = _LOCK_STATES.get(name) or {}
+            if not st.get("held"):
+                continue
+            since = st.get("since")
+            if since is None or not isinstance(since, (int, float)):
+                st["since"] = now  # sin marca temporal: empezamos a contar ya
+                continue
+            held = now - since
+            if held >= limit:
+                stale.append((name, held))
+    if not stale:
+        return False
+    detail = ", ".join(f"{name} {held:.0f}s" for name, held in stale)
+    log = logging.getLogger("locks")
+    log.warning("lock retenido más de su tope (%s); rotando automáticamente", detail)
+    with CACHE_LOCK:
+        if not CACHE.get("last_error"):
+            CACHE["last_error"] = f"Lock rotado de forma automática: {detail}"
+    _rotate_fetch_lock()
+    return True
+
+
+def _lock_holder_watchdog() -> None:
+    """Autocuración: si un lock lleva retenido más de su tope (hilo zombi cuyo
+    cliente abandonó la conexión), lo rota para que el servidor no quede en
+    "busy" eterno. Funciona aunque CACHE esté en "ok" (el caso que el watchdog
+    de prewarm no cubre)."""
+    while True:
+        time.sleep(5)
+        _lock_watchdog_tick()
 
 
 def _publish_busy_error() -> None:
@@ -1614,13 +1753,17 @@ async def lock_session(request: Request) -> Response:
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
-    if FETCH_LOCK.locked():
+    lock_info = _lock_holder_info("fetch")
+    if lock_info["locked"]:
         return JSONResponse({
             "status": "busy",
             "app": APP_NAME,
             "mcp_endpoint": "/mcp",
             "busy": True,
             "detail": "Una operación de Garmin está en curso; el servidor sigue vivo.",
+            "lock_held_seconds": lock_info.get("held_seconds"),
+            "fetch_step": lock_info.get("fetch_step"),
+            "lock_thread": lock_info.get("thread"),
         })
     with CACHE_LOCK:
         payload = {
@@ -3425,6 +3568,8 @@ def _run_server() -> None:
     thread.start()
     watchdog = threading.Thread(target=_prewarm_watchdog, daemon=True)
     watchdog.start()
+    lock_watchdog = threading.Thread(target=_lock_holder_watchdog, daemon=True)
+    lock_watchdog.start()
 
     # First-run banner so the user finds the setup wizard quickly from logs.
     if _is_first_run():

@@ -20,6 +20,14 @@ FETCH_TOOL_TIMEOUT_SECONDS = max(5, int(os.getenv("FETCH_TOOL_TIMEOUT_SECONDS", 
 # Tope global (segundos) del prewarm inicial; pasado ese tiempo se aborta el
 # primer refresh y se marca error para que /health no quede "busy" eterno.
 PREWARM_MAX_SECONDS = max(60, int(os.getenv("PREWARM_MAX_SECONDS", "420")))
+# Tiempo máximo (segundos) que FETCH_LOCK puede estar retenido de forma
+# continuada antes de que el watchdog lo rote automáticamente. Un hilo zombi
+# (p. ej. una tool call cuyo cliente abandonó la conexión) no libera nunca el
+# lock y dejaría el servidor en "busy" eterno sin esta autocuración. El tope se
+# fija por encima del peor caso legítimo (snapshot completo ~6 min + login).
+LOCK_ROTATE_AFTER_SECONDS = max(60, int(os.getenv("LOCK_ROTATE_AFTER_SECONDS", "900")))
+# Igual para REFRESH_LOCK (refresco de fondo; peor caso legítimo ~6 min).
+REFRESH_LOCK_ROTATE_AFTER_SECONDS = max(60, int(os.getenv("REFRESH_LOCK_ROTATE_AFTER_SECONDS", "600")))
 # Estrategias de login garminconnect que usan curl_cffi (libcurl no respeta
 # socket.setdefaulttimeout y puede colgar un hilo para siempre).
 GARMIN_SKIP_STRATEGIES = os.getenv(
