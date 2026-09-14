@@ -1521,7 +1521,9 @@ _PATCHES = [
 ]
 
 
-def _collect_day_snapshot(target_date, include_recent_activities=False, _lock_fn=None, *args, **kwargs):
+def _collect_day_snapshot(
+    target_date, include_recent_activities=False, _lock_fn=None, *args, **kwargs
+):
     snap = _snapshot_base(target_date, include_recent_activities, _lock_fn=_lock_fn)
     for patch in _PATCHES:
         snap = patch(snap, *args, **kwargs)

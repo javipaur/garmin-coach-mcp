@@ -27,7 +27,9 @@ PREWARM_MAX_SECONDS = max(60, int(os.getenv("PREWARM_MAX_SECONDS", "420")))
 # fija por encima del peor caso legítimo (snapshot completo ~6 min + login).
 LOCK_ROTATE_AFTER_SECONDS = max(60, int(os.getenv("LOCK_ROTATE_AFTER_SECONDS", "900")))
 # Igual para REFRESH_LOCK (refresco de fondo; peor caso legítimo ~6 min).
-REFRESH_LOCK_ROTATE_AFTER_SECONDS = max(60, int(os.getenv("REFRESH_LOCK_ROTATE_AFTER_SECONDS", "600")))
+REFRESH_LOCK_ROTATE_AFTER_SECONDS = max(
+    60, int(os.getenv("REFRESH_LOCK_ROTATE_AFTER_SECONDS", "600"))
+)
 # Estrategias de login garminconnect que usan curl_cffi (libcurl no respeta
 # socket.setdefaulttimeout y puede colgar un hilo para siempre).
 GARMIN_SKIP_STRATEGIES = os.getenv(
