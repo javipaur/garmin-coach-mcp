@@ -2049,23 +2049,29 @@ async def health(_: Request) -> JSONResponse:
             }
         )
     with CACHE_LOCK:
-        payload = {
+        cache_status = CACHE["status"]
+        last_refresh = CACHE["last_refresh"]
+        last_success_refresh = CACHE["last_success_refresh"]
+        consecutive_failures = CACHE["consecutive_refresh_failures"]
+        last_error = CACHE["last_error"]
+    return JSONResponse(
+        {
             "status": "ok",
             "app": APP_NAME,
             "mcp_endpoint": "/mcp",
             "version": _git_revision(),
-            "cache_status": CACHE["status"],
-            "last_refresh": CACHE["last_refresh"],
-            "last_refresh_local": _isoish_to_local(CACHE["last_refresh"]),
-            "last_success_refresh": CACHE["last_success_refresh"],
+            "cache_status": cache_status,
+            "last_refresh": last_refresh,
+            "last_refresh_local": _isoish_to_local(last_refresh),
+            "last_success_refresh": last_success_refresh,
             "cache_age_seconds": _cache_age_seconds(),
             "stale": _cache_is_stale(),
-            "consecutive_refresh_failures": CACHE["consecutive_refresh_failures"],
-            "last_error": CACHE["last_error"],
+            "consecutive_refresh_failures": consecutive_failures,
+            "last_error": last_error,
             "token_file_exists": TOKEN_FILE.exists(),
             "volume_path": str(DATA_ROOT),
         }
-    return JSONResponse(payload)
+    )
 
 
 @mcp.custom_route("/metrics", methods=["GET"])
@@ -3742,28 +3748,33 @@ def get_cached_snapshot() -> dict[str, Any]:
     """Última foto cacheada del día actual, con métricas normalizadas y raw_sources."""
     with CACHE_LOCK:
         snapshot = deepcopy(CACHE["snapshot"])
-        metrics = {}
-        if isinstance(snapshot, dict):
-            metrics = snapshot.get("metrics") or {}
+        status = CACHE["status"]
+        last_refresh = CACHE["last_refresh"]
+        last_success_refresh = CACHE["last_success_refresh"]
+        consecutive_failures = CACHE["consecutive_refresh_failures"]
+        last_error = CACHE["last_error"]
+    metrics = {}
+    if isinstance(snapshot, dict):
+        metrics = snapshot.get("metrics") or {}
 
-        return {
-            "status": CACHE["status"],
-            "last_refresh": CACHE["last_refresh"],
-            "last_refresh_local": _isoish_to_local(CACHE["last_refresh"]),
-            "last_success_refresh": CACHE["last_success_refresh"],
-            "cache_age_seconds": _cache_age_seconds(),
-            "stale": _cache_is_stale(),
-            "consecutive_refresh_failures": CACHE["consecutive_refresh_failures"],
-            "last_error": CACHE["last_error"],
-            "snapshot_obtenido_local": _isoish_to_local(snapshot.get("fetched_at"))
-            if isinstance(snapshot, dict)
-            else None,
-            "datos_hasta_local": metrics.get("datos_hasta_local")
-            if isinstance(metrics, dict)
-            else None,
-            "ultima_sincronizacion_conector_local": _isoish_to_local(CACHE["last_refresh"]),
-            "snapshot": snapshot,
-        }
+    return {
+        "status": status,
+        "last_refresh": last_refresh,
+        "last_refresh_local": _isoish_to_local(last_refresh),
+        "last_success_refresh": last_success_refresh,
+        "cache_age_seconds": _cache_age_seconds(),
+        "stale": _cache_is_stale(),
+        "consecutive_refresh_failures": consecutive_failures,
+        "last_error": last_error,
+        "snapshot_obtenido_local": _isoish_to_local(snapshot.get("fetched_at"))
+        if isinstance(snapshot, dict)
+        else None,
+        "datos_hasta_local": metrics.get("datos_hasta_local")
+        if isinstance(metrics, dict)
+        else None,
+        "ultima_sincronizacion_conector_local": _isoish_to_local(last_refresh),
+        "snapshot": snapshot,
+    }
 
 
 @mcp.tool
