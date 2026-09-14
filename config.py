@@ -30,6 +30,22 @@ LOCK_ROTATE_AFTER_SECONDS = max(60, int(os.getenv("LOCK_ROTATE_AFTER_SECONDS", "
 REFRESH_LOCK_ROTATE_AFTER_SECONDS = max(
     60, int(os.getenv("REFRESH_LOCK_ROTATE_AFTER_SECONDS", "600"))
 )
+# Edad a partir de la cual la caché se considera "stale" (por defecto 2 ciclos).
+SNAPSHOT_STALE_AFTER_SECONDS = max(
+    300, int(os.getenv("SNAPSHOT_STALE_AFTER_SECONDS", str(max(300, CACHE_MINUTES * 60 * 2))))
+)
+# Heartbeat de tokens Garmin: refresca los ficheros de tokens a punto de caducar
+# ANTES de que una llamada real descubra "login roto" en mitad del uso.
+TOKEN_HEARTBEAT_ENABLED = os.getenv("TOKEN_HEARTBEAT_ENABLED", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+TOKEN_HEARTBEAT_INTERVAL_SECONDS = max(
+    300, int(os.getenv("TOKEN_HEARTBEAT_INTERVAL_SECONDS", "21600"))
+)
+# Anticipación en la que se fuerza el refresco (acceso típico ~12 h; a 1 h de caducar).
+TOKEN_REFRESH_LEAD_SECONDS = max(300, int(os.getenv("TOKEN_REFRESH_LEAD_SECONDS", "3600")))
 # Estrategias de login garminconnect que usan curl_cffi (libcurl no respeta
 # socket.setdefaulttimeout y puede colgar un hilo para siempre).
 GARMIN_SKIP_STRATEGIES = os.getenv(
@@ -50,6 +66,11 @@ LOGIN_MFA_TIMEOUT_SECONDS = 300
 
 # Paths
 DATA_ROOT = Path(os.getenv("DATA_DIR", "/data"))
+# Snapshot persistido en disco: el servidor sirve la última foto al arrancar
+# (sin esperar los ~6 min del prewarm) y /health mezcla edad real de la caché.
+SNAPSHOT_PERSIST_FILE = Path(
+    os.getenv("SNAPSHOT_PERSIST_FILE", str(DATA_ROOT / "last_snapshot.json"))
+)
 LOCAL_GARMINCONNECT_DIR = Path.home() / ".garminconnect"
 LOCAL_DEBUG_TOKEN_DIR = Path.cwd() / ".debug-data" / "garmin"
 USERS_DB_DIR = Path(os.getenv("USERS_DB_DIR", "/data/users"))

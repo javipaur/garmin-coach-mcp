@@ -11,6 +11,7 @@ import logging.config
 import os
 import re
 import socket
+import subprocess
 import threading
 import time
 from collections import deque
@@ -90,8 +91,13 @@ from config import (
     PREWARM_MAX_SECONDS,
     REFRESH_LOCK_ROTATE_AFTER_SECONDS,
     RESET_GARMIN_TOKENS,
+    SNAPSHOT_PERSIST_FILE,
+    SNAPSHOT_STALE_AFTER_SECONDS,
     TOKEN_DIR,
     TOKEN_FILE,
+    TOKEN_HEARTBEAT_ENABLED,
+    TOKEN_HEARTBEAT_INTERVAL_SECONDS,
+    TOKEN_REFRESH_LEAD_SECONDS,
     USERS_DB_DIR,
 )
 from date_utils import (
@@ -363,9 +369,70 @@ def _skip_garmin_cffi_strategies(api: Garmin) -> None:
     except Exception:
         pass
 
+
+_GIT_REVISION_CACHE: str | None = None
+_GIT_REVISION_LOCK = threading.Lock()
+
+
+def _git_revision() -> str:
+    """Versión corta del commit en ejecución (env GIT_SHA o git local)."""
+    global _GIT_REVISION_CACHE
+    with _GIT_REVISION_LOCK:
+        if _GIT_REVISION_CACHE is not None:
+            return _GIT_REVISION_CACHE
+    rev = os.getenv("GIT_SHA", "").strip()
+    if not rev:
+        try:
+            rev = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            ).stdout.strip()
+        except Exception:
+            rev = ""
+    if not rev:
+        rev = "unknown"
+    with _GIT_REVISION_LOCK:
+        _GIT_REVISION_CACHE = rev
+    return rev
+
+
+def _cache_age_seconds() -> float | None:
+    """Segundos desde el último refresh de la caché (o None si nunca refrescó).
+
+    Normaliza timestamps ISO naive a UTC: los que llegan en formato "Z" o sin
+    zona horaria se tratan como UTC (es lo que emiten _now_iso() y Garmin).
+    """
+    with CACHE_LOCK:
+        last = CACHE.get("last_refresh")
+    if not last:
+        return None
+    s = str(last)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    if s.endswith("+00:00") is False and "+" not in s and "-" not in s[10:]:
+        s = s + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return None
+    age = (datetime.now(dt.tzinfo) - dt).total_seconds()
+    return max(0.0, age)
+
+
+def _cache_is_stale() -> bool:
+    age = _cache_age_seconds()
+    return age is not None and age > SNAPSHOT_STALE_AFTER_SECONDS
+
+
 CACHE: dict[str, Any] = {
     "status": "starting",
     "last_refresh": None,
+    "last_success_refresh": None,
+    "consecutive_refresh_failures": 0,
     "last_error": None,
     "snapshot": None,
 }
@@ -373,8 +440,6 @@ CACHE: dict[str, Any] = {
 mcp = FastMCP(
     APP_NAME,
     instructions=(
-
-
         "Herramientas para leer métricas reales de Garmin Connect. "
         "Responde siempre en español y prioriza términos canónicos alineados con Garmin Connect en español. "
         "Usa 'Predisposición para entrenar', 'VFC', 'Puntuación de sueño', 'Carga aguda' y 'Estrés'. "
@@ -386,8 +451,7 @@ mcp = FastMCP(
         "Cuando el usuario pregunte por la hora de sincronización o de cuándo son los datos, prioriza ultima_sincronizacion_conector_local, snapshot_obtenido_local y datos_hasta_local.  Para Body Battery, usa el nombre 'Body Battery', no 'Batería corporal'. Para Predisposición para entrenar, usa estados en femenino: Muy baja, Baja, Moderada, Alta u Óptima según corresponda. Para sueño, prioriza sueno_texto_seguro, puntuacion_de_sueno y duracion_de_sueno_texto. No menciones REM, fases del sueño ni despertares salvo que existan campos canónicos explícitos para ello. "
         "Si el usuario pide máxima exactitud, usa get_raw_sources o get_cached_snapshot y responde basándote en raw_sources sin inventar campos. "
         "Si una métrica no existe, di que Garmin no la devolvió."
-
-),
+    ),
 )
 
 # Aplica _translate_garmin a la salida de todos los tools automáticamente
@@ -399,7 +463,9 @@ if GARMIN_LANGUAGE.startswith("es"):
             @functools.wraps(f)
             def _wrapped(*args, **kwargs):
                 return _translate_garmin(f(*args, **kwargs))
+
             return _orig_mcp_tool(_wrapped, **tool_kwargs)
+
         if fn is not None:
             return _decorator(fn)
         return _decorator
@@ -653,7 +719,7 @@ def _password_input_html(
     if minlength:
         attrs += f' minlength="{minlength}"'
     if autofocus:
-        attrs += ' autofocus'
+        attrs += " autofocus"
     if placeholder:
         attrs += f' placeholder="{_html.escape(placeholder)}"'
     toggle_js = (
@@ -663,10 +729,10 @@ def _password_input_html(
     )
     return (
         '<div class="pw-wrap">'
-        f'<input {attrs}>'
+        f"<input {attrs}>"
         f'<button type="button" class="pw-toggle" aria-label="Mostrar u ocultar contraseña" '
         f'onclick="{toggle_js}">👁</button>'
-        '</div>'
+        "</div>"
     )
 
 
@@ -707,7 +773,9 @@ def _get_api(user_id: str | None = None) -> Garmin:
         raise RuntimeError(f"Error de conexión con Garmin: {exc}") from exc
 
 
-def _optional_call_first(api: Garmin, methods: tuple[str, ...], *args: Any) -> tuple[Any, str | None]:
+def _optional_call_first(
+    api: Garmin, methods: tuple[str, ...], *args: Any
+) -> tuple[Any, str | None]:
     last_error = None
     attempted = False
 
@@ -917,7 +985,9 @@ def _hrv_metrics(hrv_data: Any) -> dict[str, Any]:
         summary = {}
 
     return {
-        "hrv_last_night": _pick_first_present(summary, ("lastNight", "lastNightAvg", "lastNightAverage")),
+        "hrv_last_night": _pick_first_present(
+            summary, ("lastNight", "lastNightAvg", "lastNightAverage")
+        ),
         "hrv_weekly_avg": _pick_first_present(summary, ("weeklyAvg", "sevenDayAvg", "baselineAvg")),
         "hrv_status": _pick_first_present(summary, ("hrvStatus", "status")),
         "hrv_baseline_low": _pick_first_present(summary, ("baselineBalancedLow", "balancedLow")),
@@ -981,32 +1051,44 @@ def _training_readiness_metrics(training_readiness: Any) -> dict[str, Any]:
     if not isinstance(entry, dict):
         return {}
 
-    score = _pick_first_present(entry, (
-        "score",
-        "readinessScore",
-        "trainingReadinessScore",
-        "value",
-    ))
-    status = _pick_first_present(entry, (
-        "level",
-        "status",
-        "readinessStatus",
-        "shortFeedback",
-        "feedbackShortType",
-    ))
-    message = _pick_first_present(entry, (
-        "feedbackShort",
-        "description",
-        "message",
-        "shortMessage",
-        "fullMessage",
-        "feedbackLong",
-        "feedbackLongType",
-    ))
-    recovery_time = _pick_first_present(entry, (
-        "recoveryTime",
-        "recoveryHours",
-    ))
+    score = _pick_first_present(
+        entry,
+        (
+            "score",
+            "readinessScore",
+            "trainingReadinessScore",
+            "value",
+        ),
+    )
+    status = _pick_first_present(
+        entry,
+        (
+            "level",
+            "status",
+            "readinessStatus",
+            "shortFeedback",
+            "feedbackShortType",
+        ),
+    )
+    message = _pick_first_present(
+        entry,
+        (
+            "feedbackShort",
+            "description",
+            "message",
+            "shortMessage",
+            "fullMessage",
+            "feedbackLong",
+            "feedbackLongType",
+        ),
+    )
+    recovery_time = _pick_first_present(
+        entry,
+        (
+            "recoveryTime",
+            "recoveryHours",
+        ),
+    )
 
     return {
         "training_readiness_score": score,
@@ -1066,13 +1148,16 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any]:
         "avg_hr": activity.get("averageHR") or summary.get("averageHR"),
         "max_hr": activity.get("maxHR") or summary.get("maxHR"),
         "calories": activity.get("calories") or summary.get("calories"),
-        "training_load": activity.get("trainingLoad") or activity.get("activityTrainingLoad") or summary.get("activityTrainingLoad"),
+        "training_load": activity.get("trainingLoad")
+        or activity.get("activityTrainingLoad")
+        or summary.get("activityTrainingLoad"),
         "elevation_gain_m": activity.get("elevationGain") or summary.get("elevationGain"),
         "training_effect": summary.get("trainingEffect"),
         "anaerobic_training_effect": summary.get("anaerobicTrainingEffect"),
         "average_power": activity.get("averagePower") or summary.get("averagePower"),
         "normalized_power": summary.get("normalizedPower"),
-        "average_run_cadence": activity.get("averageRunCadence") or summary.get("averageRunCadence"),
+        "average_run_cadence": activity.get("averageRunCadence")
+        or summary.get("averageRunCadence"),
         "steps": activity.get("steps") or summary.get("steps"),
     }
 
@@ -1163,31 +1248,43 @@ def _collect_extra_raw(
     return raw, errors, device_info
 
 
-def _collect_day_snapshot(target_date: str, include_recent_activities: bool = False) -> dict[str, Any]:
+def _collect_day_snapshot(
+    target_date: str, include_recent_activities: bool = False
+) -> dict[str, Any]:
     target_date = _parse_input_date(target_date)
     sleep_reference_day = target_date
 
     with _fetch_lock():
         api = _get_api()
 
-        summary, summary_err = _optional_call_first(api, ("get_user_summary", "get_stats"), target_date)
-        heart, heart_err = _optional_call_first(api, ("get_heart_rates", "get_rhr_day"), target_date)
+        summary, summary_err = _optional_call_first(
+            api, ("get_user_summary", "get_stats"), target_date
+        )
+        heart, heart_err = _optional_call_first(
+            api, ("get_heart_rates", "get_rhr_day"), target_date
+        )
         sleep, sleep_err = _optional_call_first(api, ("get_sleep_data",), sleep_reference_day)
         stress, stress_err = _optional_call_first(api, ("get_stress_data",), target_date)
         body_battery, bb_err = _optional_call_first(api, ("get_body_battery",), target_date)
         hrv, hrv_err = _optional_call_first(api, ("get_hrv_data",), target_date)
         max_metrics, vo2_err = _optional_call_first(api, ("get_max_metrics",), target_date)
-        training_readiness, tr_err = _optional_call_first(api, ("get_training_readiness",), target_date)
+        training_readiness, tr_err = _optional_call_first(
+            api, ("get_training_readiness",), target_date
+        )
         training_status, ts_err = _optional_call_first(api, ("get_training_status",), target_date)
 
         activities = []
         activities_raw = []
         activities_err = None
         if include_recent_activities:
-            recent, activities_err = _optional_call_first(api, ("get_activities",), 0, ACTIVITY_LIMIT)
+            recent, activities_err = _optional_call_first(
+                api, ("get_activities",), 0, ACTIVITY_LIMIT
+            )
             if isinstance(recent, list):
                 activities_raw = recent[:ACTIVITY_LIMIT]
-                activities = [_normalize_activity(a) for a in recent[:ACTIVITY_LIMIT] if isinstance(a, dict)]
+                activities = [
+                    _normalize_activity(a) for a in recent[:ACTIVITY_LIMIT] if isinstance(a, dict)
+                ]
 
         extra_raw, extra_errors, device_info = _collect_extra_raw(api, target_date, training_status)
 
@@ -1275,29 +1372,166 @@ def _refresh_cache_sync() -> dict[str, Any]:
         with CACHE_LOCK:
             CACHE["status"] = "ok"
             CACHE["last_refresh"] = _now_iso()
+            CACHE["last_success_refresh"] = _now_iso()
+            CACHE["consecutive_refresh_failures"] = 0
             CACHE["last_error"] = None
             CACHE["snapshot"] = snapshot
+        _persist_cache_snapshot(deepcopy(snapshot))
         return deepcopy(CACHE)
     except GarminConnectTooManyRequestsError as exc:
         with CACHE_LOCK:
             CACHE["status"] = "error"
             CACHE["last_error"] = f"429 Garmin rate limit: {exc}"
+            CACHE["consecutive_refresh_failures"] = 1 + (
+                CACHE.get("consecutive_refresh_failures") or 0
+            )
         return deepcopy(CACHE)
     except GarminConnectAuthenticationError as exc:
         with CACHE_LOCK:
             CACHE["status"] = "error"
             CACHE["last_error"] = f"Auth Garmin: {exc}"
+            CACHE["consecutive_refresh_failures"] = 1 + (
+                CACHE.get("consecutive_refresh_failures") or 0
+            )
         return deepcopy(CACHE)
     except GarminConnectConnectionError as exc:
         with CACHE_LOCK:
             CACHE["status"] = "error"
             CACHE["last_error"] = f"Conexión Garmin: {exc}"
+            CACHE["consecutive_refresh_failures"] = 1 + (
+                CACHE.get("consecutive_refresh_failures") or 0
+            )
         return deepcopy(CACHE)
     except Exception as exc:
         with CACHE_LOCK:
             CACHE["status"] = "error"
             CACHE["last_error"] = f"Error inesperado: {exc}"
+            CACHE["consecutive_refresh_failures"] = 1 + (
+                CACHE.get("consecutive_refresh_failures") or 0
+            )
         return deepcopy(CACHE)
+
+
+def _persist_cache_snapshot(snapshot: dict[str, Any] | None, path: Path | None = None) -> bool:
+    """Persiste el snapshot en disco (best-effort, escritura atómica).
+
+    Permite servir datos al instante tras un reinicio, sin esperar el prewarm.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    target = path or SNAPSHOT_PERSIST_FILE
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"saved_at": _now_iso(), "snapshot": snapshot}, ensure_ascii=False)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except Exception:
+        return False
+
+
+def _load_persisted_cache_snapshot(path: Path | None = None) -> dict[str, Any] | None:
+    target = path or SNAPSHOT_PERSIST_FILE
+    try:
+        if not target.exists():
+            return None
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        snap = payload.get("snapshot") if isinstance(payload, dict) else None
+        return snap if isinstance(snap, dict) else None
+    except Exception:
+        return None
+
+
+def _bootstrap_cache_from_disk() -> bool:
+    """Carga el último snapshot persistido en CACHE al arrancar.
+
+    Así el servidor sirve datos mientras el prewarm refresca en segundo plano.
+    `saved_at` del fichero queda reflejado en last_refresh para conservar la
+    edad real de los datos (y que /health pueda marcarlos como stale si toca).
+    """
+    snap = _load_persisted_cache_snapshot()
+    if not isinstance(snap, dict):
+        return False
+    persisted_at = snap.get("fetched_at") or snap.get("saved_at") or _now_iso()
+    with CACHE_LOCK:
+        if CACHE.get("snapshot") is None:
+            CACHE["snapshot"] = snap
+        if not CACHE.get("last_refresh"):
+            CACHE["last_refresh"] = persisted_at
+        if CACHE.get("status") in (None, "starting"):
+            CACHE["status"] = "ok"
+    logging.getLogger("prewarm").info("caché restaurada desde disco (saved_at=%s)", persisted_at)
+    return True
+
+
+def _read_token_expires_at(path: Path) -> float | None:
+    """Época (epoch seconds) de caducidad del access token de un fichero Garmin."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    oauth2 = data.get("oauth2_tokens") if isinstance(data, dict) else None
+    if not isinstance(oauth2, dict):
+        return None
+    expires_at = oauth2.get("expires_at")
+    if isinstance(expires_at, (int, float)) and expires_at > 0:
+        return float(expires_at)
+    expires_in = oauth2.get("expires_in")
+    if isinstance(expires_in, (int, float)) and expires_in > 0:
+        return time.time() + float(expires_in)
+    return None
+
+
+def _refresh_token_file(path: Path) -> bool:
+    """Refresca los tokens de un fichero llamando a login() (best-effort)."""
+    try:
+        api = Garmin()
+        _skip_garmin_cffi_strategies(api)
+        api.login(str(path.parent))
+        return True
+    except Exception as exc:
+        logging.getLogger("token-heartbeat").warning(
+            "refresco de tokens falló (%s): %s", path.name, exc
+        )
+        return False
+
+
+def _token_heartbeat_tick() -> list[str]:
+    """Una pasada del heartbeat: refresca ficheros de tokens a punto de caducar."""
+    refreshed: list[str] = []
+    now = time.time()
+    paths = [TOKEN_FILE]
+    try:
+        if USERS_DB_DIR.exists() and USERS_DB_DIR.is_dir():
+            paths.extend(sorted(USERS_DB_DIR.glob("*/garmin_tokens.json")))
+    except Exception:
+        pass
+    for path in paths:
+        if not path.exists():
+            continue
+        expires_at = _read_token_expires_at(path)
+        if expires_at is None:
+            continue
+        if (expires_at - now) <= TOKEN_REFRESH_LEAD_SECONDS and _refresh_token_file(path):
+            refreshed.append(path.name)
+    return refreshed
+
+
+def _token_heartbeat_loop() -> None:
+    """Refresca los tokens ANTES de que caduquen (evita "login roto" silencioso)."""
+    wait = TOKEN_HEARTBEAT_INTERVAL_SECONDS
+    while True:
+        time.sleep(wait)
+        try:
+            refreshed = _token_heartbeat_tick()
+            if refreshed:
+                logging.getLogger("token-heartbeat").info(
+                    "tokens refrescados de forma preventiva: %s",
+                    ", ".join(refreshed),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("token-heartbeat").warning("heartbeat error: %s", exc)
 
 
 _PREWARM_START: float | None = None
@@ -1494,7 +1728,9 @@ def _render_dashboard(request: Request) -> str:
     )
 
     if s["admin_lock_ok"]:
-        actions.append('<a href="/lock"><button type="button" class="secondary">Bloquear sesión</button></a>')
+        actions.append(
+            '<a href="/lock"><button type="button" class="secondary">Bloquear sesión</button></a>'
+        )
 
     # ------ Inline guides (collapsible) ------
     guides: list[str] = []
@@ -1508,112 +1744,117 @@ def _render_dashboard(request: Request) -> str:
         connect_url = f"{public_url}/connect?api_key={user_api_key}"
         guides.append(
             '<details id="guide-connect" class="guide" open>'
-            '<summary>🤖 Conectar tu IA (Claude Desktop, Móvil, ChatGPT…)</summary>'
+            "<summary>🤖 Conectar tu IA (Claude Desktop, Móvil, ChatGPT…)</summary>"
             f'<p class="muted">Conecta el MCP desde cualquier dispositivo de forma fácil.</p>'
             '<div style="margin-top:10px">'
             f'<a href="{_html.escape(connect_url)}"><button type="button">Abrir wizard de conexión</button></a> '
             f'<button type="button" onclick="navigator.clipboard.writeText({_html.escape(json.dumps(connect_url))});this.innerText=\'Copiado ✓\'">Copiar link de conexión</button>'
-            '</div>'
+            "</div>"
             f'<p style="margin-top:10px"><code style="font-size:12px">{_html.escape(user_api_key[:15])}•••••••</code> '
             f'<button type="button" onclick="navigator.clipboard.writeText({_html.escape(json.dumps(user_api_key))});this.innerText=\'Copiado ✓\'">Copiar API Key</button></p>'
             '<ol style="margin-top:6px">'
-            '<li>Abre el <strong>wizard de conexión</strong> (botón de arriba)</li>'
-            '<li>Elige tu cliente: Claude Desktop / Móvil / Code / Cursor</li>'
-            '<li>Copia la configuración que se muestra</li>'
-            '<li>Escanea el QR para conectar desde el móvil</li>'
-            '</ol>'
-            '</details>'
+            "<li>Abre el <strong>wizard de conexión</strong> (botón de arriba)</li>"
+            "<li>Elige tu cliente: Claude Desktop / Móvil / Code / Cursor</li>"
+            "<li>Copia la configuración que se muestra</li>"
+            "<li>Escanea el QR para conectar desde el móvil</li>"
+            "</ol>"
+            "</details>"
         )
 
     if not s["claude_ok"]:
         guides.append(
             '<details id="guide-claude" class="guide">'
-            '<summary>Cómo conectar este MCP a tu IA (Claude, ChatGPT…)</summary>'
+            "<summary>Cómo conectar este MCP a tu IA (Claude, ChatGPT…)</summary>"
             '<p class="muted">Funciona con cualquier IA que acepte conectores MCP.</p>'
-            '<ol>'
-            '<li>Abre tu IA → <strong>Settings</strong> → sección de <strong>Connectors</strong> / MCP</li>'
+            "<ol>"
+            "<li>Abre tu IA → <strong>Settings</strong> → sección de <strong>Connectors</strong> / MCP</li>"
             '<li>Elige <strong>Add custom connector</strong> (o "añadir servidor MCP")</li>'
-            f'<li>Pega esta URL: <code>{_html.escape(mcp_url)}</code></li>'
-            '<li>Guarda. En cuanto tu IA haga la primera petición, esta sección se pondrá verde ✅</li>'
-            '</ol>'
+            f"<li>Pega esta URL: <code>{_html.escape(mcp_url)}</code></li>"
+            "<li>Guarda. En cuanto tu IA haga la primera petición, esta sección se pondrá verde ✅</li>"
+            "</ol>"
             f'<button type="button" onclick="navigator.clipboard.writeText({_html.escape(json.dumps(mcp_url))});this.innerText=\'Copiado ✓\'">Copiar URL del conector</button>'
-            '</details>'
+            "</details>"
         )
     elif user_api_key:
         guides.append(
             '<details id="guide-claude-ok" class="guide">'
-            '<summary>✅ IA conectada recientemente</summary>'
+            "<summary>✅ IA conectada recientemente</summary>"
             '<p class="muted">La última conexión fue recientemente. Puedes ampliar el wizard de conexión si necesitas conectar otro dispositivo.</p>'
-            '</details>'
+            "</details>"
         )
 
     # ------ Compose ------
     body = (
-        '<h1>Garmin Coach MCP</h1>'
+        "<h1>Garmin Coach MCP</h1>"
         '<p class="muted">Panel de estado y configuración</p>'
         '<h2 style="margin-top:24px">Estado del setup</h2>'
-        '<div id="status-rows" class="rows">' + "".join(rows) + '</div>'
+        '<div id="status-rows" class="rows">' + "".join(rows) + "</div>"
         '<h2 style="margin-top:24px">Acciones</h2>'
-        '<div class="actions">' + "".join(actions) + '</div>'
-        + (('<h2 style="margin-top:24px">Configuración pendiente</h2>' + "".join(guides))
-           if guides else '')
-        + '<script>'
-        'setInterval(async function(){'
+        '<div class="actions">'
+        + "".join(actions)
+        + "</div>"
+        + (
+            ('<h2 style="margin-top:24px">Configuración pendiente</h2>' + "".join(guides))
+            if guides
+            else ""
+        )
+        + "<script>"
+        "setInterval(async function(){"
         'try{var r=await fetch("/dashboard/rows");if(r.ok){'
         'document.getElementById("status-rows").innerHTML=await r.text();'
-        '}}catch(e){}},1000)'
-        '</script>'
+        "}}catch(e){}},1000)"
+        "</script>"
     )
 
     extra_head = (
-        '<style>'
-        '.rows{display:flex;flex-direction:column;gap:10px}'
-        '.row{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;'
-        'background:#16161c;border:1px solid #26262e;border-radius:12px}'
-        '.row-ok{background:rgba(48,209,88,.10);border-color:rgba(48,209,88,.25)}'
-        '.row-pending{background:rgba(255,159,10,.10);border-color:rgba(255,159,10,.28)}'
-        '.row-icon{font-size:20px;line-height:1.3;flex:0 0 24px}'
-        '.row-main{flex:1 1 auto;min-width:0}'
-        '.row-title{font-weight:600;font-size:15px;color:#fff}'
-        '.row-detail{font-size:13px;color:#9a9aa2;margin-top:3px;line-height:1.45}'
-        '.row-action{flex:0 0 auto;align-self:center}'
-        '.row-action button{margin-top:0;padding:9px 16px;font-size:14px;width:auto}'
-        '.row-action a{display:inline-block}'
-        '.actions{display:flex;flex-direction:column;gap:10px}'
-        '.actions button{margin-top:0}'
-        '.actions a{display:block}'
-        'details.guide{background:#16161c;border:1px solid #26262e;border-radius:12px;'
-        'padding:14px 16px;margin-top:10px}'
-        'details.guide summary{cursor:pointer;font-weight:600;font-size:15px;padding:4px 0;color:#fff}'
-        'details.guide ol{padding-left:20px;line-height:1.8;font-size:14px;margin:10px 0 0}'
-        'details.guide li{margin:5px 0}'
-        '@media (max-width:380px){'
-        '.row{flex-wrap:wrap}'
-        '.row-action{flex-basis:100%;margin-top:8px}'
-        '.row-action button,.row-action a{width:100%}'
-        '}'
-        '</style>'
+        "<style>"
+        ".rows{display:flex;flex-direction:column;gap:10px}"
+        ".row{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;"
+        "background:#16161c;border:1px solid #26262e;border-radius:12px}"
+        ".row-ok{background:rgba(48,209,88,.10);border-color:rgba(48,209,88,.25)}"
+        ".row-pending{background:rgba(255,159,10,.10);border-color:rgba(255,159,10,.28)}"
+        ".row-icon{font-size:20px;line-height:1.3;flex:0 0 24px}"
+        ".row-main{flex:1 1 auto;min-width:0}"
+        ".row-title{font-weight:600;font-size:15px;color:#fff}"
+        ".row-detail{font-size:13px;color:#9a9aa2;margin-top:3px;line-height:1.45}"
+        ".row-action{flex:0 0 auto;align-self:center}"
+        ".row-action button{margin-top:0;padding:9px 16px;font-size:14px;width:auto}"
+        ".row-action a{display:inline-block}"
+        ".actions{display:flex;flex-direction:column;gap:10px}"
+        ".actions button{margin-top:0}"
+        ".actions a{display:block}"
+        "details.guide{background:#16161c;border:1px solid #26262e;border-radius:12px;"
+        "padding:14px 16px;margin-top:10px}"
+        "details.guide summary{cursor:pointer;font-weight:600;font-size:15px;padding:4px 0;color:#fff}"
+        "details.guide ol{padding-left:20px;line-height:1.8;font-size:14px;margin:10px 0 0}"
+        "details.guide li{margin:5px 0}"
+        "@media (max-width:380px){"
+        ".row{flex-wrap:wrap}"
+        ".row-action{flex-basis:100%;margin-top:8px}"
+        ".row-action button,.row-action a{width:100%}"
+        "}"
+        "</style>"
     )
 
     return _login_render_page("Garmin Coach MCP", None, body, extra_head=extra_head)
 
 
 def _render_unlock_page(wrong: bool = False) -> str:
-    err = '<div class="error">Contraseña incorrecta.</div>' if wrong else ''
+    err = '<div class="error">Contraseña incorrecta.</div>' if wrong else ""
     body = (
-        '<h1>Panel protegido</h1>'
+        "<h1>Panel protegido</h1>"
         '<p class="muted">Introduce tu contraseña para acceder a la configuración.</p>'
-        f'{err}'
+        f"{err}"
         '<form method="get" action="/admin">'
         '<label for="token">Contraseña</label>'
-        + _password_input_html("token", "token", autocomplete="current-password", autofocus=True) +
-        '<button type="submit">Entrar</button>'
-        '</form>'
+        + _password_input_html("token", "token", autocomplete="current-password", autofocus=True)
+        + '<button type="submit">Entrar</button>'
+        "</form>"
         '<details style="margin-top:28px">'
-        '<summary>¿No recuerdas la contraseña?</summary>'
+        "<summary>¿No recuerdas la contraseña?</summary>"
         '<p class="muted" style="margin-top:10px">Tu contraseña es el valor de la variable '
-        '<code>ADMIN_TOKEN</code> definida al desplegar el servidor.</p>'
-        '</details>'
+        "<code>ADMIN_TOKEN</code> definida al desplegar el servidor.</p>"
+        "</details>"
     )
     return _login_render_page("Panel protegido", None, body)
 
@@ -1621,6 +1862,7 @@ def _render_unlock_page(wrong: bool = False) -> str:
 @mcp.custom_route("/dashboard/rows", methods=["GET"])
 async def dashboard_rows(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     s = _dashboard_status()
     rows = _render_status_rows(s)
     return HTMLResponse("".join(rows))
@@ -1636,11 +1878,12 @@ def _render_status_rows(s: dict[str, Any]) -> list[str]:
             f'  <div class="row-icon">{icon}</div>'
             f'  <div class="row-main">'
             f'    <div class="row-title">{title}</div>'
-            f'    {detail_html}'
-            f'  </div>'
+            f"    {detail_html}"
+            f"  </div>"
             f'  <div class="row-action">{action_html}</div>'
-            f'</div>'
+            f"</div>"
         )
+
     rows: list[str] = []
     rows.append(row(s["server_ok"], "Servidor desplegado", "Activo y respondiendo"))
     if s["garmin_ok"]:
@@ -1654,25 +1897,54 @@ def _render_status_rows(s: dict[str, Any]) -> list[str]:
             detail = "Conectado, caché sin refrescar todavía"
         rows.append(row(True, f"Garmin conectado{email_str}", detail))
     else:
-        rows.append(row(False, "Garmin sin conectar",
-                        "Necesitas hacer login con tus credenciales Garmin",
-                        '<a href="/login"><button type="button">Conectar</button></a>'))
+        rows.append(
+            row(
+                False,
+                "Garmin sin conectar",
+                "Necesitas hacer login con tus credenciales Garmin",
+                '<a href="/login"><button type="button">Conectar</button></a>',
+            )
+        )
     if s["persistence_ok"] and s["garmin_has_tokens"]:
-        rows.append(row(True, "Guardado permanente en disco",
-                        "Activado: tus tokens se guardan en el volumen de datos y aguantan reinicios."))
+        rows.append(
+            row(
+                True,
+                "Guardado permanente en disco",
+                "Activado: tus tokens se guardan en el volumen de datos y aguantan reinicios.",
+            )
+        )
     elif s["persistence_ok"] and not s["garmin_has_tokens"]:
-        rows.append(row(False, "Guardado permanente en disco",
-                        "Volumen de datos listo, pero aún no hay tokens de Garmin que persistir. Conecta Garmin primero."))
+        rows.append(
+            row(
+                False,
+                "Guardado permanente en disco",
+                "Volumen de datos listo, pero aún no hay tokens de Garmin que persistir. Conecta Garmin primero.",
+            )
+        )
     else:
-        rows.append(row(False, "Guardado permanente en disco",
-                        "No hay volumen de datos montado: si el servidor reinicia perderás la conexión con Garmin."))
-    rows.append(row(s["admin_lock_ok"], "Protección con contraseña",
-                    ("Activado: solo tú, con tu contraseña, puedes abrir el wizard de login."
-                     if s["admin_lock_ok"]
-                     else "Ahora mismo, cualquiera que sepa la dirección de tu servidor podría abrir esta página y cambiar la cuenta de Garmin conectada. Actívalo para protegerla con una contraseña que eliges tú."),
-                    ('<a href="/setup/proteccion"><button type="button" class="secondary">Cambiar</button></a>'
-                     if s["admin_lock_ok"]
-                     else '<a href="/setup/proteccion"><button type="button" class="secondary">Activar</button></a>')))
+        rows.append(
+            row(
+                False,
+                "Guardado permanente en disco",
+                "No hay volumen de datos montado: si el servidor reinicia perderás la conexión con Garmin.",
+            )
+        )
+    rows.append(
+        row(
+            s["admin_lock_ok"],
+            "Protección con contraseña",
+            (
+                "Activado: solo tú, con tu contraseña, puedes abrir el wizard de login."
+                if s["admin_lock_ok"]
+                else "Ahora mismo, cualquiera que sepa la dirección de tu servidor podría abrir esta página y cambiar la cuenta de Garmin conectada. Actívalo para protegerla con una contraseña que eliges tú."
+            ),
+            (
+                '<a href="/setup/proteccion"><button type="button" class="secondary">Cambiar</button></a>'
+                if s["admin_lock_ok"]
+                else '<a href="/setup/proteccion"><button type="button" class="secondary">Activar</button></a>'
+            ),
+        )
+    )
     if s["claude_ok"]:
         ago = _human_time_ago(s["claude_seen_minutes"])
         client = s.get("mcp_client", "")
@@ -1683,11 +1955,17 @@ def _render_status_rows(s: dict[str, Any]) -> list[str]:
         rows.append(row(True, f"IA conectada ({ago})", detail))
     elif s["claude_seen_minutes"] is not None:
         ago = _human_time_ago(s["claude_seen_minutes"])
-        rows.append(row(True, f"IA durmiendo ({ago})",
-                        "Sin actividad reciente. Cuando la IA vuelva a usarlo, se reactivará."))
+        rows.append(
+            row(
+                True,
+                f"IA durmiendo ({ago})",
+                "Sin actividad reciente. Cuando la IA vuelva a usarlo, se reactivará.",
+            )
+        )
     else:
-        rows.append(row(True, "IA lista para conectar",
-                        "El servidor MCP está esperando conexiones."))
+        rows.append(
+            row(True, "IA lista para conectar", "El servidor MCP está esperando conexiones.")
+        )
     return rows
 
 
@@ -1706,6 +1984,7 @@ def _landing_html() -> str | None:
 @mcp.custom_route("/", methods=["GET"])
 async def root(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     landing = _landing_html()
     if landing is not None:
         # Public marketing landing. Admin dashboard lives at /admin.
@@ -1746,6 +2025,7 @@ async def admin_dashboard(request: Request) -> Response:
 @mcp.custom_route("/lock", methods=["GET"])
 async def lock_session(request: Request) -> Response:
     from starlette.responses import RedirectResponse
+
     resp = RedirectResponse("/admin", status_code=303)
     resp.delete_cookie("admin_token", samesite="strict")
     return resp
@@ -1755,24 +2035,32 @@ async def lock_session(request: Request) -> Response:
 async def health(_: Request) -> JSONResponse:
     lock_info = _lock_holder_info("fetch")
     if lock_info["locked"]:
-        return JSONResponse({
-            "status": "busy",
-            "app": APP_NAME,
-            "mcp_endpoint": "/mcp",
-            "busy": True,
-            "detail": "Una operación de Garmin está en curso; el servidor sigue vivo.",
-            "lock_held_seconds": lock_info.get("held_seconds"),
-            "fetch_step": lock_info.get("fetch_step"),
-            "lock_thread": lock_info.get("thread"),
-        })
+        return JSONResponse(
+            {
+                "status": "busy",
+                "app": APP_NAME,
+                "mcp_endpoint": "/mcp",
+                "version": _git_revision(),
+                "busy": True,
+                "detail": "Una operación de Garmin está en curso; el servidor sigue vivo.",
+                "lock_held_seconds": lock_info.get("held_seconds"),
+                "fetch_step": lock_info.get("fetch_step"),
+                "lock_thread": lock_info.get("thread"),
+            }
+        )
     with CACHE_LOCK:
         payload = {
             "status": "ok",
             "app": APP_NAME,
             "mcp_endpoint": "/mcp",
+            "version": _git_revision(),
             "cache_status": CACHE["status"],
             "last_refresh": CACHE["last_refresh"],
             "last_refresh_local": _isoish_to_local(CACHE["last_refresh"]),
+            "last_success_refresh": CACHE["last_success_refresh"],
+            "cache_age_seconds": _cache_age_seconds(),
+            "stale": _cache_is_stale(),
+            "consecutive_refresh_failures": CACHE["consecutive_refresh_failures"],
             "last_error": CACHE["last_error"],
             "token_file_exists": TOKEN_FILE.exists(),
             "volume_path": str(DATA_ROOT),
@@ -1780,10 +2068,10 @@ async def health(_: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
-
 @mcp.custom_route("/metrics", methods=["GET"])
 async def metrics(request: Request) -> Response:
     from starlette.responses import PlainTextResponse
+
     with CACHE_LOCK:
         last_refresh = CACHE.get("last_refresh")
         status = CACHE.get("status")
@@ -1791,13 +2079,13 @@ async def metrics(request: Request) -> Response:
     lines = [
         "# HELP gcmcp_uptime_seconds Time since server start",
         "# TYPE gcmcp_uptime_seconds gauge",
-        f'gcmcp_uptime_seconds {uptime_s:.1f}',
+        f"gcmcp_uptime_seconds {uptime_s:.1f}",
         "# HELP gcmcp_cache_status Last cache status",
         "# TYPE gcmcp_cache_status gauge",
         f'gcmcp_cache_status{{status="{status}"}} 1',
         "# HELP gcmcp_last_refresh_unix Last refresh unix timestamp",
         "# TYPE gcmcp_last_refresh_unix gauge",
-        f'gcmcp_last_refresh_unix {(last_refresh or 0):.1f}',
+        f"gcmcp_last_refresh_unix {(last_refresh or 0):.1f}",
     ]
     return PlainTextResponse("\n".join(lines) + "\n")
 
@@ -1806,91 +2094,106 @@ async def metrics(request: Request) -> Response:
 # Connection wizard routes (multi-user)
 # ---------------------------------------------------------------------------
 
+
 def _get_public_url(request: Request) -> str:
     """Get the public base URL from the request."""
     host = request.headers.get("host", "localhost:8000")
-    scheme = "https" if request.headers.get("x-forwarded-proto") == "https" or "https" in str(request.url) else "http"
+    scheme = (
+        "https"
+        if request.headers.get("x-forwarded-proto") == "https" or "https" in str(request.url)
+        else "http"
+    )
     return f"{scheme}://{host}"
 
 
 @mcp.custom_route("/connect", methods=["GET"])
 async def connect_wizard(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     base_url = _get_public_url(request)
     api_key = request.query_params.get("api_key", "")
 
-    desktop_json = '{"mcpServers": {"garmin-coach": {"command": "npx", "args": ["-y", "mcp-remote", "' + base_url + '/mcp", "--header", "X-User-API-Key:{API_KEY}"]}}}'
-    cursor_json = '{"mcpServers": {"garmin-coach": {"url": "' + base_url + '/mcp", "headers": {"X-User-API-Key": "TU_API_KEY"}}}'
+    desktop_json = (
+        '{"mcpServers": {"garmin-coach": {"command": "npx", "args": ["-y", "mcp-remote", "'
+        + base_url
+        + '/mcp", "--header", "X-User-API-Key:{API_KEY}"]}}}'
+    )
+    cursor_json = (
+        '{"mcpServers": {"garmin-coach": {"url": "'
+        + base_url
+        + '/mcp", "headers": {"X-User-API-Key": "TU_API_KEY"}}}'
+    )
 
     html = (
         '<!DOCTYPE html>\n<html lang="es"><head><meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        '<title>Conectar Garmin Coach MCP</title>\n'
-        '<style>\n'
-        '*{box-sizing:border-box;margin:0;padding:0}\n'
-        'body{font-family:system-ui,-apple-system,sans-serif;background:#0a0a0a;color:#e0e0e0;padding:20px;max-width:800px;margin:0 auto}\n'
-        'h1{color:#4ade80;margin-bottom:20px;font-size:1.8em}\n'
-        'h2{color:#60a5fa;margin:24px 0 12px;font-size:1.3em}\n'
-        '.card{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:20px;margin:16px 0}\n'
-        'pre{background:#111;padding:16px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.5;border:1px solid #333}\n'
-        'code{color:#4ade80}\n'
-        '.btn{background:#4ade80;color:#000;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-weight:600;font-size:14px}\n'
-        '.btn:hover{background:#22c55e}\n'
-        '.btn-sm{padding:6px 12px;font-size:12px}\n'
-        '.copied{background:#22c55e!important}\n'
-        '.steps{counter-reset:step}\n'
-        '.steps li{list-style:none;counter-increment:step;padding:8px 0 8px 40px;position:relative}\n'
-        '.steps li::before{content:counter(step);position:absolute;left:0;width:28px;height:28px;background:#4ade80;color:#000;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}\n'
-        '.api-key-box{background:#111;padding:12px;border-radius:8px;border:1px solid #4ade80;display:flex;justify-content:space-between;align-items:center;word-break:break-all}\n'
-        '.qr-img{background:white;padding:10px;border-radius:8px;display:inline-block}\n'
-        '</style></head><body>\n'
-        '<h1>Garmin Coach MCP - Conectar</h1>\n'
-
+        "<title>Conectar Garmin Coach MCP</title>\n"
+        "<style>\n"
+        "*{box-sizing:border-box;margin:0;padding:0}\n"
+        "body{font-family:system-ui,-apple-system,sans-serif;background:#0a0a0a;color:#e0e0e0;padding:20px;max-width:800px;margin:0 auto}\n"
+        "h1{color:#4ade80;margin-bottom:20px;font-size:1.8em}\n"
+        "h2{color:#60a5fa;margin:24px 0 12px;font-size:1.3em}\n"
+        ".card{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:20px;margin:16px 0}\n"
+        "pre{background:#111;padding:16px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.5;border:1px solid #333}\n"
+        "code{color:#4ade80}\n"
+        ".btn{background:#4ade80;color:#000;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-weight:600;font-size:14px}\n"
+        ".btn:hover{background:#22c55e}\n"
+        ".btn-sm{padding:6px 12px;font-size:12px}\n"
+        ".copied{background:#22c55e!important}\n"
+        ".steps{counter-reset:step}\n"
+        ".steps li{list-style:none;counter-increment:step;padding:8px 0 8px 40px;position:relative}\n"
+        ".steps li::before{content:counter(step);position:absolute;left:0;width:28px;height:28px;background:#4ade80;color:#000;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}\n"
+        ".api-key-box{background:#111;padding:12px;border-radius:8px;border:1px solid #4ade80;display:flex;justify-content:space-between;align-items:center;word-break:break-all}\n"
+        ".qr-img{background:white;padding:10px;border-radius:8px;display:inline-block}\n"
+        "</style></head><body>\n"
+        "<h1>Garmin Coach MCP - Conectar</h1>\n"
         '<h2>Tu API Key</h2>\n<div class="card">\n'
-        '<div class="api-key-box"><code id="apikey">' + api_key + '</code>\n'
+        '<div class="api-key-box"><code id="apikey">' + api_key + "</code>\n"
         '<button class="btn btn-sm" onclick="copyText(\'apikey\', this)">Copiar</button></div>\n'
         '<p style="margin-top:8px;color:#888;font-size:12px">Guarda esta API key. La necesitas para conectar desde cualquier cliente.</p>\n'
-        '</div>\n'
-
+        "</div>\n"
         '<h2>1. Claude Desktop (Windows/Mac/Linux)</h2>\n<div class="card">\n'
         '<ol class="steps">\n'
-        '<li>Abre Claude Desktop &gt; Settings &gt; Developer &gt; Edit Config</li>\n'
-        '<li>Copia el siguiente JSON:</li>\n</ol>\n'
-        '<pre id="desktop-config">' + _html.escape(desktop_json) + '</pre>\n'
+        "<li>Abre Claude Desktop &gt; Settings &gt; Developer &gt; Edit Config</li>\n"
+        "<li>Copia el siguiente JSON:</li>\n</ol>\n"
+        '<pre id="desktop-config">' + _html.escape(desktop_json) + "</pre>\n"
         '<button class="btn" onclick="copyEl(\'desktop-config\', this)">Copiar configuracion</button>\n'
         '<p style="margin-top:8px;color:#888;font-size:12px">Reemplaza {API_KEY} con tu API key real.</p>\n'
-        '</div>\n'
-
+        "</div>\n"
         '<h2>2. Claude.ai / Movil (Custom Connectors)</h2>\n<div class="card">\n'
         '<ol class="steps">\n'
         '<li>Abre <a href="https://claude.ai" style="color:#60a5fa">claude.ai</a> &gt; Settings &gt; Connectors</li>\n'
         '<li>Click "Add custom connector"</li>\n'
-        '<li>Pegar URL (incluye tu API key, no hace falta configurar cabeceras):</li>\n</ol>\n'
-        '<div class="api-key-box"><code>' + base_url + '/mcp?api_key=' + api_key + '</code>\n'
+        "<li>Pegar URL (incluye tu API key, no hace falta configurar cabeceras):</li>\n</ol>\n"
+        '<div class="api-key-box"><code>' + base_url + "/mcp?api_key=" + api_key + "</code>\n"
         '<button class="btn btn-sm" onclick="copyText(this.previousElementSibling, this)">Copiar URL</button></div>\n'
         '<p style="margin-top:12px;color:#888;font-size:12px">La API key viaja en la URL, así que No necesitas añadir la cabecera X-User-API-Key manualmente.</p>\n'
         '<p style="color:#888;font-size:12px;margin-top:4px">Una vez configurado, funciona en Desktop, web y movil.</p>\n'
-        '</div>\n'
-
+        "</div>\n"
         '<h2>3. Claude Code CLI</h2>\n<div class="card">\n'
-        '<pre>claude mcp add --transport http garmin-coach "' + base_url + '/mcp?api_key=' + api_key + '"</pre>\n'
+        '<pre>claude mcp add --transport http garmin-coach "'
+        + base_url
+        + "/mcp?api_key="
+        + api_key
+        + '"</pre>\n'
         '<button class="btn" onclick="copyEl(this.previousElementSibling, this)">Copiar comando</button>\n'
-        '</div>\n'
-
+        "</div>\n"
         '<h2>4. Cursor / VS Code / Windsurf</h2>\n<div class="card">\n'
-        '<pre>' + _html.escape(cursor_json) + '</pre>\n'
+        "<pre>" + _html.escape(cursor_json) + "</pre>\n"
         '<button class="btn" onclick="copyEl(this.previousElementSibling, this)">Copiar JSON</button>\n'
-        '</div>\n'
-
+        "</div>\n"
         '<h2>5. QR Code (para movil)</h2>\n<div class="card">\n'
         '<p style="margin-bottom:12px">Escanea este codigo para abrir la pagina de conexion en tu movil:</p>\n'
-        '<div class="qr-img"><img src="/api/qr?t=' + base_url + '/connect?api_key=' + api_key + '" width="200" height="200" alt="QR Code"></div>\n'
-        '</div>\n'
-
-        '<script>\n'
+        '<div class="qr-img"><img src="/api/qr?t='
+        + base_url
+        + "/connect?api_key="
+        + api_key
+        + '" width="200" height="200" alt="QR Code"></div>\n'
+        "</div>\n"
+        "<script>\n"
         'function copyText(id, btn){navigator.clipboard.writeText(typeof id==="string"?document.getElementById(id).textContent:id.textContent).then(()=>{btn.textContent="Copiado!";btn.classList.add("copied");setTimeout(()=>{btn.textContent="Copiar";btn.classList.remove("copied")},1500)})}\n'
         'function copyEl(el, btn){const t=typeof el==="string"?document.getElementById(el):el;navigator.clipboard.writeText(t.textContent).then(()=>{btn.textContent="Copiado!";btn.classList.add("copied");setTimeout(()=>{btn.textContent="Copiar";btn.classList.remove("copied")},1500)})}\n'
-        '</script></body></html>'
+        "</script></body></html>"
     )
     return HTMLResponse(html)
 
@@ -1904,10 +2207,12 @@ async def api_claude_config(request: Request) -> JSONResponse:
             "garmin-coach": {
                 "command": "npx",
                 "args": [
-                    "-y", "mcp-remote",
+                    "-y",
+                    "mcp-remote",
                     f"{base_url}/mcp",
-                    "--header", f"X-User-API-Key:{api_key}"
-                ]
+                    "--header",
+                    f"X-User-API-Key:{api_key}",
+                ],
             }
         }
     }
@@ -1917,12 +2222,14 @@ async def api_claude_config(request: Request) -> JSONResponse:
 @mcp.custom_route("/api/qr", methods=["GET"])
 async def api_qr(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     url = request.query_params.get("t", request.query_params.get("url", ""))
     if not url:
         return HTMLResponse("Missing ?t=<url>", status_code=400)
     try:
         import qrcode
         import qrcode.image.svg
+
         img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage)
         buf = io.BytesIO()
         img.save(buf)
@@ -1936,16 +2243,19 @@ async def api_qr(request: Request) -> Response:
 async def api_connection_test(request: Request) -> JSONResponse:
     api_key = request.query_params.get("api_key", "")
     user = _get_user_by_api_key(api_key) if api_key else None
-    return JSONResponse({
-        "status": "ok",
-        "mcp_endpoint": "/mcp",
-        "auth_configured": bool(api_key),
-        "user_found": user is not None,
-        "user_name": user.get("display_name") if user else None,
-    })
+    return JSONResponse(
+        {
+            "status": "ok",
+            "mcp_endpoint": "/mcp",
+            "auth_configured": bool(api_key),
+            "user_found": user is not None,
+            "user_name": user.get("display_name") if user else None,
+        }
+    )
 
 
 # Admin user management routes
+
 
 def _admin_page_html(title: str, body: str, extra_head: str = "") -> str:
     """Shared chrome for admin pages (dark / lime aesthetic)."""
@@ -1995,6 +2305,7 @@ input::placeholder{{color:var(--faint)}}
 @mcp.custom_route("/admin/users", methods=["GET"])
 async def admin_users_list(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     api_key = request.query_params.get("api_key", "")
     admin_key = ADMIN_API_KEY or api_key
     base_url = _get_public_url(request)
@@ -2009,49 +2320,59 @@ async def admin_users_list(request: Request) -> Response:
         u_key = u.get("api_key", "")
         login_link = f"{base_url}/u/login?api_key={u_key}"
         name = u.get("display_name", "") or "Sin nombre"
-        initial = (name[:1].upper() or uid[:1].upper())
+        initial = name[:1].upper() or uid[:1].upper()
         created = (u.get("created_at", "") or "")[:10]
-        has_token = (u.get("garmin_tokens_json") or "").strip() != "" or (USERS_DB_DIR / uid / "garmin_tokens.json").exists()
+        has_token = (u.get("garmin_tokens_json") or "").strip() != "" or (
+            USERS_DB_DIR / uid / "garmin_tokens.json"
+        ).exists()
         status_lbl = "Conectado" if has_token else "Pendiente"
         status_cls = "ok" if has_token else "none"
         rows += f"""<tr>
 <td><div class="avatar">{_html.escape(initial)}</div></td>
 <td><div class="user-name">{_html.escape(name)}</div></td>
 <td><span class="st {status_cls}"></span><span class="st-lbl">{status_lbl}</span></td>
-<td style="font-size:.82rem;color:var(--dim)">{created if created else '—'}</td>
+<td style="font-size:.82rem;color:var(--dim)">{created if created else "—"}</td>
 <td style="text-align:right"><a href="{_html.escape(login_link)}" class="btn secondary" style="font-size:.76rem;padding:6px 12px">Abrir perfil</a></td>
 </tr>"""
 
     empty_state = (
-        '<div class="card" style="text-align:center;padding:40px 24px">'
-        '<div style="font-size:2.4rem;margin-bottom:10px">🏃</div>'
-        '<h2 style="font-size:1.2rem">Todavía no hay corredores</h2>'
-        '<p class="card-sub" style="margin:8px auto 0;max-width:34em">'
-        'Crea un corredor con el asistente paso a paso de abajo. Recibirá su enlace personal para conectar su Garmin.</p>'
-        '</div>'
-    ) if not rows else ""
+        (
+            '<div class="card" style="text-align:center;padding:40px 24px">'
+            '<div style="font-size:2.4rem;margin-bottom:10px">🏃</div>'
+            '<h2 style="font-size:1.2rem">Todavía no hay corredores</h2>'
+            '<p class="card-sub" style="margin:8px auto 0;max-width:34em">'
+            "Crea un corredor con el asistente paso a paso de abajo. Recibirá su enlace personal para conectar su Garmin.</p>"
+            "</div>"
+        )
+        if not rows
+        else ""
+    )
 
     extra_head = (
-        '<style>'
-        'table{{width:100%;border-collapse:collapse;margin-top:8px}}'
-        'th,td{{padding:14px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:.9rem;vertical-align:middle}}'
-        'th{{color:var(--dim);font-weight:500;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em}}'
-        '.avatar{{width:36px;height:36px;border-radius:50%;background:rgba(200,241,105,.12);border:1px solid rgba(200,241,105,.25);color:var(--acc);display:grid;place-items:center;font-weight:600;font-family:\'IBM Plex Mono\',monospace;font-size:.9rem}}'
-        '.user-name{{font-weight:600}}'
-        '.st{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}}'
-        '.st.ok{{background:var(--acc);box-shadow:0 0 8px rgba(200,241,105,.6)}}'
-        '.st.none{{background:var(--faint)}}'
-        '.st-lbl{{font-size:.8rem;color:var(--dim)}}'
-        '.steps{{display:flex;flex-direction:column;gap:0;counter-reset:step;margin-top:8px}}'
-        '</style>'
+        "<style>"
+        "table{{width:100%;border-collapse:collapse;margin-top:8px}}"
+        "th,td{{padding:14px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:.9rem;vertical-align:middle}}"
+        "th{{color:var(--dim);font-weight:500;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em}}"
+        ".avatar{{width:36px;height:36px;border-radius:50%;background:rgba(200,241,105,.12);border:1px solid rgba(200,241,105,.25);color:var(--acc);display:grid;place-items:center;font-weight:600;font-family:'IBM Plex Mono',monospace;font-size:.9rem}}"
+        ".user-name{{font-weight:600}}"
+        ".st{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}}"
+        ".st.ok{{background:var(--acc);box-shadow:0 0 8px rgba(200,241,105,.6)}}"
+        ".st.none{{background:var(--faint)}}"
+        ".st-lbl{{font-size:.8rem;color:var(--dim)}}"
+        ".steps{{display:flex;flex-direction:column;gap:0;counter-reset:step;margin-top:8px}}"
+        "</style>"
     )
 
     body = (
         '<h1>Corredores <span class="acc">del club</span></h1>'
         '<p class="sub">Solo se muestra el nombre. Cada corredor accede a su email y su clave desde su perfil personal.</p>'
-        + ('<div class="card"><h2>Miembros</h2><div style="overflow-x:auto">'
-           '<table><tr><th></th><th>Nombre</th><th>Estado</th><th>Alta</th><th></th></tr>'
-           f'{rows}</table></div></div>' if rows else empty_state)
+        + (
+            '<div class="card"><h2>Miembros</h2><div style="overflow-x:auto">'
+            "<table><tr><th></th><th>Nombre</th><th>Estado</th><th>Alta</th><th></th></tr>"
+            f"{rows}</table></div></div>"
+            if rows
+            else empty_state
+        )
         + _admin_create_wizard_html()
     )
     return HTMLResponse(_admin_page_html("Admin · Corredores", body, extra_head))
@@ -2162,6 +2483,7 @@ def _admin_create_wizard_html() -> str:
 @mcp.custom_route("/admin/users/create", methods=["POST"])
 async def admin_users_create(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     key = request.query_params.get("api_key", "")
     admin_key = ADMIN_API_KEY or key
     if ADMIN_API_KEY and key != ADMIN_API_KEY:
@@ -2187,39 +2509,55 @@ async def admin_users_create(request: Request) -> Response:
             '<div style="text-align:center">'
             '<div style="font-size:2.6rem;margin-bottom:8px">🎉</div>'
             '<h2 style="font-size:1.3rem;color:var(--acc)">¡Listo! Corredor creado</h2>'
-            '<p class="card-sub" style="margin-top:6px">Envía esto a <strong>' + _html.escape(display_name) + '</strong>:</p>'
-            '</div>'
+            '<p class="card-sub" style="margin-top:6px">Envía esto a <strong>'
+            + _html.escape(display_name)
+            + "</strong>:</p>"
+            "</div>"
             '<div class="code-block" style="background:#0d120e;border:1px solid rgba(200,241,105,.25);border-radius:10px;padding:16px;margin-top:16px;text-align:left">'
             '<div style="font-size:.72rem;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Su API key</div>'
-            '<div class="mono" style="word-break:break-all;font-size:.85rem;color:var(--acc)">' + _html.escape(api_key) + '</div>'
+            '<div class="mono" style="word-break:break-all;font-size:.85rem;color:var(--acc)">'
+            + _html.escape(api_key)
+            + "</div>"
             '<button class="btn secondary" style="font-size:.78rem;padding:8px 14px;margin-top:14px" onclick="wizCopyKey()">Copiar clave</button>'
-            '</div>'
+            "</div>"
             '<div style="text-align:left;margin-top:20px;display:flex;flex-direction:column;gap:12px">'
             '<p class="hint" style="margin:0"><strong style="color:var(--fg)">Paso 1 ·</strong> Comparte tu API key.</p>'
             '<p class="hint" style="margin:0"><strong style="color:var(--fg)">Paso 2 ·</strong> El corredor entra a conectar su Garmin:</p>'
-            '<a href="' + _html.escape(panel_link) + '" class="btn secondary" style="font-size:.85rem;padding:10px 16px;justify-content:flex-start">Panel del corredor &rarr;</a>'
+            '<a href="'
+            + _html.escape(panel_link)
+            + '" class="btn secondary" style="font-size:.85rem;padding:10px 16px;justify-content:flex-start">Panel del corredor &rarr;</a>'
             '<p class="hint" style="margin:0"><strong style="color:var(--fg)">Paso 3 ·</strong> Y configura la IA con su clave:</p>'
-            '<a href="' + _html.escape(connect_link) + '" class="btn secondary" style="font-size:.85rem;padding:10px 16px;justify-content:flex-start">Asistente para conectar la IA &rarr;</a>'
-            '</div>'
+            '<a href="'
+            + _html.escape(connect_link)
+            + '" class="btn secondary" style="font-size:.85rem;padding:10px 16px;justify-content:flex-start">Asistente para conectar la IA &rarr;</a>'
+            "</div>"
         )
         return JSONResponse({"ok": True, "html": success, "api_key": api_key})
 
     # Non-JS fallback: full success page.
     body = (
         '<h1>Corredor <span class="acc">creado</span></h1>'
-        '<p class="sub">Estos son los accesos de <strong>' + _html.escape(display_name) + '</strong>. Guárdalos y compártelos.</p>'
+        '<p class="sub">Estos son los accesos de <strong>'
+        + _html.escape(display_name)
+        + "</strong>. Guárdalos y compártelos.</p>"
         '<div class="card"><h2>API key</h2>'
         '<p class="card-sub">La clave personal del corredor:</p>'
-        '<div class="mono" style="background:#0d120e;border:1px solid var(--line);border-radius:10px;padding:14px;word-break:break-all;color:var(--acc)">' + _html.escape(api_key) + '</div>'
-        '</div>'
+        '<div class="mono" style="background:#0d120e;border:1px solid var(--line);border-radius:10px;padding:14px;word-break:break-all;color:var(--acc)">'
+        + _html.escape(api_key)
+        + "</div>"
+        "</div>"
         '<div class="card"><h2>Enlace de su panel</h2>'
         '<p class="card-sub">Para conectar su Garmin y ver su estado:</p>'
-        '<a class="btn block" href="' + _html.escape(panel_link) + '" style="text-decoration:none">Abrir panel del corredor</a>'
-        '</div>'
+        '<a class="btn block" href="'
+        + _html.escape(panel_link)
+        + '" style="text-decoration:none">Abrir panel del corredor</a>'
+        "</div>"
         '<div class="card"><h2>Conectar la IA</h2>'
         '<p class="card-sub">Para configurar Claude / Cursor / móvil:</p>'
-        '<a class="btn block secondary" href="' + _html.escape(connect_link) + '" style="text-decoration:none">Asistente de conexión</a>'
-        '</div>'
+        '<a class="btn block secondary" href="'
+        + _html.escape(connect_link)
+        + '" style="text-decoration:none">Asistente de conexión</a>'
+        "</div>"
         '<a href="/admin/users" class="btn secondary" style="margin-top:8px;text-decoration:none">&larr; Volver a usuarios</a>'
     )
     return HTMLResponse(_admin_page_html("Usuario creado", body))
@@ -2229,6 +2567,7 @@ async def admin_users_create(request: Request) -> Response:
 # Per-user web panel (API-key based) + Garmin connection wizard
 # ---------------------------------------------------------------------------
 
+
 def _require_user(request: Request):
     """Return the authenticated user from the user_api_key cookie, or None."""
     return _request_user(request)
@@ -2236,9 +2575,9 @@ def _require_user(request: Request):
 
 def _user_unauthorized_html() -> str:
     body = (
-        '<h1>Necesitas identificarte</h1>'
+        "<h1>Necesitas identificarte</h1>"
         '<p class="muted">Abre el enlace de conexión que te han enviado '
-        '(contiene tu <code>api_key</code>) para acceder a tu panel.</p>'
+        "(contiene tu <code>api_key</code>) para acceder a tu panel.</p>"
     )
     return _login_render_page("Login", None, body)
 
@@ -2247,6 +2586,7 @@ def _user_unauthorized_html() -> str:
 async def user_login_start(request: Request) -> Response:
     """Authenticate a user by API key (from URL) and set their session cookie."""
     from starlette.responses import HTMLResponse, RedirectResponse
+
     api_key = request.query_params.get("api_key", "").strip()
     if not api_key:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2261,6 +2601,7 @@ async def user_login_start(request: Request) -> Response:
 @mcp.custom_route("/panel", methods=["GET"])
 async def user_panel(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     user = _require_user(request)
     if not user:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2269,7 +2610,7 @@ async def user_panel(request: Request) -> Response:
     api_key = user.get("api_key", "")
     display_name = user.get("display_name", "") or user_id
     garmin_email = user.get("garmin_email", "")
-    initial = (display_name[:1].upper() or "?")
+    initial = display_name[:1].upper() or "?"
 
     token_file = _user_token_file(user_id)
     connected = token_file.exists()
@@ -2277,17 +2618,21 @@ async def user_panel(request: Request) -> Response:
     connect_url = f"{public_url}/connect?api_key={api_key}"
 
     status_html = (
-        ('<div class="p-status ok">'
-         '<span class="p-dot"></span>'
-         '<div><div class="p-st-title">Garmin conectado</div>'
-         '<div class="p-st-sub">' + _html.escape(garmin_email or "—") + '</div></div>'
-         '</div>')
+        (
+            '<div class="p-status ok">'
+            '<span class="p-dot"></span>'
+            '<div><div class="p-st-title">Garmin conectado</div>'
+            '<div class="p-st-sub">' + _html.escape(garmin_email or "—") + "</div></div>"
+            "</div>"
+        )
         if connected
-        else ('<div class="p-status none">'
-              '<span class="p-dot"></span>'
-              '<div><div class="p-st-title">Garmin sin conectar</div>'
-              '<div class="p-st-sub">Conecta tu cuenta para que la IA pueda leer tus datos.</div></div>'
-              '</div>')
+        else (
+            '<div class="p-status none">'
+            '<span class="p-dot"></span>'
+            '<div><div class="p-st-title">Garmin sin conectar</div>'
+            '<div class="p-st-sub">Conecta tu cuenta para que la IA pueda leer tus datos.</div></div>'
+            "</div>"
+        )
     )
 
     connect_btn = (
@@ -2301,76 +2646,78 @@ async def user_panel(request: Request) -> Response:
         f'<div class="p-avatar">{_html.escape(initial)}</div>'
         '<div><div class="p-hi">Hola,</div>'
         f'<h1 class="p-name">{_html.escape(display_name)}</h1></div>'
-        '</div>'
-
+        "</div>"
         '<div class="p-section-label">Tu cuenta Garmin</div>'
         + status_html
-        + '<div style="margin-top:14px">' + connect_btn + '</div>'
-
+        + '<div style="margin-top:14px">'
+        + connect_btn
+        + "</div>"
         '<div class="p-section-label">Tu credencial de acceso</div>'
         '<div class="p-card">'
         '<p class="p-card-sub">Esta API key es personal y es tuya. Solo se muestra aquí, '
-        'para tu acceso; no la compartas.</p>'
+        "para tu acceso; no la compartas.</p>"
         '<div class="p-key-row">'
         '<code class="p-key" id="apikey">••••••••••••••••••••</code>'
         '<button type="button" class="p-btn p-btn-sm" id="showKey" '
         'onclick="toggleKey()">Ver clave</button>'
         '<button type="button" class="p-btn p-btn-sm p-btn-dull" id="copyKey" '
         'onclick="copyKey()" style="display:none">Copiar</button>'
-        '</div>'
-        '</div>'
-
+        "</div>"
+        "</div>"
         '<div class="p-section-label">Conectar la IA</div>'
         '<div class="p-card">'
         '<p class="p-card-sub">Abre el asistente para configurar Claude Desktop, el móvil o Cursor '
-        'con tu cuenta.</p>'
+        "con tu cuenta.</p>"
         f'<a href="{_html.escape(connect_url)}" class="p-btn">Abrir asistente de conexión</a>'
         '<button type="button" class="p-btn p-btn-dull" id="copyLink" '
         'onclick="copyLink()">Copiar link de conexión</button>'
-        '</div>'
-
+        "</div>"
         '<div style="margin-top:28px;text-align:center">'
         '<a href="/logout" class="p-link">Cerrar sesión</a>'
-        '</div>'
+        "</div>"
     )
 
     extra_head = (
-        '<style>'
-        ':root{--acc:#c8f169;--acc-dim:#8fa84e;--bg:#0a0d0b;--panel:#111710;--line:#1e2820;--fg:#e6ede8;--dim:#93a399;--faint:#5d6b63}'
-        '.wrap{max-width:560px}'
-        '.p-head{display:flex;align-items:center;gap:16px;margin-bottom:8px}'
-        '.p-avatar{width:52px;height:52px;border-radius:14px;background:rgba(200,241,105,.12);border:1px solid rgba(200,241,105,.28);color:var(--acc);display:grid;place-items:center;font-weight:700;font-family:\'IBM Plex Mono\',monospace;font-size:1.3rem;flex:none}'
-        '.p-hi{color:var(--dim);font-size:.85rem;margin-bottom:2px}'
-        '.p-name{margin:0;font-size:1.6rem}'
-        '.p-section-label{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);font-weight:600;margin:30px 0 10px}'
-        '.p-status{display:flex;align-items:center;gap:12px;border-radius:12px;padding:14px 16px;border:1px solid var(--line);background:var(--panel)}'
-        '.p-status .p-dot{width:11px;height:11px;border-radius:50%;flex:none}'
-        '.p-status.ok .p-dot{background:var(--acc);box-shadow:0 0 10px rgba(200,241,105,.6)}'
-        '.p-status.none .p-dot{background:#5d6b63}'
-        '.p-st-title{font-weight:600;font-size:.98rem;color:var(--fg)}'
-        '.p-st-sub{color:var(--dim);font-size:.8rem;margin-top:2px;word-break:break-word}'
-        '.p-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}'
-        '.p-card-sub{color:var(--dim);font-size:.82rem;margin:0 0 14px;line-height:1.5}'
-        '.p-key-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}'
-        '.p-key{background:#0d120e;border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-family:\'IBM Plex Mono\',monospace;font-size:.82rem;color:var(--acc);flex:1;min-width:150px;word-break:break-all}'
-        '.p-btn{display:inline-block;background:var(--acc);color:#0a0d0b;text-decoration:none;font-weight:600;border:none;border-radius:10px;padding:12px 18px;font-size:.95rem;cursor:pointer;font-family:inherit;margin:0 6px 8px 0;transition:filter .15s;width:auto;line-height:1.4}'
-        '.p-btn:hover{filter:brightness(1.08)}'
-        '.p-btn-sm{padding:9px 14px;font-size:.82rem;margin-top:0}'
-        '.p-btn-dull{background:transparent;color:var(--fg);border:1px solid var(--line);margin-top:2px}'
-        '.p-btn-dull:hover{border-color:var(--acc);color:var(--acc);filter:none}'
-        '.p-link{color:var(--dim);font-size:.88rem;text-decoration:none}'
-        '.p-link:hover{color:var(--acc)}'
-        '</style>'
-        '<script>'
-        'var _key=' + _js_json(api_key) + ';'
-        'var _shown=false;'
-        'function toggleKey(){var el=document.getElementById(\'apikey\');var copyBtn=document.getElementById(\'copyKey\');'
-        '_shown=!_shown;el.textContent=_shown?_key:\'••••••••••••••••••••\';'
-        'document.getElementById(\'showKey\').textContent=_shown?\'Ocultar\':\'Ver clave\';'
-        'copyBtn.style.display=_shown?\'inline-block\':\'none\';}'
-        'function copyKey(){navigator.clipboard.writeText(_key).then(function(){document.getElementById(\'copyKey\').textContent=\'Copiada ✓\';setTimeout(function(){document.getElementById(\'copyKey\').textContent=\'Copiar\'},1500)}).catch(function(){prompt(\'Copia tu clave manualmente:\',_key)})}'
-        'function copyLink(){navigator.clipboard.writeText(' + _js_json(connect_url) + ').then(function(){var b=document.getElementById(\'copyLink\');b.textContent=\'Copiado ✓\';setTimeout(function(){b.textContent=\'Copiar link de conexión\'},1500)}).catch(function(){prompt(\'Copia el enlace:\',' + _js_json(connect_url) + ')})}'
-        '</script>'
+        "<style>"
+        ":root{--acc:#c8f169;--acc-dim:#8fa84e;--bg:#0a0d0b;--panel:#111710;--line:#1e2820;--fg:#e6ede8;--dim:#93a399;--faint:#5d6b63}"
+        ".wrap{max-width:560px}"
+        ".p-head{display:flex;align-items:center;gap:16px;margin-bottom:8px}"
+        ".p-avatar{width:52px;height:52px;border-radius:14px;background:rgba(200,241,105,.12);border:1px solid rgba(200,241,105,.28);color:var(--acc);display:grid;place-items:center;font-weight:700;font-family:'IBM Plex Mono',monospace;font-size:1.3rem;flex:none}"
+        ".p-hi{color:var(--dim);font-size:.85rem;margin-bottom:2px}"
+        ".p-name{margin:0;font-size:1.6rem}"
+        ".p-section-label{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);font-weight:600;margin:30px 0 10px}"
+        ".p-status{display:flex;align-items:center;gap:12px;border-radius:12px;padding:14px 16px;border:1px solid var(--line);background:var(--panel)}"
+        ".p-status .p-dot{width:11px;height:11px;border-radius:50%;flex:none}"
+        ".p-status.ok .p-dot{background:var(--acc);box-shadow:0 0 10px rgba(200,241,105,.6)}"
+        ".p-status.none .p-dot{background:#5d6b63}"
+        ".p-st-title{font-weight:600;font-size:.98rem;color:var(--fg)}"
+        ".p-st-sub{color:var(--dim);font-size:.8rem;margin-top:2px;word-break:break-word}"
+        ".p-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}"
+        ".p-card-sub{color:var(--dim);font-size:.82rem;margin:0 0 14px;line-height:1.5}"
+        ".p-key-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}"
+        ".p-key{background:#0d120e;border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:.82rem;color:var(--acc);flex:1;min-width:150px;word-break:break-all}"
+        ".p-btn{display:inline-block;background:var(--acc);color:#0a0d0b;text-decoration:none;font-weight:600;border:none;border-radius:10px;padding:12px 18px;font-size:.95rem;cursor:pointer;font-family:inherit;margin:0 6px 8px 0;transition:filter .15s;width:auto;line-height:1.4}"
+        ".p-btn:hover{filter:brightness(1.08)}"
+        ".p-btn-sm{padding:9px 14px;font-size:.82rem;margin-top:0}"
+        ".p-btn-dull{background:transparent;color:var(--fg);border:1px solid var(--line);margin-top:2px}"
+        ".p-btn-dull:hover{border-color:var(--acc);color:var(--acc);filter:none}"
+        ".p-link{color:var(--dim);font-size:.88rem;text-decoration:none}"
+        ".p-link:hover{color:var(--acc)}"
+        "</style>"
+        "<script>"
+        "var _key=" + _js_json(api_key) + ";"
+        "var _shown=false;"
+        "function toggleKey(){var el=document.getElementById('apikey');var copyBtn=document.getElementById('copyKey');"
+        "_shown=!_shown;el.textContent=_shown?_key:'••••••••••••••••••••';"
+        "document.getElementById('showKey').textContent=_shown?'Ocultar':'Ver clave';"
+        "copyBtn.style.display=_shown?'inline-block':'none';}"
+        "function copyKey(){navigator.clipboard.writeText(_key).then(function(){document.getElementById('copyKey').textContent='Copiada ✓';setTimeout(function(){document.getElementById('copyKey').textContent='Copiar'},1500)}).catch(function(){prompt('Copia tu clave manualmente:',_key)})}"
+        "function copyLink(){navigator.clipboard.writeText("
+        + _js_json(connect_url)
+        + ").then(function(){var b=document.getElementById('copyLink');b.textContent='Copiado ✓';setTimeout(function(){b.textContent='Copiar link de conexión'},1500)}).catch(function(){prompt('Copia el enlace:',"
+        + _js_json(connect_url)
+        + ")})}"
+        "</script>"
     )
     return HTMLResponse(_login_render_page("Mi panel", None, body, extra_head=extra_head))
 
@@ -2378,6 +2725,7 @@ async def user_panel(request: Request) -> Response:
 @mcp.custom_route("/logout", methods=["GET"])
 async def user_logout(request: Request) -> Response:
     from starlette.responses import RedirectResponse
+
     resp = RedirectResponse("/u/login", status_code=303)
     resp.delete_cookie("user_api_key", samesite="strict")
     return resp
@@ -2386,51 +2734,55 @@ async def user_logout(request: Request) -> Response:
 @mcp.custom_route("/login-usuario", methods=["GET"])
 async def user_email_login(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     already = _request_user(request)
     if already:
         return RedirectResponse("/panel", status_code=303)
     error = ""
     body = (
-        '<h1>Entrar con tu email</h1>'
+        "<h1>Entrar con tu email</h1>"
         '<p class="p-sub">Si ya tienes cuenta en el club, escribe el email con el que '
-        'conectaste tu Garmin y accede a tu perfil.</p>'
-        + ('<div class="p-alert">' + _html.escape(error) + '</div>' if error else '')
+        "conectaste tu Garmin y accede a tu perfil.</p>"
+        + ('<div class="p-alert">' + _html.escape(error) + "</div>" if error else "")
         + '<form method="POST" action="/login-usuario">'
         '<label for="lemail">Tu email</label>'
         '<input id="lemail" name="email" type="email" autocomplete="email" required autofocus>'
         '<button type="submit" class="p-btn p-btn-block" style="margin-top:24px">Entrar en mi perfil</button>'
-        '</form>'
+        "</form>"
         '<p style="margin-top:20px;text-align:center" class="p-hint">'
-        '¿No recuerdas tu email? Pide al administrador tu enlace de acceso personal.</p>'
+        "¿No recuerdas tu email? Pide al administrador tu enlace de acceso personal.</p>"
     )
     extra_head = (
-        '<style>'
-        ':root{--acc:#c8f169;--bg:#0a0d0b;--panel:#111710;--line:#1e2820;--dim:#93a399;--faint:#5d6b63}'
-        '.wrap{max-width:460px}'
-        '.p-sub{color:var(--dim);font-size:.9rem;margin:0 0 6px}'
-        '.p-alert{background:rgba(255,69,58,.12);color:#ff6961;border:1px solid rgba(255,69,58,.3);border-radius:10px;padding:12px 14px;font-size:.85rem;margin:12px 0}'
-        '.p-btn-block{display:block;width:100%;text-align:center}'
-        '.p-hint{color:var(--faint);font-size:.8rem}'
-        '</style>'
+        "<style>"
+        ":root{--acc:#c8f169;--bg:#0a0d0b;--panel:#111710;--line:#1e2820;--dim:#93a399;--faint:#5d6b63}"
+        ".wrap{max-width:460px}"
+        ".p-sub{color:var(--dim);font-size:.9rem;margin:0 0 6px}"
+        ".p-alert{background:rgba(255,69,58,.12);color:#ff6961;border:1px solid rgba(255,69,58,.3);border-radius:10px;padding:12px 14px;font-size:.85rem;margin:12px 0}"
+        ".p-btn-block{display:block;width:100%;text-align:center}"
+        ".p-hint{color:var(--faint);font-size:.8rem}"
+        "</style>"
     )
-    return HTMLResponse(_login_render_page("Entrar en mi perfil", None, body, extra_head=extra_head))
+    return HTMLResponse(
+        _login_render_page("Entrar en mi perfil", None, body, extra_head=extra_head)
+    )
 
 
 @mcp.custom_route("/login-usuario", methods=["POST"])
 async def user_email_login_post(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     form = await request.form()
     email = (form.get("email") or "").strip()
     user = _find_user_by_email(email)
     if not user:
         body = (
-            '<h1>No encontramos ese email</h1>'
+            "<h1>No encontramos ese email</h1>"
             '<p class="muted">No hay ningún corredor del club registrado con '
-            '<code>' + _html.escape(email) + '</code>.</p>'
+            "<code>" + _html.escape(email) + "</code>.</p>"
             '<div style="margin-top:16px">'
             '<a href="/login-usuario"><button type="button">Probar otro email</button></a> '
             '<a href="/" style="color:#60a5fa">← Volver a la página principal</a>'
-            '</div>'
+            "</div>"
         )
         return HTMLResponse(_login_render_page("Email no encontrado", None, body), status_code=404)
 
@@ -2442,21 +2794,22 @@ async def user_email_login_post(request: Request) -> Response:
 @mcp.custom_route("/garmin-connect", methods=["GET"])
 async def garmin_connect_form(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     user = _require_user(request)
     if not user:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
 
     body = (
-        '<h1>Conectar con Garmin</h1>'
+        "<h1>Conectar con Garmin</h1>"
         '<p class="muted">Introduce las credenciales de tu cuenta Garmin Connect. '
-        'Luego te pediremos el código MFA que enviamos a tu Gmail.</p>'
+        "Luego te pediremos el código MFA que enviamos a tu Gmail.</p>"
         '<form method="POST" action="/garmin-connect/submit">'
         '<label for="email">Email Garmin</label>'
         '<input id="email" name="email" type="email" autocomplete="username" required autofocus>'
         '<label for="password">Contraseña</label>'
-        + _password_input_html("password", "password", autocomplete="current-password") +
-        '<button type="submit">Siguiente</button>'
-        '</form>'
+        + _password_input_html("password", "password", autocomplete="current-password")
+        + '<button type="submit">Siguiente</button>'
+        "</form>"
         '<p style="margin-top:8px"><a href="/panel" style="color:#60a5fa">← Volver a mi panel</a></p>'
     )
     return HTMLResponse(_login_render_page("Conectar Garmin · paso 1", 1, body))
@@ -2465,6 +2818,7 @@ async def garmin_connect_form(request: Request) -> Response:
 @mcp.custom_route("/garmin-connect/submit", methods=["POST"])
 async def garmin_connect_submit(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     user = _require_user(request)
     if not user:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2474,7 +2828,7 @@ async def garmin_connect_submit(request: Request) -> Response:
     password = (form.get("password") or "").strip()
     if not email or not password:
         body = (
-            '<h1>Faltan datos</h1>'
+            "<h1>Faltan datos</h1>"
             '<div class="error">Email o contraseña vacíos.</div>'
             '<a href="/garmin-connect">← Volver</a>'
         )
@@ -2511,6 +2865,7 @@ async def garmin_connect_submit(request: Request) -> Response:
 @mcp.custom_route("/garmin-connect/wait", methods=["GET"])
 async def garmin_connect_wait(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     user = _require_user(request)
     if not user:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2519,7 +2874,7 @@ async def garmin_connect_wait(request: Request) -> Response:
     session = _login_get_session(session_id)
     if not session or session.get("user_id") != user["id"]:
         body = (
-            '<h1>Sesión caducada</h1>'
+            "<h1>Sesión caducada</h1>"
             '<p class="muted">Esta sesión de conexión expiró.</p>'
             '<a href="/garmin-connect">← Empezar de nuevo</a>'
         )
@@ -2532,7 +2887,7 @@ async def garmin_connect_wait(request: Request) -> Response:
         return RedirectResponse(f"/garmin-connect/result?session={session_id}", status_code=303)
 
     body = (
-        '<h2>Conectando con Garmin…</h2>'
+        "<h2>Conectando con Garmin…</h2>"
         '<p class="muted">Estamos solicitando el código MFA. Revisa tu Gmail en unos segundos.</p>'
         '<div class="spinner" aria-hidden="true"></div>'
         '<p class="muted" style="text-align:center;font-size:13px">Esta página se actualizará sola.</p>'
@@ -2543,6 +2898,7 @@ async def garmin_connect_wait(request: Request) -> Response:
 @mcp.custom_route("/garmin-connect/mfa", methods=["GET"])
 async def garmin_connect_mfa_form(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     user = _require_user(request)
     if not user:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2551,7 +2907,7 @@ async def garmin_connect_mfa_form(request: Request) -> Response:
     session = _login_get_session(session_id)
     if not session or session.get("user_id") != user["id"]:
         body = (
-            '<h1>Sesión caducada</h1>'
+            "<h1>Sesión caducada</h1>"
             '<p class="muted">Esta sesión expiró.</p>'
             '<a href="/garmin-connect">← Empezar de nuevo</a>'
         )
@@ -2565,7 +2921,7 @@ async def garmin_connect_mfa_form(request: Request) -> Response:
 
     sid_safe = _html.escape(session_id)
     body = (
-        '<h2>Código de verificación</h2>'
+        "<h2>Código de verificación</h2>"
         '<p class="muted">Hemos pedido a Garmin que te envíe un código de 6 dígitos al Gmail. Revisa la bandeja de entrada y pégalo aquí.</p>'
         '<form method="POST" action="/garmin-connect/mfa">'
         f'<input type="hidden" name="session" value="{sid_safe}">'
@@ -2573,7 +2929,7 @@ async def garmin_connect_mfa_form(request: Request) -> Response:
         '<input id="code" name="code" type="text" inputmode="numeric" pattern="[0-9]*" '
         'autocomplete="one-time-code" maxlength="10" required autofocus>'
         '<button type="submit">Siguiente</button>'
-        '</form>'
+        "</form>"
     )
     return HTMLResponse(_login_render_page("Conectar Garmin · paso 2", 2, body))
 
@@ -2581,6 +2937,7 @@ async def garmin_connect_mfa_form(request: Request) -> Response:
 @mcp.custom_route("/garmin-connect/mfa", methods=["POST"])
 async def garmin_connect_mfa_submit(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     user = _require_user(request)
     if not user:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2591,7 +2948,7 @@ async def garmin_connect_mfa_submit(request: Request) -> Response:
     session = _login_get_session(session_id)
     if not session or session.get("user_id") != user["id"]:
         body = (
-            '<h1>Sesión caducada</h1>'
+            "<h1>Sesión caducada</h1>"
             '<p class="muted">Esta sesión expiró.</p>'
             '<a href="/garmin-connect">← Empezar de nuevo</a>'
         )
@@ -2607,6 +2964,7 @@ async def garmin_connect_mfa_submit(request: Request) -> Response:
 @mcp.custom_route("/garmin-connect/result", methods=["GET"])
 async def garmin_connect_result(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     user = _require_user(request)
     if not user:
         return HTMLResponse(_user_unauthorized_html(), status_code=401)
@@ -2615,8 +2973,8 @@ async def garmin_connect_result(request: Request) -> Response:
     session = _login_get_session(session_id)
     if not session or session.get("user_id") != user["id"]:
         body = (
-            '<h1>✅ Garmin conectado</h1>'
-            '<p>Tu cuenta Garmin ya quedó guardada.</p>'
+            "<h1>✅ Garmin conectado</h1>"
+            "<p>Tu cuenta Garmin ya quedó guardada.</p>"
             '<a href="/panel"><button type="button">Ir a mi panel</button></a>'
         )
         return HTMLResponse(_login_render_page("Completado", None, body))
@@ -2624,7 +2982,7 @@ async def garmin_connect_result(request: Request) -> Response:
     status = session.get("status", "starting")
     if status not in ("success", "error"):
         body = (
-            '<h2>Procesando…</h2>'
+            "<h2>Procesando…</h2>"
             '<p class="muted">Validando el código MFA con Garmin. Aguanta un momento.</p>'
             '<div class="spinner" aria-hidden="true"></div>'
         )
@@ -2633,7 +2991,7 @@ async def garmin_connect_result(request: Request) -> Response:
     if status == "error":
         err = _html.escape(session.get("error") or "Error desconocido")
         body = (
-            '<h1>Algo falló</h1>'
+            "<h1>Algo falló</h1>"
             f'<div class="error">{err}</div>'
             '<p class="muted">Causas típicas: contraseña incorrecta, código MFA caducado, o Garmin pidiendo CAPTCHA. Prueba de nuevo.</p>'
             '<a href="/garmin-connect"><button type="button">Empezar de nuevo</button></a>'
@@ -2647,18 +3005,21 @@ async def garmin_connect_result(request: Request) -> Response:
         _update_user(user["id"], garmin_email=connected_email)
     _login_drop_session(session_id)
     body = (
-        '<h1>✅ ¡Garmin conectado!</h1>'
+        "<h1>✅ ¡Garmin conectado!</h1>"
         '<div class="success">Tu cuenta de Garmin quedó guardada en tu perfil. '
-        'La IA ya puede leer tus datos de entrenamiento.</div>'
+        "La IA ya puede leer tus datos de entrenamiento.</div>"
         '<div style="margin-top:16px">'
         '<a href="/panel"><button type="button">Ir a mi panel</button></a> '
-        '<a href="/connect?api_key=' + _html.escape(user.get("api_key", "")) + '"><button type="button" class="secondary">Configurar la IA</button></a>'
-        '</div>'
+        '<a href="/connect?api_key='
+        + _html.escape(user.get("api_key", ""))
+        + '"><button type="button" class="secondary">Configurar la IA</button></a>'
+        "</div>"
     )
     return HTMLResponse(_login_render_page("Listo", 3, body))
 
 
 # Continue with existing routes
+
 
 @mcp.custom_route("/download/{activity_id}", methods=["GET"])
 async def download_activity_fit(request: Request) -> Response:
@@ -2670,11 +3031,19 @@ async def download_activity_fit(request: Request) -> Response:
             api = _get_api()
             data = None
             fmt_name = "zip"
-            for fmt in [api.ActivityDownloadFormat.ORIGINAL, api.ActivityDownloadFormat.TCX, api.ActivityDownloadFormat.GPX]:
+            for fmt in [
+                api.ActivityDownloadFormat.ORIGINAL,
+                api.ActivityDownloadFormat.TCX,
+                api.ActivityDownloadFormat.GPX,
+            ]:
                 try:
                     data = api.download_activity(activity_id, fmt)
                     if data:
-                        fmt_name = "zip" if fmt == api.ActivityDownloadFormat.ORIGINAL else fmt.name.lower()
+                        fmt_name = (
+                            "zip"
+                            if fmt == api.ActivityDownloadFormat.ORIGINAL
+                            else fmt.name.lower()
+                        )
                         break
                 except Exception:
                     continue
@@ -2682,13 +3051,21 @@ async def download_activity_fit(request: Request) -> Response:
             return Response(
                 content=data,
                 media_type="application/octet-stream",
-                headers={"Content-Disposition": f'attachment; filename="activity_{activity_id}.{fmt_name}"'},
+                headers={
+                    "Content-Disposition": f'attachment; filename="activity_{activity_id}.{fmt_name}"'
+                },
             )
     except Exception:
         pass
 
     panel_url_dl = SELF_PUBLIC_URL or "el panel del servidor"
-    return JSONResponse({"error": "Sesión de Garmin caducada", "fix": f"Abre {panel_url_dl} en tu navegador y entra en 'Re-loguear Garmin' (tarda 1 minuto)."}, status_code=503)
+    return JSONResponse(
+        {
+            "error": "Sesión de Garmin caducada",
+            "fix": f"Abre {panel_url_dl} en tu navegador y entra en 'Re-loguear Garmin' (tarda 1 minuto).",
+        },
+        status_code=503,
+    )
 
 
 # Optional fallback to another running instance when local tokens fail. Empty by
@@ -2759,13 +3136,16 @@ async def get_config_share(request: Request) -> JSONResponse:
 
 _ADJ_DIR = DATA_ROOT / "adj"
 
+
 def _disk_usage():
     try:
         import shutil
+
         du = shutil.disk_usage(_ADJ_DIR if _ADJ_DIR.exists() else DATA_ROOT)
         return {"total": du.total, "used": du.used, "free": du.free}
     except Exception:
         return None
+
 
 @mcp.custom_route("/adj", methods=["GET"])
 async def list_adj(request: Request) -> JSONResponse:
@@ -2777,10 +3157,25 @@ async def list_adj(request: Request) -> JSONResponse:
         if f.suffix == ".json":
             try:
                 data = json.loads(f.read_text())
-                files.append({"id": f.stem, "data": data, "modified": f.stat().st_mtime, "size": f.stat().st_size})
+                files.append(
+                    {
+                        "id": f.stem,
+                        "data": data,
+                        "modified": f.stat().st_mtime,
+                        "size": f.stat().st_size,
+                    }
+                )
             except Exception:
-                files.append({"id": f.stem, "data": None, "modified": f.stat().st_mtime, "size": f.stat().st_size})
+                files.append(
+                    {
+                        "id": f.stem,
+                        "data": None,
+                        "modified": f.stat().st_mtime,
+                        "size": f.stat().st_size,
+                    }
+                )
     return JSONResponse({"files": files, "storage": storage})
+
 
 @mcp.custom_route("/adj", methods=["DELETE"])
 async def delete_all_adj(request: Request) -> JSONResponse:
@@ -2796,6 +3191,7 @@ async def delete_all_adj(request: Request) -> JSONResponse:
                 pass
     return JSONResponse({"ok": True, "deleted": count})
 
+
 @mcp.custom_route("/adj/{act_id}", methods=["DELETE"])
 async def delete_adj(request: Request) -> JSONResponse:
     act_id = request.path_params.get("act_id", "")
@@ -2810,6 +3206,7 @@ async def delete_adj(request: Request) -> JSONResponse:
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
+
 @mcp.custom_route("/adj/{act_id}", methods=["GET"])
 async def get_adj(request: Request) -> JSONResponse:
     act_id = request.path_params.get("act_id", "")
@@ -2822,6 +3219,7 @@ async def get_adj(request: Request) -> JSONResponse:
         return JSONResponse(json.loads(adj_file.read_text()))
     except Exception:
         return JSONResponse({})
+
 
 @mcp.custom_route("/adj/{act_id}", methods=["POST"])
 async def save_adj(request: Request) -> JSONResponse:
@@ -2843,7 +3241,7 @@ async def list_activities_web(request: Request) -> JSONResponse:
     limit = int(request.query_params.get("limit", "30"))
     limit = max(1, min(500, limit))
     start_date = request.query_params.get("start_date", "").strip()  # YYYY-MM-DD
-    end_date = request.query_params.get("end_date", "").strip()      # YYYY-MM-DD
+    end_date = request.query_params.get("end_date", "").strip()  # YYYY-MM-DD
 
     def _normalize(a: dict) -> dict:
         activity_type = a.get("activityType") or {}
@@ -2876,7 +3274,13 @@ async def list_activities_web(request: Request) -> JSONResponse:
         pass
 
     panel_url = SELF_PUBLIC_URL or "el panel del servidor"
-    return JSONResponse({"error": "Sesión de Garmin caducada", "fix": f"Abre {panel_url} en tu navegador y entra en 'Re-loguear Garmin' (tarda 1 minuto)."}, status_code=503)
+    return JSONResponse(
+        {
+            "error": "Sesión de Garmin caducada",
+            "fix": f"Abre {panel_url} en tu navegador y entra en 'Re-loguear Garmin' (tarda 1 minuto).",
+        },
+        status_code=503,
+    )
 
 
 @mcp.custom_route("/debug/audit", methods=["GET"])
@@ -2952,7 +3356,9 @@ async def debug_activities(_: Request) -> JSONResponse:
                 "activityId": a.get("activityId"),
                 "activityName": a.get("activityName"),
                 "startTimeLocal": a.get("startTimeLocal"),
-                "activityType": a.get("activityType", {}).get("typeKey") if isinstance(a.get("activityType"), dict) else None,
+                "activityType": a.get("activityType", {}).get("typeKey")
+                if isinstance(a.get("activityType"), dict)
+                else None,
             }
             for a in activities[:5]
         ]
@@ -2966,31 +3372,29 @@ async def debug_activities(_: Request) -> JSONResponse:
 
 
 def _login_unauthorized_html() -> str:
-    body = (
-        '<h1>404</h1>'
-        '<p class="muted">Página no encontrada.</p>'
-    )
+    body = '<h1>404</h1><p class="muted">Página no encontrada.</p>'
     return _login_render_page("404", None, body)
 
 
 @mcp.custom_route("/login", methods=["GET"])
 async def login_start(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     if not _login_admin_ok(request):
         return HTMLResponse(_login_unauthorized_html(), status_code=404)
 
     _login_cleanup_expired_sessions()
 
     body = (
-        '<h1>Re-login Garmin</h1>'
+        "<h1>Re-login Garmin</h1>"
         '<p class="muted">Vamos a renovar los tokens. Necesitas tu email, contraseña y el código MFA que llegará al Gmail.</p>'
         '<form method="POST" action="/login/submit">'
         '<label for="email">Email Garmin</label>'
         '<input id="email" name="email" type="email" autocomplete="username" required autofocus>'
         '<label for="password">Contraseña</label>'
-        + _password_input_html("password", "password", autocomplete="current-password") +
-        '<button type="submit">Siguiente</button>'
-        '</form>'
+        + _password_input_html("password", "password", autocomplete="current-password")
+        + '<button type="submit">Siguiente</button>'
+        "</form>"
     )
     response = HTMLResponse(_login_render_page("Re-login Garmin · paso 1", 1, body))
     active_token = _login_active_token(request)
@@ -3002,6 +3406,7 @@ async def login_start(request: Request) -> Response:
 @mcp.custom_route("/login/submit", methods=["POST"])
 async def login_submit(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     if not _login_admin_ok(request):
         return HTMLResponse(_login_unauthorized_html(), status_code=404)
 
@@ -3010,7 +3415,7 @@ async def login_submit(request: Request) -> Response:
     password = (form.get("password") or "").strip()
     if not email or not password:
         body = (
-            '<h1>Faltan datos</h1>'
+            "<h1>Faltan datos</h1>"
             '<div class="error">Email o contraseña vacíos.</div>'
             '<a href="/login">← Volver</a>'
         )
@@ -3045,6 +3450,7 @@ async def login_submit(request: Request) -> Response:
 @mcp.custom_route("/login/wait", methods=["GET"])
 async def login_wait(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     # Authorization here is the session id itself (a 144-bit secret created by an
     # authorized /login/submit). The admin/bootstrap token may already be gone by
     # the time we reach the later steps, so we must NOT gate on it.
@@ -3052,7 +3458,7 @@ async def login_wait(request: Request) -> Response:
     session = _login_get_session(session_id)
     if not session:
         body = (
-            '<h1>Sesión caducada</h1>'
+            "<h1>Sesión caducada</h1>"
             '<p class="muted">Esta sesión de login expiró. Vuelve a empezar.</p>'
             '<a href="/login">← Empezar de nuevo</a>'
         )
@@ -3065,25 +3471,24 @@ async def login_wait(request: Request) -> Response:
         return RedirectResponse(f"/login/result?session={session_id}", status_code=303)
 
     body = (
-        '<h2>Conectando con Garmin…</h2>'
+        "<h2>Conectando con Garmin…</h2>"
         '<p class="muted">Estamos solicitando el código MFA. Revisa tu Gmail en unos segundos.</p>'
         '<div class="spinner" aria-hidden="true"></div>'
         '<p class="muted" style="text-align:center;font-size:13px">Esta página se actualizará sola.</p>'
     )
-    return HTMLResponse(
-        _login_render_page("Procesando", 1, body, auto_refresh_seconds=2)
-    )
+    return HTMLResponse(_login_render_page("Procesando", 1, body, auto_refresh_seconds=2))
 
 
 @mcp.custom_route("/login/mfa", methods=["GET"])
 async def login_mfa_form(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     # Authorized by the session id (see note in login_wait).
     session_id = request.query_params.get("session", "").strip()
     session = _login_get_session(session_id)
     if not session:
         body = (
-            '<h1>Sesión caducada</h1>'
+            "<h1>Sesión caducada</h1>"
             '<p class="muted">Esta sesión expiró.</p>'
             '<a href="/login">← Empezar de nuevo</a>'
         )
@@ -3097,7 +3502,7 @@ async def login_mfa_form(request: Request) -> Response:
 
     sid_safe = _html.escape(session_id)
     body = (
-        '<h2>Código de verificación</h2>'
+        "<h2>Código de verificación</h2>"
         '<p class="muted">Hemos pedido a Garmin que te envíe un código de 6 dígitos al Gmail. Revisa la bandeja de entrada y pégalo aquí.</p>'
         '<form method="POST" action="/login/mfa">'
         f'<input type="hidden" name="session" value="{sid_safe}">'
@@ -3105,7 +3510,7 @@ async def login_mfa_form(request: Request) -> Response:
         '<input id="code" name="code" type="text" inputmode="numeric" pattern="[0-9]*" '
         'autocomplete="one-time-code" maxlength="10" required autofocus>'
         '<button type="submit">Siguiente</button>'
-        '</form>'
+        "</form>"
     )
     return HTMLResponse(_login_render_page("Re-login Garmin · paso 2", 2, body))
 
@@ -3113,6 +3518,7 @@ async def login_mfa_form(request: Request) -> Response:
 @mcp.custom_route("/login/mfa", methods=["POST"])
 async def login_mfa_submit(request: Request) -> Response:
     from starlette.responses import HTMLResponse, RedirectResponse
+
     # Authorized by the session id carried in the form (see note in login_wait).
     form = await request.form()
     session_id = (form.get("session") or "").strip()
@@ -3120,7 +3526,7 @@ async def login_mfa_submit(request: Request) -> Response:
     session = _login_get_session(session_id)
     if not session:
         body = (
-            '<h1>Sesión caducada</h1>'
+            "<h1>Sesión caducada</h1>"
             '<p class="muted">Esta sesión expiró.</p>'
             '<a href="/login">← Empezar de nuevo</a>'
         )
@@ -3136,6 +3542,7 @@ async def login_mfa_submit(request: Request) -> Response:
 @mcp.custom_route("/login/result", methods=["GET"])
 async def login_result(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     # Authorized by the session id (see note in login_wait). The bootstrap token is
     # cleared the instant login succeeds, so gating on it here would 404 the very
     # screen that confirms success.
@@ -3146,14 +3553,14 @@ async def login_result(request: Request) -> Response:
         # the result). Show a friendly confirmation instead of a scary error.
         if not _is_first_run():
             body = (
-                '<h1>✅ Configuración completada</h1>'
-                '<p>Tu cuenta Garmin ya está conectada.</p>'
+                "<h1>✅ Configuración completada</h1>"
+                "<p>Tu cuenta Garmin ya está conectada.</p>"
                 '<script>setTimeout(function(){window.location.href="/admin"},2000)</script>'
                 '<a href="/admin"><button type="button">Ir al panel</button></a>'
             )
             return HTMLResponse(_login_render_page("Completado", None, body))
         body = (
-            '<h1>Sesión caducada</h1>'
+            "<h1>Sesión caducada</h1>"
             '<p class="muted">Esta sesión expiró o ya se cerró.</p>'
             '<a href="/login">← Empezar de nuevo</a>'
         )
@@ -3163,18 +3570,16 @@ async def login_result(request: Request) -> Response:
 
     if status not in ("success", "error"):
         body = (
-            '<h2>Procesando login…</h2>'
+            "<h2>Procesando login…</h2>"
             '<p class="muted">Validando el código MFA con Garmin. Aguanta un momento.</p>'
             '<div class="spinner" aria-hidden="true"></div>'
         )
-        return HTMLResponse(
-            _login_render_page("Procesando", 3, body, auto_refresh_seconds=2)
-        )
+        return HTMLResponse(_login_render_page("Procesando", 3, body, auto_refresh_seconds=2))
 
     if status == "error":
         err = _html.escape(session.get("error") or "Error desconocido")
         body = (
-            '<h1>Algo falló</h1>'
+            "<h1>Algo falló</h1>"
             f'<div class="error">{err}</div>'
             '<p class="muted">Las causas más típicas: contraseña incorrecta, código MFA caducado, o Garmin pidiendo CAPTCHA. Prueba de nuevo.</p>'
             '<a href="/login"><button type="button">Empezar de nuevo</button></a>'
@@ -3189,29 +3594,31 @@ async def login_result(request: Request) -> Response:
     public_url = _public_base_url(request)
     mcp_url = f"{public_url}/mcp"
 
-    parts = ['<h1>¡Listo!</h1>']
+    parts = ["<h1>¡Listo!</h1>"]
 
     if report.get("disk", {}).get("ok"):
         parts.append(
             '<div class="success">Tokens guardados en el volumen persistente. '
-            'Tu MCP aguanta reinicios del servidor.</div>'
+            "Tu MCP aguanta reinicios del servidor.</div>"
         )
     else:
         # Manual persistence path: show ONE copy-paste block with the tokens.
         env_block = f"GARMIN_TOKENS_JSON={tokens_b64}"
         parts.append(
-            '<p>Tu MCP está activo <strong>durante esta sesión</strong>. Para hacerlo permanente, '
-            'define la variable de entorno <code>GARMIN_TOKENS_JSON</code> de tu servidor con este valor:</p>'
+            "<p>Tu MCP está activo <strong>durante esta sesión</strong>. Para hacerlo permanente, "
+            "define la variable de entorno <code>GARMIN_TOKENS_JSON</code> de tu servidor con este valor:</p>"
             f'<pre style="max-height:260px;overflow:auto;background:#1c1c22;color:#f2f2f7;padding:14px;border-radius:10px;font-size:13px;line-height:1.5;word-break:break-all;white-space:pre-wrap;border:1px solid #2a2a32" id="env-block">{_html.escape(env_block)}</pre>'
-            '<button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'env-block\').innerText);this.innerText=\'Copiado ✓\'">Copiar bloque</button>'
+            "<button type=\"button\" onclick=\"navigator.clipboard.writeText(document.getElementById('env-block').innerText);this.innerText='Copiado ✓'\">Copiar bloque</button>"
             '<a href="/admin" style="display:inline-block;margin-top:16px"><button type="button" class="secondary">Ir al panel</button></a>'
         )
 
     parts.append('<h2 style="margin-top:32px">Conéctalo a tu IA</h2>')
-    parts.append('<p class="muted">Funciona con cualquier IA con conectores MCP (Claude, ChatGPT…). Pega esta URL en Settings → Connectors:</p>')
+    parts.append(
+        '<p class="muted">Funciona con cualquier IA con conectores MCP (Claude, ChatGPT…). Pega esta URL en Settings → Connectors:</p>'
+    )
     parts.append(
         f'<pre id="mcp-url">{_html.escape(mcp_url)}</pre>'
-        '<button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'mcp-url\').innerText);this.innerText=\'Copiado ✓\'">Copiar URL del conector</button>'
+        "<button type=\"button\" onclick=\"navigator.clipboard.writeText(document.getElementById('mcp-url').innerText);this.innerText='Copiado ✓'\">Copiar URL del conector</button>"
     )
 
     _login_drop_session(session_id)
@@ -3226,31 +3633,40 @@ async def login_result(request: Request) -> Response:
 @mcp.custom_route("/setup/proteccion", methods=["GET"])
 async def setup_protection_form(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     if not _login_admin_ok(request):
         return HTMLResponse(_login_unauthorized_html(), status_code=404)
 
     already = bool(_current_admin_token())
     title = "Cambiar contraseña" if already else "Protección con contraseña"
     intro = (
-        'Escribe la nueva contraseña que quieras. La anterior dejará de funcionar.'
-        if already else
-        'Escribe la contraseña que tú quieras. A partir de ahora, esta página de configuración '
-        'solo se abrirá con ella, para que nadie más pueda tocar tu cuenta de Garmin.'
+        "Escribe la nueva contraseña que quieras. La anterior dejará de funcionar."
+        if already
+        else "Escribe la contraseña que tú quieras. A partir de ahora, esta página de configuración "
+        "solo se abrirá con ella, para que nadie más pueda tocar tu cuenta de Garmin."
     )
     submit = "Guardar nueva contraseña" if already else "Activar protección"
     body = (
-        f'<h1>{title}</h1>'
-        f'<p>{intro}</p>'
+        f"<h1>{title}</h1>"
+        f"<p>{intro}</p>"
         '<form method="POST" action="/setup/proteccion">'
         '<label for="pwd">Tu contraseña (mínimo 8 caracteres)</label>'
-        + _password_input_html("pwd", "pwd", placeholder="la que tú quieras",
-                               autocomplete="new-password", minlength=8, autofocus=True) +
-        '<button type="submit">' + submit + '</button>'
+        + _password_input_html(
+            "pwd",
+            "pwd",
+            placeholder="la que tú quieras",
+            autocomplete="new-password",
+            minlength=8,
+            autofocus=True,
+        )
+        + '<button type="submit">'
+        + submit
+        + "</button>"
         '<button type="button" class="secondary" onclick="'
         "var p=Array.from(crypto.getRandomValues(new Uint8Array(18))).map(b=>('0'+b.toString(16)).slice(-2)).join('');"
         "document.getElementById('pwd').value=p;"
         '">O genérame una segura al azar</button>'
-        '</form>'
+        "</form>"
         '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
     )
     return HTMLResponse(_login_render_page(title, None, body))
@@ -3259,6 +3675,7 @@ async def setup_protection_form(request: Request) -> Response:
 @mcp.custom_route("/setup/proteccion", methods=["POST"])
 async def setup_protection_submit(request: Request) -> Response:
     from starlette.responses import HTMLResponse
+
     if not _login_admin_ok(request):
         return HTMLResponse(_login_unauthorized_html(), status_code=404)
 
@@ -3267,7 +3684,7 @@ async def setup_protection_submit(request: Request) -> Response:
 
     def _err(msg: str) -> Response:
         body = (
-            '<h1>No se pudo activar</h1>'
+            "<h1>No se pudo activar</h1>"
             f'<div class="error">{_html.escape(msg)}</div>'
             '<a href="/setup/proteccion"><button type="button">Volver a intentar</button></a>'
             '<a href="/admin"><button type="button" class="secondary">← Volver al panel</button></a>'
@@ -3291,16 +3708,16 @@ async def setup_protection_submit(request: Request) -> Response:
 
     persist_note = (
         '<div class="success">Ya está activa y guardada de forma permanente '
-        '(se conserva en el volumen de datos).</div>'
+        "(se conserva en el volumen de datos).</div>"
     )
 
     body = (
-        f'<h1>{heading}</h1>'
-        f'{persist_note}'
+        f"<h1>{heading}</h1>"
+        f"{persist_note}"
         '<p class="muted" style="margin-top:8px">Tu contraseña es: '
         '<span id="pwd-display" data-pwd="' + _html.escape(pwd, quote=True) + '" '
         'style="font-family:monospace;background:rgba(255,255,255,.1);padding:2px 6px;border-radius:5px">'
-        '********</span>'
+        "********</span>"
         '<button type="button" id="pwd-toggle" style="background:none;border:none;color:#9a9aa2;cursor:pointer;font-size:18px;padding:2px 6px;vertical-align:middle;width:auto;margin:0" onclick="'
         "var s=document.getElementById('pwd-display');"
         "if(s.dataset.shown){s.textContent='********';s.dataset.shown='';this.textContent='👁';}"
@@ -3333,9 +3750,17 @@ def get_cached_snapshot() -> dict[str, Any]:
             "status": CACHE["status"],
             "last_refresh": CACHE["last_refresh"],
             "last_refresh_local": _isoish_to_local(CACHE["last_refresh"]),
+            "last_success_refresh": CACHE["last_success_refresh"],
+            "cache_age_seconds": _cache_age_seconds(),
+            "stale": _cache_is_stale(),
+            "consecutive_refresh_failures": CACHE["consecutive_refresh_failures"],
             "last_error": CACHE["last_error"],
-            "snapshot_obtenido_local": _isoish_to_local(snapshot.get("fetched_at")) if isinstance(snapshot, dict) else None,
-            "datos_hasta_local": metrics.get("datos_hasta_local") if isinstance(metrics, dict) else None,
+            "snapshot_obtenido_local": _isoish_to_local(snapshot.get("fetched_at"))
+            if isinstance(snapshot, dict)
+            else None,
+            "datos_hasta_local": metrics.get("datos_hasta_local")
+            if isinstance(metrics, dict)
+            else None,
             "ultima_sincronizacion_conector_local": _isoish_to_local(CACHE["last_refresh"]),
             "snapshot": snapshot,
         }
@@ -3354,9 +3779,13 @@ def get_day_snapshot(target_date: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool
-def get_raw_sources(target_date: str | None = None, include_recent_activities: bool = True) -> dict[str, Any]:
+def get_raw_sources(
+    target_date: str | None = None, include_recent_activities: bool = True
+) -> dict[str, Any]:
     """Devuelve los payloads crudos que ha devuelto Garmin para un día."""
-    snapshot = _collect_day_snapshot(_parse_input_date(target_date), include_recent_activities=include_recent_activities)
+    snapshot = _collect_day_snapshot(
+        _parse_input_date(target_date), include_recent_activities=include_recent_activities
+    )
     return {
         "date": snapshot["date"],
         "fetched_at": snapshot["fetched_at"],
@@ -3368,7 +3797,9 @@ def get_raw_sources(target_date: str | None = None, include_recent_activities: b
 @mcp.tool
 def get_primary_device_info(target_date: str | None = None) -> dict[str, Any]:
     """Devuelve el dispositivo principal detectado y, si existe, su configuración."""
-    snapshot = _collect_day_snapshot(_parse_input_date(target_date), include_recent_activities=False)
+    snapshot = _collect_day_snapshot(
+        _parse_input_date(target_date), include_recent_activities=False
+    )
     raw = snapshot["raw_sources"]
     return {
         "date": snapshot["date"],
@@ -3445,6 +3876,7 @@ def get_window_rollup(days: int = 7) -> list[dict[str, Any]]:
         time.sleep(0.4)
     return results
 
+
 class _UserAuthMiddleware:
     """ASGI middleware that authenticates MCP requests via X-User-API-Key header."""
 
@@ -3456,9 +3888,12 @@ class _UserAuthMiddleware:
             path = scope.get("path", "")
             if path == "/mcp" or path.startswith("/mcp/"):
                 headers = dict(scope.get("headers", []))
-                api_key = headers.get(b"x-user-api-key", b"").decode("utf-8", errors="replace").strip()
+                api_key = (
+                    headers.get(b"x-user-api-key", b"").decode("utf-8", errors="replace").strip()
+                )
                 if not api_key:
                     import urllib.parse
+
                     qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
                     params = urllib.parse.parse_qs(qs)
                     api_key = params.get("api_key", [""])[0].strip()
@@ -3494,7 +3929,6 @@ class _MCPHitTracker:
         await self.app(scope, receive, send)
 
 
-
 class _RateLimitMiddleware:
     def __init__(self, app, max_requests: int = 60, window_seconds: int = 60):
         self.app = app
@@ -3519,9 +3953,14 @@ class _RateLimitMiddleware:
         if scope.get("type") == "http":
             client_ip = (scope.get("client") or ("", 0))[0]
             path = scope.get("path", "")
-            if (path.startswith("/mcp") or path.startswith("/admin")) and self._is_rate_limited(client_ip, path):
+            if (path.startswith("/mcp") or path.startswith("/admin")) and self._is_rate_limited(
+                client_ip, path
+            ):
                 from starlette.responses import Response
-                await Response("Too Many Requests", status_code=429, headers={"Retry-After": str(self.window)})(scope, receive, send)
+
+                await Response(
+                    "Too Many Requests", status_code=429, headers={"Retry-After": str(self.window)}
+                )(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 
@@ -3547,8 +3986,15 @@ def _configure_structured_logging() -> None:
     root.handlers = [handler]
     root.setLevel(logging.INFO)
     root._gcmcp_configured = True
+
+
 def _run_server() -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Arranque en frío: sirve el último snapshot persistido al instante mientras
+    # el prewarm refresca en segundo plano (evita minutos de "starting" y el
+    # agotamiento del listado de tools de los clientes MCP).
+    _bootstrap_cache_from_disk()
 
     # Compatibilidad: el SDK mcp rechaza con 406 a los clientes que no envían
     # exactamente "Accept: application/json, text/event-stream" (lo que rompe
@@ -3570,6 +4016,9 @@ def _run_server() -> None:
     watchdog.start()
     lock_watchdog = threading.Thread(target=_lock_holder_watchdog, daemon=True)
     lock_watchdog.start()
+    if TOKEN_HEARTBEAT_ENABLED:
+        heartbeat = threading.Thread(target=_token_heartbeat_loop, daemon=True)
+        heartbeat.start()
 
     # First-run banner so the user finds the setup wizard quickly from logs.
     if _is_first_run():
@@ -3585,7 +4034,9 @@ def _run_server() -> None:
         port=PORT,
         stateless_http=True,
         middleware=[
-            Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+            Middleware(
+                CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+            ),
             Middleware(_UserAuthMiddleware),
             Middleware(_MCPHitTracker),
             Middleware(_RateLimitMiddleware, max_requests=60, window_seconds=60),
@@ -3690,7 +4141,9 @@ except Exception:
 _HRV_SELECTION_DEBUG_LAST = None
 
 
-def _hrv_candidate_from_raw_for_wrapper(requested_date_iso: str, hrv_raw: Any) -> dict[str, Any] | None:
+def _hrv_candidate_from_raw_for_wrapper(
+    requested_date_iso: str, hrv_raw: Any
+) -> dict[str, Any] | None:
     if not isinstance(hrv_raw, dict):
         return None
 
@@ -3736,21 +4189,25 @@ def _Garmin_get_hrv_data_multi_day(self, cdate):
         try:
             raw = _Garmin_get_hrv_data_original_multi_day(self, day)
         except Exception as exc:
-            checked.append({
-                "requested_date": day,
-                "ok": False,
-                "error": str(exc),
-            })
+            checked.append(
+                {
+                    "requested_date": day,
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
             continue
 
         candidate = _hrv_candidate_from_raw_for_wrapper(day, raw)
-        checked.append({
-            "requested_date": day,
-            "ok": candidate is not None,
-            "last_night": candidate.get("last_night") if candidate else None,
-            "weekly_avg": candidate.get("weekly_avg") if candidate else None,
-            "status": candidate.get("status") if candidate else None,
-        })
+        checked.append(
+            {
+                "requested_date": day,
+                "ok": candidate is not None,
+                "last_night": candidate.get("last_night") if candidate else None,
+                "weekly_avg": candidate.get("weekly_avg") if candidate else None,
+                "status": candidate.get("status") if candidate else None,
+            }
+        )
 
         if candidate is not None:
             selected = candidate
@@ -3765,7 +4222,9 @@ def _Garmin_get_hrv_data_multi_day(self, cdate):
             "last_night": selected.get("last_night"),
             "weekly_avg": selected.get("weekly_avg"),
             "status": selected.get("status"),
-        } if selected else None,
+        }
+        if selected
+        else None,
     }
 
     if selected is not None:
@@ -3780,14 +4239,17 @@ if _Garmin_get_hrv_data_original_multi_day is not None:
     except Exception:
         pass
 
-ES_FIELD_LABELS.update({
-    "vfc_fecha_api_garmin": "Fecha API Garmin de VFC",
-    "vfc_noche_termina_en_fecha": "Noche de VFC que termina en fecha",
-    "vfc_origen_canonico": "Origen canónico de VFC",
-    "vfc_referencia_texto": "Referencia humana de VFC",
-})
+ES_FIELD_LABELS.update(
+    {
+        "vfc_fecha_api_garmin": "Fecha API Garmin de VFC",
+        "vfc_noche_termina_en_fecha": "Noche de VFC que termina en fecha",
+        "vfc_origen_canonico": "Origen canónico de VFC",
+        "vfc_referencia_texto": "Referencia humana de VFC",
+    }
+)
 # === GARMIN GET_HRV_DATA MULTI-DAY WRAPPER END ===
 # === MCPX ACTIVITY DEEP PATCH START ===
+
 
 def _activity_type_key_from_payload(payload: Any) -> str | None:
     if not isinstance(payload, dict):
@@ -3830,11 +4292,13 @@ def _extract_metric_descriptors(details: Any) -> list[dict[str, Any]]:
         if not isinstance(descriptor, dict):
             continue
         unit = descriptor.get("unit") or {}
-        out.append({
-            "metrics_index": descriptor.get("metricsIndex"),
-            "key": descriptor.get("key"),
-            "unit": unit.get("key") if isinstance(unit, dict) else None,
-        })
+        out.append(
+            {
+                "metrics_index": descriptor.get("metricsIndex"),
+                "key": descriptor.get("key"),
+                "unit": unit.get("key") if isinstance(unit, dict) else None,
+            }
+        )
     return out
 
 
@@ -3850,7 +4314,9 @@ def _extract_detail_counts(details: Any) -> dict[str, Any]:
         "measurement_count": details.get("measurementCount"),
         "metrics_count": details.get("metricsCount"),
         "total_metrics_count": details.get("totalMetricsCount"),
-        "heart_rate_samples": len(details.get("heartRateDTOs") or []) if isinstance(details.get("heartRateDTOs"), list) else 0,
+        "heart_rate_samples": len(details.get("heartRateDTOs") or [])
+        if isinstance(details.get("heartRateDTOs"), list)
+        else 0,
         "polyline_points": len(polyline) if isinstance(polyline, list) else 0,
     }
 
@@ -3912,7 +4378,9 @@ def _extract_split_counts(splits: Any, typed_splits: Any, split_summaries: Any) 
         lap_count = len(splits.get("lapDTOs") or [])
     if isinstance(typed_splits, dict) and isinstance(typed_splits.get("splits"), list):
         typed_count = len(typed_splits.get("splits") or [])
-    if isinstance(split_summaries, dict) and isinstance(split_summaries.get("splitSummaries"), list):
+    if isinstance(split_summaries, dict) and isinstance(
+        split_summaries.get("splitSummaries"), list
+    ):
         split_summary_count = len(split_summaries.get("splitSummaries") or [])
 
     return {
@@ -4014,28 +4482,33 @@ def _summarize_strength_sets(exercise_sets_payload: Any) -> dict[str, Any] | Non
             if max_weight_kg is None or weight_kg > max_weight_kg:
                 max_weight_kg = weight_kg
 
-            per_set.append({
-                "set_index": idx,
-                "exercise_guess": guess,
-                "exercise_guess_probability": prob,
-                "set_type": set_type,
-                "start_time": start_time,
-                "duration_s": duration_s,
-                "reps": reps,
-                "weight_kg": weight_kg,
-                "volume_kg": volume_kg,
-                "exercise_candidates": item.get("exercises"),
-            })
+            per_set.append(
+                {
+                    "set_index": idx,
+                    "exercise_guess": guess,
+                    "exercise_guess_probability": prob,
+                    "set_type": set_type,
+                    "start_time": start_time,
+                    "duration_s": duration_s,
+                    "reps": reps,
+                    "weight_kg": weight_kg,
+                    "volume_kg": volume_kg,
+                    "exercise_candidates": item.get("exercises"),
+                }
+            )
 
             if set_type == "ACTIVE":
-                row = grouped.setdefault(guess, {
-                    "exercise": guess,
-                    "sets": 0,
-                    "active_sets": 0,
-                    "reps": 0.0,
-                    "max_weight_kg": None,
-                    "volume_kg": 0.0,
-                })
+                row = grouped.setdefault(
+                    guess,
+                    {
+                        "exercise": guess,
+                        "sets": 0,
+                        "active_sets": 0,
+                        "reps": 0.0,
+                        "max_weight_kg": None,
+                        "volume_kg": 0.0,
+                    },
+                )
                 row["sets"] += 1
                 row["active_sets"] += 1
                 row["reps"] += reps
@@ -4067,10 +4540,13 @@ def _summarize_strength_sets(exercise_sets_payload: Any) -> dict[str, Any] | Non
 def _sleep_with_jitter(base_seconds: float) -> None:
     import random
     import time
+
     time.sleep(base_seconds + random.uniform(0, 0.35))
 
 
-def _call_with_retries(api: Garmin, method_name: str, *args: Any, retries: int = 2, **kwargs: Any) -> tuple[Any, str | None]:
+def _call_with_retries(
+    api: Garmin, method_name: str, *args: Any, retries: int = 2, **kwargs: Any
+) -> tuple[Any, str | None]:
     last_err: str | None = None
 
     for attempt in range(retries + 1):
@@ -4081,17 +4557,20 @@ def _call_with_retries(api: Garmin, method_name: str, *args: Any, retries: int =
         last_err = err
         err_text = (err or "").lower()
 
-        retryable = any(token in err_text for token in [
-            "502",
-            "503",
-            "504",
-            "bad gateway",
-            "gateway timeout",
-            "cloudflare",
-            "temporarily unavailable",
-            "connection",
-            "timeout",
-        ])
+        retryable = any(
+            token in err_text
+            for token in [
+                "502",
+                "503",
+                "504",
+                "bad gateway",
+                "gateway timeout",
+                "cloudflare",
+                "temporarily unavailable",
+                "connection",
+                "timeout",
+            ]
+        )
 
         if not retryable or attempt >= retries:
             return value, last_err
@@ -4101,16 +4580,28 @@ def _call_with_retries(api: Garmin, method_name: str, *args: Any, retries: int =
     return None, last_err
 
 
-def _fetch_activity_bundle(api: Garmin, activity_id: str, include_time_series: bool = False, max_samples: int = 200) -> dict[str, Any]:
+def _fetch_activity_bundle(
+    api: Garmin, activity_id: str, include_time_series: bool = False, max_samples: int = 200
+) -> dict[str, Any]:
     activity, activity_err = _call_with_retries(api, "get_activity", activity_id, retries=1)
     details, details_err = _call_with_retries(api, "get_activity_details", activity_id, retries=2)
     splits, splits_err = _call_with_retries(api, "get_activity_splits", activity_id, retries=1)
-    typed_splits, typed_splits_err = _call_with_retries(api, "get_activity_typed_splits", activity_id, retries=1)
-    split_summaries, split_summaries_err = _call_with_retries(api, "get_activity_split_summaries", activity_id, retries=1)
+    typed_splits, typed_splits_err = _call_with_retries(
+        api, "get_activity_typed_splits", activity_id, retries=1
+    )
+    split_summaries, split_summaries_err = _call_with_retries(
+        api, "get_activity_split_summaries", activity_id, retries=1
+    )
     weather, weather_err = _call_with_retries(api, "get_activity_weather", activity_id, retries=1)
-    hr_zones, hr_zones_err = _call_with_retries(api, "get_activity_hr_in_timezones", activity_id, retries=1)
-    power_zones, power_zones_err = _call_with_retries(api, "get_activity_power_in_timezones", activity_id, retries=1)
-    exercise_sets, exercise_sets_err = _call_with_retries(api, "get_activity_exercise_sets", activity_id, retries=1)
+    hr_zones, hr_zones_err = _call_with_retries(
+        api, "get_activity_hr_in_timezones", activity_id, retries=1
+    )
+    power_zones, power_zones_err = _call_with_retries(
+        api, "get_activity_power_in_timezones", activity_id, retries=1
+    )
+    exercise_sets, exercise_sets_err = _call_with_retries(
+        api, "get_activity_exercise_sets", activity_id, retries=1
+    )
     gear, gear_err = _call_with_retries(api, "get_activity_gear", activity_id, retries=1)
 
     activity_type = _activity_type_key_from_payload(activity or {})
@@ -4119,10 +4610,13 @@ def _fetch_activity_bundle(api: Garmin, activity_id: str, include_time_series: b
 
     bundle: dict[str, Any] = {
         "activity_id": activity_id,
-        "activity_name": (activity or {}).get("activityName") if isinstance(activity, dict) else None,
+        "activity_name": (activity or {}).get("activityName")
+        if isinstance(activity, dict)
+        else None,
         "activity_type": activity_type,
         "activity_family": _activity_family(activity_type),
-        "start_time_local": (summary or {}).get("startTimeLocal") or ((activity or {}).get("startTimeLocal") if isinstance(activity, dict) else None),
+        "start_time_local": (summary or {}).get("startTimeLocal")
+        or ((activity or {}).get("startTimeLocal") if isinstance(activity, dict) else None),
         "summary": _pick_activity_summary(summary),
         "metadata": _pick_activity_metadata(metadata),
         "detail_metric_descriptors": _extract_metric_descriptors(details),
@@ -4130,12 +4624,18 @@ def _fetch_activity_bundle(api: Garmin, activity_id: str, include_time_series: b
         "split_counts": _extract_split_counts(splits, typed_splits, split_summaries),
         "laps": (splits or {}).get("lapDTOs") if isinstance(splits, dict) else None,
         "events": (splits or {}).get("eventDTOs") if isinstance(splits, dict) else None,
-        "typed_splits": (typed_splits or {}).get("splits") if isinstance(typed_splits, dict) else None,
-        "split_summaries": (split_summaries or {}).get("splitSummaries") if isinstance(split_summaries, dict) else None,
+        "typed_splits": (typed_splits or {}).get("splits")
+        if isinstance(typed_splits, dict)
+        else None,
+        "split_summaries": (split_summaries or {}).get("splitSummaries")
+        if isinstance(split_summaries, dict)
+        else None,
         "weather": weather if isinstance(weather, dict) else None,
         "hr_time_in_zones": hr_zones if isinstance(hr_zones, list) else None,
         "power_time_in_zones": power_zones if isinstance(power_zones, list) else None,
-        "exercise_sets": (exercise_sets or {}).get("exerciseSets") if isinstance(exercise_sets, dict) else None,
+        "exercise_sets": (exercise_sets or {}).get("exerciseSets")
+        if isinstance(exercise_sets, dict)
+        else None,
         "exercise_set_count": _exercise_set_count(exercise_sets),
         "strength_summary": _summarize_strength_sets(exercise_sets),
         "gear": gear if isinstance(gear, list) else None,
@@ -4173,12 +4673,16 @@ def _fetch_activity_bundle(api: Garmin, activity_id: str, include_time_series: b
 
 
 @mcp.tool
-def get_activity_full(activity_id: str, include_time_series: bool = False, max_samples: int = 200) -> dict[str, Any]:
+def get_activity_full(
+    activity_id: str, include_time_series: bool = False, max_samples: int = 200
+) -> dict[str, Any]:
     """Actividad completa con resumen, vueltas, clima, zonas, material y series temporales opcionales."""
     max_samples = max(1, min(2000, int(max_samples)))
     with _fetch_lock():
         api = _get_api()
-        return _fetch_activity_bundle(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
+        return _fetch_activity_bundle(
+            api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples
+        )
 
 
 @mcp.tool
@@ -4215,11 +4719,17 @@ def get_recent_activities_full(limit: int = 8) -> list[dict[str, Any]]:
                 continue
             activity_ids.append(str(activity_id))
 
-        return [_fetch_activity_bundle(api, activity_id, include_time_series=False) for activity_id in activity_ids]
+        return [
+            _fetch_activity_bundle(api, activity_id, include_time_series=False)
+            for activity_id in activity_ids
+        ]
+
+
 # === MCPX ACTIVITY DEEP PATCH END ===
 
 
 # === MCPX ALL SPORTS RAW TOOLS START ===
+
 
 def _available_summary_keys(activity: Any) -> list[str]:
     if not isinstance(activity, dict):
@@ -4252,19 +4762,33 @@ def _available_detail_metric_keys(details: Any) -> list[str]:
     return sorted(out)
 
 
-def _fetch_activity_all_data(api: Garmin, activity_id: str, include_time_series: bool = False, max_samples: int = 500) -> dict[str, Any]:
+def _fetch_activity_all_data(
+    api: Garmin, activity_id: str, include_time_series: bool = False, max_samples: int = 500
+) -> dict[str, Any]:
     activity, activity_err = _call_with_retries(api, "get_activity", activity_id, retries=1)
     details, details_err = _call_with_retries(api, "get_activity_details", activity_id, retries=2)
     splits, splits_err = _call_with_retries(api, "get_activity_splits", activity_id, retries=1)
-    typed_splits, typed_splits_err = _call_with_retries(api, "get_activity_typed_splits", activity_id, retries=1)
-    split_summaries, split_summaries_err = _call_with_retries(api, "get_activity_split_summaries", activity_id, retries=1)
+    typed_splits, typed_splits_err = _call_with_retries(
+        api, "get_activity_typed_splits", activity_id, retries=1
+    )
+    split_summaries, split_summaries_err = _call_with_retries(
+        api, "get_activity_split_summaries", activity_id, retries=1
+    )
     weather, weather_err = _call_with_retries(api, "get_activity_weather", activity_id, retries=1)
-    hr_zones, hr_zones_err = _call_with_retries(api, "get_activity_hr_in_timezones", activity_id, retries=1)
-    power_zones, power_zones_err = _call_with_retries(api, "get_activity_power_in_timezones", activity_id, retries=1)
-    exercise_sets, exercise_sets_err = _call_with_retries(api, "get_activity_exercise_sets", activity_id, retries=1)
+    hr_zones, hr_zones_err = _call_with_retries(
+        api, "get_activity_hr_in_timezones", activity_id, retries=1
+    )
+    power_zones, power_zones_err = _call_with_retries(
+        api, "get_activity_power_in_timezones", activity_id, retries=1
+    )
+    exercise_sets, exercise_sets_err = _call_with_retries(
+        api, "get_activity_exercise_sets", activity_id, retries=1
+    )
     gear, gear_err = _call_with_retries(api, "get_activity_gear", activity_id, retries=1)
 
-    compact = _fetch_activity_bundle(api, activity_id, include_time_series=include_time_series, max_samples=max_samples)
+    compact = _fetch_activity_bundle(
+        api, activity_id, include_time_series=include_time_series, max_samples=max_samples
+    )
 
     compact["available_summary_keys"] = _available_summary_keys(activity)
     compact["available_metadata_keys"] = _available_metadata_keys(activity)
@@ -4300,12 +4824,16 @@ def _fetch_activity_all_data(api: Garmin, activity_id: str, include_time_series:
 
 
 @mcp.tool
-def get_activity_all_data(activity_id: str, include_time_series: bool = False, max_samples: int = 500) -> dict[str, Any]:
+def get_activity_all_data(
+    activity_id: str, include_time_series: bool = False, max_samples: int = 500
+) -> dict[str, Any]:
     """Devuelve todos los payloads crudos y el bundle compacto de una actividad, sin filtrar por deporte."""
     max_samples = max(1, min(2000, int(max_samples)))
     with _fetch_lock():
         api = _get_api()
-        return _fetch_activity_all_data(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
+        return _fetch_activity_all_data(
+            api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples
+        )
 
 
 @mcp.tool
@@ -4323,18 +4851,22 @@ def get_recent_activities_catalog(limit: int = 12) -> list[dict[str, Any]]:
             if not isinstance(activity, dict):
                 continue
             activity_type = activity.get("activityType") or activity.get("activityTypeDTO") or {}
-            out.append({
-                "activity_id": activity.get("activityId"),
-                "activity_name": activity.get("activityName"),
-                "activity_type": activity_type.get("typeKey"),
-                "activity_family": _activity_family(activity_type.get("typeKey")),
-                "start_time_local": activity.get("startTimeLocal"),
-            })
+            out.append(
+                {
+                    "activity_id": activity.get("activityId"),
+                    "activity_name": activity.get("activityName"),
+                    "activity_type": activity_type.get("typeKey"),
+                    "activity_family": _activity_family(activity_type.get("typeKey")),
+                    "start_time_local": activity.get("startTimeLocal"),
+                }
+            )
         return out
 
 
 @mcp.tool
-def get_recent_activities_all_data(limit: int = 3, include_time_series: bool = False, max_samples: int = 300) -> list[dict[str, Any]]:
+def get_recent_activities_all_data(
+    limit: int = 3, include_time_series: bool = False, max_samples: int = 300
+) -> list[dict[str, Any]]:
     """Devuelve todos los payloads crudos para varias actividades recientes. Úsalo con límites pequeños."""
     limit = max(1, min(8, int(limit)))
     max_samples = max(1, min(2000, int(max_samples)))
@@ -4351,13 +4883,22 @@ def get_recent_activities_all_data(limit: int = 3, include_time_series: bool = F
             activity_id = activity.get("activityId")
             if activity_id is None:
                 continue
-            out.append(_fetch_activity_all_data(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples))
+            out.append(
+                _fetch_activity_all_data(
+                    api,
+                    str(activity_id),
+                    include_time_series=include_time_series,
+                    max_samples=max_samples,
+                )
+            )
         return out
+
 
 # === MCPX ALL SPORTS RAW TOOLS END ===
 
 
 # === MCPX SPORT PROFILE TOOLS START ===
+
 
 def _pick_keys(source: Any, keys: list[str]) -> dict[str, Any]:
     if not isinstance(source, dict):
@@ -4369,43 +4910,46 @@ def _sport_profile_running_like(bundle: dict[str, Any]) -> dict[str, Any]:
     summary = bundle.get("summary") or {}
     return {
         "sport_profile_type": "running_like",
-        "primary_metrics": _pick_keys(summary, [
-            "distance",
-            "duration",
-            "elapsedDuration",
-            "movingDuration",
-            "averageHR",
-            "maxHR",
-            "averageSpeed",
-            "averageMovingSpeed",
-            "maxSpeed",
-            "averagePower",
-            "maxPower",
-            "normalizedPower",
-            "averageRunCadence",
-            "maxRunCadence",
-            "groundContactTime",
-            "verticalOscillation",
-            "verticalRatio",
-            "strideLength",
-            "steps",
-            "elevationGain",
-            "elevationLoss",
-            "avgElevation",
-            "averageTemperature",
-            "maxTemperature",
-            "minTemperature",
-            "activityTrainingLoad",
-            "trainingEffect",
-            "anaerobicTrainingEffect",
-            "trainingEffectLabel",
-            "beginPotentialStamina",
-            "endPotentialStamina",
-            "minAvailableStamina",
-            "moderateIntensityMinutes",
-            "vigorousIntensityMinutes",
-            "waterEstimated",
-        ]),
+        "primary_metrics": _pick_keys(
+            summary,
+            [
+                "distance",
+                "duration",
+                "elapsedDuration",
+                "movingDuration",
+                "averageHR",
+                "maxHR",
+                "averageSpeed",
+                "averageMovingSpeed",
+                "maxSpeed",
+                "averagePower",
+                "maxPower",
+                "normalizedPower",
+                "averageRunCadence",
+                "maxRunCadence",
+                "groundContactTime",
+                "verticalOscillation",
+                "verticalRatio",
+                "strideLength",
+                "steps",
+                "elevationGain",
+                "elevationLoss",
+                "avgElevation",
+                "averageTemperature",
+                "maxTemperature",
+                "minTemperature",
+                "activityTrainingLoad",
+                "trainingEffect",
+                "anaerobicTrainingEffect",
+                "trainingEffectLabel",
+                "beginPotentialStamina",
+                "endPotentialStamina",
+                "minAvailableStamina",
+                "moderateIntensityMinutes",
+                "vigorousIntensityMinutes",
+                "waterEstimated",
+            ],
+        ),
         "detail_metric_keys": bundle.get("available_detail_metric_keys") or [],
         "detail_counts": bundle.get("detail_counts") or {},
         "split_counts": bundle.get("split_counts") or {},
@@ -4421,25 +4965,28 @@ def _sport_profile_strength(bundle: dict[str, Any]) -> dict[str, Any]:
     strength_summary = bundle.get("strength_summary") or {}
     return {
         "sport_profile_type": "strength",
-        "primary_metrics": _pick_keys(summary, [
-            "duration",
-            "elapsedDuration",
-            "movingDuration",
-            "averageHR",
-            "maxHR",
-            "averageTemperature",
-            "maxTemperature",
-            "minTemperature",
-            "activityTrainingLoad",
-            "trainingEffect",
-            "anaerobicTrainingEffect",
-            "trainingEffectLabel",
-            "moderateIntensityMinutes",
-            "vigorousIntensityMinutes",
-            "calories",
-            "waterEstimated",
-            "steps",
-        ]),
+        "primary_metrics": _pick_keys(
+            summary,
+            [
+                "duration",
+                "elapsedDuration",
+                "movingDuration",
+                "averageHR",
+                "maxHR",
+                "averageTemperature",
+                "maxTemperature",
+                "minTemperature",
+                "activityTrainingLoad",
+                "trainingEffect",
+                "anaerobicTrainingEffect",
+                "trainingEffectLabel",
+                "moderateIntensityMinutes",
+                "vigorousIntensityMinutes",
+                "calories",
+                "waterEstimated",
+                "steps",
+            ],
+        ),
         "strength_summary": strength_summary,
         "hr_time_in_zones": bundle.get("hr_time_in_zones"),
         "weather": bundle.get("weather"),
@@ -4450,32 +4997,35 @@ def _sport_profile_cycling(bundle: dict[str, Any]) -> dict[str, Any]:
     summary = bundle.get("summary") or {}
     return {
         "sport_profile_type": "cycling",
-        "primary_metrics": _pick_keys(summary, [
-            "distance",
-            "duration",
-            "elapsedDuration",
-            "movingDuration",
-            "averageHR",
-            "maxHR",
-            "averageSpeed",
-            "averageMovingSpeed",
-            "maxSpeed",
-            "averagePower",
-            "maxPower",
-            "normalizedPower",
-            "totalWork",
-            "elevationGain",
-            "elevationLoss",
-            "avgElevation",
-            "averageTemperature",
-            "activityTrainingLoad",
-            "trainingEffect",
-            "anaerobicTrainingEffect",
-            "trainingEffectLabel",
-            "moderateIntensityMinutes",
-            "vigorousIntensityMinutes",
-            "waterEstimated",
-        ]),
+        "primary_metrics": _pick_keys(
+            summary,
+            [
+                "distance",
+                "duration",
+                "elapsedDuration",
+                "movingDuration",
+                "averageHR",
+                "maxHR",
+                "averageSpeed",
+                "averageMovingSpeed",
+                "maxSpeed",
+                "averagePower",
+                "maxPower",
+                "normalizedPower",
+                "totalWork",
+                "elevationGain",
+                "elevationLoss",
+                "avgElevation",
+                "averageTemperature",
+                "activityTrainingLoad",
+                "trainingEffect",
+                "anaerobicTrainingEffect",
+                "trainingEffectLabel",
+                "moderateIntensityMinutes",
+                "vigorousIntensityMinutes",
+                "waterEstimated",
+            ],
+        ),
         "detail_metric_keys": bundle.get("available_detail_metric_keys") or [],
         "hr_time_in_zones": bundle.get("hr_time_in_zones"),
         "power_time_in_zones": bundle.get("power_time_in_zones"),
@@ -4488,23 +5038,26 @@ def _sport_profile_swimming(bundle: dict[str, Any]) -> dict[str, Any]:
     summary = bundle.get("summary") or {}
     return {
         "sport_profile_type": "swimming",
-        "primary_metrics": _pick_keys(summary, [
-            "distance",
-            "duration",
-            "elapsedDuration",
-            "movingDuration",
-            "averageHR",
-            "maxHR",
-            "averageSpeed",
-            "maxSpeed",
-            "calories",
-            "activityTrainingLoad",
-            "trainingEffect",
-            "anaerobicTrainingEffect",
-            "trainingEffectLabel",
-            "moderateIntensityMinutes",
-            "vigorousIntensityMinutes",
-        ]),
+        "primary_metrics": _pick_keys(
+            summary,
+            [
+                "distance",
+                "duration",
+                "elapsedDuration",
+                "movingDuration",
+                "averageHR",
+                "maxHR",
+                "averageSpeed",
+                "maxSpeed",
+                "calories",
+                "activityTrainingLoad",
+                "trainingEffect",
+                "anaerobicTrainingEffect",
+                "trainingEffectLabel",
+                "moderateIntensityMinutes",
+                "vigorousIntensityMinutes",
+            ],
+        ),
         "detail_metric_keys": bundle.get("available_detail_metric_keys") or [],
         "hr_time_in_zones": bundle.get("hr_time_in_zones"),
     }
@@ -4514,17 +5067,20 @@ def _sport_profile_transport(bundle: dict[str, Any]) -> dict[str, Any]:
     summary = bundle.get("summary") or {}
     return {
         "sport_profile_type": "transport",
-        "primary_metrics": _pick_keys(summary, [
-            "distance",
-            "duration",
-            "elapsedDuration",
-            "movingDuration",
-            "averageSpeed",
-            "maxSpeed",
-            "calories",
-            "steps",
-        ]),
-        "note": "Actividad informativa, no perfil principal de entrenamiento."
+        "primary_metrics": _pick_keys(
+            summary,
+            [
+                "distance",
+                "duration",
+                "elapsedDuration",
+                "movingDuration",
+                "averageSpeed",
+                "maxSpeed",
+                "calories",
+                "steps",
+            ],
+        ),
+        "note": "Actividad informativa, no perfil principal de entrenamiento.",
     }
 
 
@@ -4553,18 +5109,29 @@ def _build_sport_profile(bundle: dict[str, Any]) -> dict[str, Any]:
         return _sport_profile_swimming(bundle)
     if family == "transport":
         return _sport_profile_transport(bundle)
-    if family == "endurance" or activity_type in {"walking", "cardio", "elliptical", "treadmill_running", "running", "hiking"}:
+    if family == "endurance" or activity_type in {
+        "walking",
+        "cardio",
+        "elliptical",
+        "treadmill_running",
+        "running",
+        "hiking",
+    }:
         return _sport_profile_running_like(bundle)
     return _sport_profile_other(bundle)
 
 
 @mcp.tool
-def get_activity_sport_profile(activity_id: str, include_time_series: bool = False, max_samples: int = 300) -> dict[str, Any]:
+def get_activity_sport_profile(
+    activity_id: str, include_time_series: bool = False, max_samples: int = 300
+) -> dict[str, Any]:
     """Perfil interpretado por deporte usando todos los datos disponibles de la actividad."""
     max_samples = max(1, min(2000, int(max_samples)))
     with _fetch_lock():
         api = _get_api()
-        bundle = _fetch_activity_all_data(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
+        bundle = _fetch_activity_all_data(
+            api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples
+        )
         profile = _build_sport_profile(bundle)
         return {
             "activity_id": bundle.get("activity_id"),
@@ -4595,23 +5162,29 @@ def get_recent_activity_sport_profiles(limit: int = 8) -> list[dict[str, Any]]:
             activity_id = activity.get("activityId")
             if activity_id is None:
                 continue
-            bundle = _fetch_activity_all_data(api, str(activity_id), include_time_series=False, max_samples=300)
-            out.append({
-                "activity_id": bundle.get("activity_id"),
-                "activity_name": bundle.get("activity_name"),
-                "activity_type": bundle.get("activity_type"),
-                "activity_family": bundle.get("activity_family"),
-                "start_time_local": bundle.get("start_time_local"),
-                "sport_profile": _build_sport_profile(bundle),
-                "source_errors": bundle.get("source_errors"),
-                "raw_payload_errors": bundle.get("raw_payload_errors"),
-            })
+            bundle = _fetch_activity_all_data(
+                api, str(activity_id), include_time_series=False, max_samples=300
+            )
+            out.append(
+                {
+                    "activity_id": bundle.get("activity_id"),
+                    "activity_name": bundle.get("activity_name"),
+                    "activity_type": bundle.get("activity_type"),
+                    "activity_family": bundle.get("activity_family"),
+                    "start_time_local": bundle.get("start_time_local"),
+                    "sport_profile": _build_sport_profile(bundle),
+                    "source_errors": bundle.get("source_errors"),
+                    "raw_payload_errors": bundle.get("raw_payload_errors"),
+                }
+            )
         return out
+
 
 # === MCPX SPORT PROFILE TOOLS END ===
 
 
 # === MCPX VISIBLE METRICS PATCH START ===
+
 
 def _raw_summary_from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     raw_payloads = bundle.get("raw_payloads") or {}
@@ -4807,23 +5380,29 @@ def _format_zone_rows(rows: Any, zone_type: str = "hr") -> list[dict[str, Any]]:
         except Exception:
             pct = None
 
-        label = _hr_zone_label_es(zone_number) if zone_type == "hr" else _power_zone_label_es(zone_number)
+        label = (
+            _hr_zone_label_es(zone_number)
+            if zone_type == "hr"
+            else _power_zone_label_es(zone_number)
+        )
 
-        out.append({
-            "Zona": f"Zona {zone_number}" if zone_number is not None else None,
-            "Límite inferior": low,
-            "Etiqueta": label,
-            "Tiempo": _format_seconds_mmss(secs),
-            "Porcentaje": _format_percentage(pct) if pct is not None else None,
-            "secs_raw": secs,
-        })
+        out.append(
+            {
+                "Zona": f"Zona {zone_number}" if zone_number is not None else None,
+                "Límite inferior": low,
+                "Etiqueta": label,
+                "Tiempo": _format_seconds_mmss(secs),
+                "Porcentaje": _format_percentage(pct) if pct is not None else None,
+                "secs_raw": secs,
+            }
+        )
 
     return out
 
 
 def _format_distance_km(value: Any) -> str | None:
     try:
-        return f"{float(value)/1000.0:.2f} km"
+        return f"{float(value) / 1000.0:.2f} km"
     except Exception:
         return None
 
@@ -4848,22 +5427,24 @@ def _visible_laps_or_segments(bundle: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(lap, dict):
             continue
 
-        out.append({
-            "Vuelta": idx,
-            "Tiempo": _format_seconds_mmss(lap.get("duration")),
-            "Tiempo acumulado": _format_seconds_mmss(lap.get("elapsedDuration")),
-            "Distancia": _format_distance_km(lap.get("distance")),
-            "Ritmo medio": _format_speed_as_pace(lap.get("averageSpeed")),
-            "GAP medio": _format_speed_as_pace(lap.get("averageGradeAdjustedSpeed")),
-            "Frecuencia cardiaca media": _format_ppm(lap.get("averageHR")),
-            "FC máxima": _format_ppm(lap.get("maxHR")),
-            "Ascenso total": _format_meters(lap.get("elevationGain")),
-            "Descenso total": _format_meters(lap.get("elevationLoss")),
-            "Potencia media": _format_watts(lap.get("averagePower")),
-            "Potencia máxima": _format_watts(lap.get("maxPower")),
-            "Cadencia de carrera media": _format_spm(lap.get("averageRunCadence")),
-            "Cadencia de carrera máxima": _format_spm(lap.get("maxRunCadence")),
-        })
+        out.append(
+            {
+                "Vuelta": idx,
+                "Tiempo": _format_seconds_mmss(lap.get("duration")),
+                "Tiempo acumulado": _format_seconds_mmss(lap.get("elapsedDuration")),
+                "Distancia": _format_distance_km(lap.get("distance")),
+                "Ritmo medio": _format_speed_as_pace(lap.get("averageSpeed")),
+                "GAP medio": _format_speed_as_pace(lap.get("averageGradeAdjustedSpeed")),
+                "Frecuencia cardiaca media": _format_ppm(lap.get("averageHR")),
+                "FC máxima": _format_ppm(lap.get("maxHR")),
+                "Ascenso total": _format_meters(lap.get("elevationGain")),
+                "Descenso total": _format_meters(lap.get("elevationLoss")),
+                "Potencia media": _format_watts(lap.get("averagePower")),
+                "Potencia máxima": _format_watts(lap.get("maxPower")),
+                "Cadencia de carrera media": _format_spm(lap.get("averageRunCadence")),
+                "Cadencia de carrera máxima": _format_spm(lap.get("maxRunCadence")),
+            }
+        )
 
     return _drop_none_deep(out)
 
@@ -4904,16 +5485,21 @@ def _visible_metrics_running_like(bundle: dict[str, Any]) -> dict[str, Any]:
             "Ritmo medio": _format_speed_as_pace(summary.get("averageSpeed")),
             "Ritmo en movimiento": _format_speed_as_pace(summary.get("averageMovingSpeed")),
             "Ritmo máximo": _format_speed_as_pace(summary.get("maxSpeed")),
-            "Ritmo ajustado por pendiente": _format_speed_as_pace(summary.get("avgGradeAdjustedSpeed")),
+            "Ritmo ajustado por pendiente": _format_speed_as_pace(
+                summary.get("avgGradeAdjustedSpeed")
+            ),
         },
         "Frecuencia cardiaca": {
             "Frecuencia cardiaca media": _format_ppm(summary.get("averageHR")),
             "Frecuencia cardiaca máxima": _format_ppm(summary.get("maxHR")),
             "Frecuencia cardiaca mínima": _format_ppm(summary.get("minHR")),
-            "Tiempo de las zonas": _format_zone_rows(bundle.get("hr_time_in_zones"), zone_type="hr"),
+            "Tiempo de las zonas": _format_zone_rows(
+                bundle.get("hr_time_in_zones"), zone_type="hr"
+            ),
         },
         "Condición de rendimiento": {
-            "Serie temporal disponible": "directPerformanceCondition" in (bundle.get("available_detail_metric_keys") or []),
+            "Serie temporal disponible": "directPerformanceCondition"
+            in (bundle.get("available_detail_metric_keys") or []),
         },
         "Longitud de zancada": {
             "Longitud de zancada media": _format_centimeters(summary.get("strideLength")),
@@ -4927,13 +5513,17 @@ def _visible_metrics_running_like(bundle: dict[str, Any]) -> dict[str, Any]:
             "Potencia máxima": _format_watts(summary.get("maxPower")),
             "Potencia normalizada": _format_watts(summary.get("normalizedPower")),
             "Trabajo total": summary.get("totalWork"),
-            "Tiempo de las zonas": _format_zone_rows(bundle.get("power_time_in_zones"), zone_type="power"),
+            "Tiempo de las zonas": _format_zone_rows(
+                bundle.get("power_time_in_zones"), zone_type="power"
+            ),
         },
         "Ratio vertical": {
             "Ratio vertical medio": _format_percent_plain(summary.get("verticalRatio")),
         },
         "Tiempo de contacto con el suelo": {
-            "Tiempo de contacto con el suelo medio": _format_milliseconds(summary.get("groundContactTime")),
+            "Tiempo de contacto con el suelo medio": _format_milliseconds(
+                summary.get("groundContactTime")
+            ),
         },
         "Temperatura": {
             "Temperatura media": _format_celsius(summary.get("averageTemperature")),
@@ -4984,22 +5574,30 @@ def _visible_metrics_strength(bundle: dict[str, Any]) -> dict[str, Any]:
             "Beneficio principal": _training_label_es(summary.get("trainingEffectLabel")),
             "Aeróbica": summary.get("trainingEffect"),
             "Anaeróbica": summary.get("anaerobicTrainingEffect"),
-            "Carga de ejercicio": round(float(summary.get("activityTrainingLoad")), 0) if summary.get("activityTrainingLoad") is not None else None,
+            "Carga de ejercicio": round(float(summary.get("activityTrainingLoad")), 0)
+            if summary.get("activityTrainingLoad") is not None
+            else None,
         },
         "Frecuencia cardiaca": {
             "Frecuencia cardiaca media": _format_ppm(summary.get("averageHR")),
             "FC máxima": _format_ppm(summary.get("maxHR")),
-            "Tiempo de las zonas": _format_zone_rows(bundle.get("hr_time_in_zones"), zone_type="hr"),
+            "Tiempo de las zonas": _format_zone_rows(
+                bundle.get("hr_time_in_zones"), zone_type="hr"
+            ),
         },
         "Detalles de la sesión de entrenamiento": {
-            "Repeticiones totales": round(float(strength_summary.get("total_reps_estimated")), 0) if strength_summary.get("total_reps_estimated") is not None else None,
+            "Repeticiones totales": round(float(strength_summary.get("total_reps_estimated")), 0)
+            if strength_summary.get("total_reps_estimated") is not None
+            else None,
             "Series totales": strength_summary.get("active_sets_count_estimated"),
             "Volumen": _format_kilograms(strength_summary.get("total_volume_kg_estimated")),
             "Peso máximo visto": _format_kilograms(strength_summary.get("max_weight_kg_seen")),
             "Bloques de trabajo": [
                 {
                     "series": item.get("active_sets") or item.get("sets"),
-                    "repeticiones": round(float(item.get("reps")), 0) if item.get("reps") is not None else None,
+                    "repeticiones": round(float(item.get("reps")), 0)
+                    if item.get("reps") is not None
+                    else None,
                     "peso máximo": _format_kilograms(item.get("max_weight_kg")),
                     "volumen": _format_kilograms(item.get("volume_kg")),
                 }
@@ -5087,14 +5685,14 @@ def _visible_metrics_swimming(bundle: dict[str, Any]) -> dict[str, Any]:
 
 def _format_km(value: Any) -> str | None:
     try:
-        return f"{float(value)/1000.0:.2f} km"
+        return f"{float(value) / 1000.0:.2f} km"
     except Exception:
         return None
 
 
 def _format_kmh(value: Any) -> str | None:
     try:
-        return f"{float(value)*3.6:.1f} km/h"
+        return f"{float(value) * 3.6:.1f} km/h"
     except Exception:
         return None
 
@@ -5106,7 +5704,9 @@ def _format_plain_minutes(value: Any) -> Any:
         return value
 
 
-def _get_first_typed_split_of_type(bundle: dict[str, Any], split_type: str) -> dict[str, Any] | None:
+def _get_first_typed_split_of_type(
+    bundle: dict[str, Any], split_type: str
+) -> dict[str, Any] | None:
     typed = bundle.get("typed_splits")
     if not isinstance(typed, list):
         return None
@@ -5204,8 +5804,12 @@ def _visible_metrics_endurance_full(bundle: dict[str, Any]) -> dict[str, Any]:
             "Puntuación": _format_execution_score(raw_activity),
         },
         "Autoevaluación": {
-            "Cómo te has sentido": raw_activity.get("userFeedback") or raw_activity.get("feel") or raw_activity.get("perceivedExerciseFeedback"),
-            "Nivel de esfuerzo percibido": raw_activity.get("perceivedExerciseIntensity") or raw_activity.get("rpe") or raw_activity.get("userRpe"),
+            "Cómo te has sentido": raw_activity.get("userFeedback")
+            or raw_activity.get("feel")
+            or raw_activity.get("perceivedExerciseFeedback"),
+            "Nivel de esfuerzo percibido": raw_activity.get("perceivedExerciseIntensity")
+            or raw_activity.get("rpe")
+            or raw_activity.get("userRpe"),
         },
         "Energía disponible": {
             "Potencial inicial": summary.get("beginPotentialStamina"),
@@ -5216,12 +5820,16 @@ def _visible_metrics_endurance_full(bundle: dict[str, Any]) -> dict[str, Any]:
             "Beneficio principal": _training_label_es(summary.get("trainingEffectLabel")),
             "Aeróbica": summary.get("trainingEffect"),
             "Anaeróbica": summary.get("anaerobicTrainingEffect"),
-            "Carga de ejercicio": round(float(summary.get("activityTrainingLoad")), 0) if summary.get("activityTrainingLoad") is not None else None,
+            "Carga de ejercicio": round(float(summary.get("activityTrainingLoad")), 0)
+            if summary.get("activityTrainingLoad") is not None
+            else None,
         },
         "Potencia": {
             "Potencia media": _format_watts(summary.get("averagePower")),
             "Potencia máxima": _format_watts(summary.get("maxPower")),
-            "Datos del viento": "Activado" if raw_activity.get("metadataDTO", {}).get("hasRunPowerWindData") else "Desactivado",
+            "Datos del viento": "Activado"
+            if raw_activity.get("metadataDTO", {}).get("hasRunPowerWindData")
+            else "Desactivado",
         },
         "Altura": {
             "Ascenso total": _format_meters(summary.get("elevationGain")),
@@ -5253,21 +5861,33 @@ def _visible_metrics_endurance_full(bundle: dict[str, Any]) -> dict[str, Any]:
         "Ritmo/velocidad": {
             "Ritmo": {
                 "Ritmo medio": _format_speed_as_pace(summary.get("averageSpeed")),
-                "Ritmo medio en movimiento": _format_speed_as_pace(summary.get("averageMovingSpeed")),
+                "Ritmo medio en movimiento": _format_speed_as_pace(
+                    summary.get("averageMovingSpeed")
+                ),
                 "Ritmo óptimo": _format_speed_as_pace(summary.get("maxSpeed")),
-                "Ritmo medio adaptado a la pendiente": _format_speed_as_pace(summary.get("avgGradeAdjustedSpeed")),
+                "Ritmo medio adaptado a la pendiente": _format_speed_as_pace(
+                    summary.get("avgGradeAdjustedSpeed")
+                ),
             },
             "Velocidad": {
                 "Velocidad media": _format_kmh(summary.get("averageSpeed")),
                 "Velocidad media en movimiento": _format_kmh(summary.get("averageMovingSpeed")),
                 "Velocidad máxima": _format_kmh(summary.get("maxSpeed")),
-                "Velocidad media adaptada a la pendiente": _format_kmh(summary.get("avgGradeAdjustedSpeed")),
+                "Velocidad media adaptada a la pendiente": _format_kmh(
+                    summary.get("avgGradeAdjustedSpeed")
+                ),
             },
         },
         "Intervalos de entrenamiento": {
-            "Tiempo: Carrera": _seconds_to_hms(interval_run.get("duration") if isinstance(interval_run, dict) else None),
-            "Distancia: Carrera": _format_km(interval_run.get("distance") if isinstance(interval_run, dict) else None),
-            "Carrera Ritmo": _format_speed_as_pace(interval_run.get("averageSpeed") if isinstance(interval_run, dict) else None),
+            "Tiempo: Carrera": _seconds_to_hms(
+                interval_run.get("duration") if isinstance(interval_run, dict) else None
+            ),
+            "Distancia: Carrera": _format_km(
+                interval_run.get("distance") if isinstance(interval_run, dict) else None
+            ),
+            "Carrera Ritmo": _format_speed_as_pace(
+                interval_run.get("averageSpeed") if isinstance(interval_run, dict) else None
+            ),
         },
         "Dinámica de carrera": {
             "Cadencia de carrera media": _format_spm(summary.get("averageRunCadence")),
@@ -5275,7 +5895,9 @@ def _visible_metrics_endurance_full(bundle: dict[str, Any]) -> dict[str, Any]:
             "Longitud media de zancada": _format_centimeters(summary.get("strideLength")),
             "Relación vertical media": _format_percent_plain(summary.get("verticalRatio")),
             "Oscilación vertical media": _format_centimeters(summary.get("verticalOscillation")),
-            "Tiempo medio de contacto con el suelo": _format_milliseconds(summary.get("groundContactTime")),
+            "Tiempo medio de contacto con el suelo": _format_milliseconds(
+                summary.get("groundContactTime")
+            ),
         },
         "Temperatura": {
             "Temperatura media": _format_celsius(summary.get("averageTemperature")),
@@ -5291,7 +5913,9 @@ def _visible_metrics_endurance_full(bundle: dict[str, Any]) -> dict[str, Any]:
             "Impacto neto": summary.get("differenceBodyBattery"),
         },
         "Vueltas": _visible_laps_or_segments(bundle),
-        "Zonas de potencia": _format_zone_rows(bundle.get("power_time_in_zones"), zone_type="power"),
+        "Zonas de potencia": _format_zone_rows(
+            bundle.get("power_time_in_zones"), zone_type="power"
+        ),
     }
 
     return _drop_none_deep(result)
@@ -5307,18 +5931,29 @@ def _build_visible_metrics(bundle: dict[str, Any]) -> dict[str, Any]:
         return _visible_metrics_cycling(bundle)
     if family == "swimming":
         return _visible_metrics_swimming(bundle)
-    if family == "endurance" or activity_type in {"running", "treadmill_running", "walking", "hiking", "cardio", "elliptical"}:
+    if family == "endurance" or activity_type in {
+        "running",
+        "treadmill_running",
+        "walking",
+        "hiking",
+        "cardio",
+        "elliptical",
+    }:
         return _visible_metrics_endurance_full(bundle)
     return {}
 
 
 @mcp.tool
-def get_activity_visible_profile(activity_id: str, include_time_series: bool = False, max_samples: int = 300) -> dict[str, Any]:
+def get_activity_visible_profile(
+    activity_id: str, include_time_series: bool = False, max_samples: int = 300
+) -> dict[str, Any]:
     """Perfil con nombres visibles estilo Garmin Connect según el tipo de actividad."""
     max_samples = max(1, min(2000, int(max_samples)))
     with _fetch_lock():
         api = _get_api()
-        bundle = _fetch_activity_all_data(api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples)
+        bundle = _fetch_activity_all_data(
+            api, str(activity_id), include_time_series=include_time_series, max_samples=max_samples
+        )
         return {
             "activity_id": bundle.get("activity_id"),
             "activity_name": bundle.get("activity_name"),
@@ -5330,10 +5965,12 @@ def get_activity_visible_profile(activity_id: str, include_time_series: bool = F
             "raw_payload_errors": bundle.get("raw_payload_errors"),
         }
 
+
 # === MCPX VISIBLE METRICS PATCH END ===
 
 
 # === MCPX HYBRID OVERVIEW TOOL START ===
+
 
 def _num_or_none(value: Any) -> float | None:
     try:
@@ -5402,7 +6039,9 @@ def _bundle_hybrid_session(bundle: dict[str, Any]) -> dict[str, Any]:
         "exercise_set_count": bundle.get("exercise_set_count"),
         "active_sets_estimated": strength_summary.get("active_sets_count_estimated"),
         "total_reps_estimated": _round_or_none(strength_summary.get("total_reps_estimated"), 0),
-        "total_volume_kg_estimated": _round_or_none(strength_summary.get("total_volume_kg_estimated"), 0),
+        "total_volume_kg_estimated": _round_or_none(
+            strength_summary.get("total_volume_kg_estimated"), 0
+        ),
         "max_weight_kg_seen": _round_or_none(strength_summary.get("max_weight_kg_seen"), 0),
         "source_errors": bundle.get("source_errors"),
     }
@@ -5413,14 +6052,17 @@ def _accumulate_type_totals(sessions: list[dict[str, Any]]) -> dict[str, Any]:
 
     for item in sessions:
         activity_type = item.get("activity_type") or "unknown"
-        row = by_type.setdefault(activity_type, {
-            "activity_type": activity_type,
-            "activity_family": item.get("activity_family"),
-            "sessions": 0,
-            "total_duration_min": 0.0,
-            "total_distance_km": 0.0,
-            "total_training_load": 0.0,
-        })
+        row = by_type.setdefault(
+            activity_type,
+            {
+                "activity_type": activity_type,
+                "activity_family": item.get("activity_family"),
+                "sessions": 0,
+                "total_duration_min": 0.0,
+                "total_distance_km": 0.0,
+                "total_training_load": 0.0,
+            },
+        )
 
         row["sessions"] += 1
         row["total_duration_min"] += float(item.get("duration_min") or 0.0)
@@ -5429,14 +6071,16 @@ def _accumulate_type_totals(sessions: list[dict[str, Any]]) -> dict[str, Any]:
 
     out = []
     for row in by_type.values():
-        out.append({
-            "activity_type": row["activity_type"],
-            "activity_family": row["activity_family"],
-            "sessions": row["sessions"],
-            "total_duration_min": round(row["total_duration_min"], 1),
-            "total_distance_km": round(row["total_distance_km"], 2),
-            "total_training_load": round(row["total_training_load"], 1),
-        })
+        out.append(
+            {
+                "activity_type": row["activity_type"],
+                "activity_family": row["activity_family"],
+                "sessions": row["sessions"],
+                "total_duration_min": round(row["total_duration_min"], 1),
+                "total_distance_km": round(row["total_distance_km"], 2),
+                "total_training_load": round(row["total_training_load"], 1),
+            }
+        )
 
     out.sort(key=lambda x: (-x["total_training_load"], x["activity_type"]))
     return {
@@ -5470,7 +6114,12 @@ def get_hybrid_recent_overview(limit: int = 12) -> dict[str, Any]:
 
     sessions = [_bundle_hybrid_session(bundle) for bundle in bundles]
 
-    running_like = [x for x in sessions if x.get("activity_type") in {"running", "treadmill_running", "walking", "hiking", "cardio", "elliptical"}]
+    running_like = [
+        x
+        for x in sessions
+        if x.get("activity_type")
+        in {"running", "treadmill_running", "walking", "hiking", "cardio", "elliptical"}
+    ]
     strength = [x for x in sessions if x.get("activity_type") == "strength_training"]
 
     return {
@@ -5480,10 +6129,12 @@ def get_hybrid_recent_overview(limit: int = 12) -> dict[str, Any]:
         "strength_sessions": strength,
     }
 
+
 # === MCPX HYBRID OVERVIEW TOOL END ===
 
 
 # === MCPX HYBRID COACH SNAPSHOT START ===
+
 
 def _coach_num(value: Any) -> float | None:
     try:
@@ -5501,7 +6152,9 @@ def _coach_round(value: Any, ndigits: int = 1) -> float | None:
     return round(num, ndigits)
 
 
-def _coach_pick_latest_by_type(sessions: list[dict[str, Any]], activity_type: str) -> dict[str, Any] | None:
+def _coach_pick_latest_by_type(
+    sessions: list[dict[str, Any]], activity_type: str
+) -> dict[str, Any] | None:
     for item in sessions:
         if item.get("activity_type") == activity_type:
             return item
@@ -5584,7 +6237,12 @@ def _coach_clean_session_fields(session: dict[str, Any] | None) -> dict[str, Any
     return out
 
 
-def _coach_build_takeaways(overview: dict[str, Any], day_metrics: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> list[str]:
+def _coach_build_takeaways(
+    overview: dict[str, Any],
+    day_metrics: dict[str, Any],
+    latest_run: dict[str, Any] | None,
+    latest_strength: dict[str, Any] | None,
+) -> list[str]:
     tips: list[str] = []
 
     total_load = _coach_num((overview.get("overview") or {}).get("total_training_load"))
@@ -5624,7 +6282,9 @@ def _coach_build_takeaways(overview: dict[str, Any], day_metrics: dict[str, Any]
         if run_vr is not None:
             tips.append(f"Último ratio vertical endurance: {run_vr}")
         if run_stamina_end is not None:
-            tips.append(f"Energía disponible final de la última sesión endurance: {run_stamina_end}")
+            tips.append(
+                f"Energía disponible final de la última sesión endurance: {run_stamina_end}"
+            )
 
     if latest_strength:
         strength_load = latest_strength.get("training_load")
@@ -5684,7 +6344,9 @@ def get_hybrid_coach_snapshot(limit: int = 12, target_date: str | None = None) -
         "sleep_duration_h": _coach_first_present(metrics, "sleep_duration_h"),
         "hrv_last_night": _coach_first_present(metrics, "hrv_last_night"),
         "hrv_weekly_avg": _coach_first_present(metrics, "hrv_weekly_avg"),
-        "body_battery_current": _coach_first_present(metrics, "body_battery_current", "body_battery_actual"),
+        "body_battery_current": _coach_first_present(
+            metrics, "body_battery_current", "body_battery_actual"
+        ),
         "body_battery_max": _coach_first_present(metrics, "body_battery_max"),
         "body_battery_min": _coach_first_present(metrics, "body_battery_min"),
         "resting_hr": _coach_first_present(metrics, "resting_hr"),
@@ -5727,6 +6389,7 @@ def get_hybrid_coach_snapshot(limit: int = 12, target_date: str | None = None) -
 
     return result
 
+
 # === MCPX HYBRID COACH SNAPSHOT END ===
 
 
@@ -5752,7 +6415,9 @@ def get_hybrid_coach_decision(limit: int = 12, target_date: str | None = None) -
             "level_title": level_title,
             "summary": summary_text,
             "primary_driver": _decision_pick_primary_driver(ctx, latest_run, latest_strength),
-            "recommended_action": _decision_recommendation_text(level_key, latest_run, latest_strength),
+            "recommended_action": _decision_recommendation_text(
+                level_key, latest_run, latest_strength
+            ),
         },
         "reasons": _decision_collect_reasons(ctx, latest_run, latest_strength),
         "risks": _decision_collect_risks(ctx, latest_run, latest_strength),
@@ -5763,13 +6428,19 @@ def get_hybrid_coach_decision(limit: int = 12, target_date: str | None = None) -
 
     return result
 
+
 # === MCPX HYBRID COACH DECISION END ===
 
 
 # === MCPX HYBRID USER BRIEFING START ===
 
 
-def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> dict[str, Any]:
+def _brief_plan(
+    decision: dict[str, Any],
+    ctx: dict[str, Any],
+    latest_run: dict[str, Any] | None,
+    latest_strength: dict[str, Any] | None,
+) -> dict[str, Any]:
     level_key = decision.get("level_key")
     acute = _brief_int(ctx.get("acute_load"))
     acute_es = ctx.get("acute_load_status_es")
@@ -5786,9 +6457,11 @@ def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[
             "detalle": [
                 "Nada de series ni fuerza dura.",
                 "Si haces algo, que sea fácil de cortar y sin perseguir métricas.",
-                "Prioriza llegar fresco a mañana."
+                "Prioriza llegar fresco a mañana.",
             ],
-            "contexto_carga": f"Carga aguda {acute} ({acute_es})" if acute is not None and acute_es else acute,
+            "contexto_carga": f"Carga aguda {acute} ({acute_es})"
+            if acute is not None and acute_es
+            else acute,
         }
 
     if level_key == "suave_controlado":
@@ -5807,9 +6480,11 @@ def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[
             "detalle": [
                 "Mantén margen respiratorio claro.",
                 "No conviertas una sesión suave en una sesión media.",
-                "Mejor una sola pieza principal y terminar con sensación de reserva."
+                "Mejor una sola pieza principal y terminar con sensación de reserva.",
             ],
-            "contexto_carga": f"Carga aguda {acute} ({acute_es})" if acute is not None and acute_es else acute,
+            "contexto_carga": f"Carga aguda {acute} ({acute_es})"
+            if acute is not None and acute_es
+            else acute,
         }
 
     return {
@@ -5821,33 +6496,45 @@ def _brief_plan(decision: dict[str, Any], ctx: dict[str, Any], latest_run: dict[
         "detalle": [
             "Haz una sola parte exigente.",
             "Controla el volumen más que la intensidad pico.",
-            "No mezcles fuerza pesada con una carrera dura el mismo día."
+            "No mezcles fuerza pesada con una carrera dura el mismo día.",
         ],
-        "contexto_carga": f"Carga aguda {acute} ({acute_es})" if acute is not None and acute_es else acute,
+        "contexto_carga": f"Carga aguda {acute} ({acute_es})"
+        if acute is not None and acute_es
+        else acute,
     }
 
 
-def _brief_avoid_list(decision: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> list[str]:
+def _brief_avoid_list(
+    decision: dict[str, Any],
+    latest_run: dict[str, Any] | None,
+    latest_strength: dict[str, Any] | None,
+) -> list[str]:
     level_key = decision.get("level_key")
     out: list[str] = []
 
     if level_key == "descanso_recuperacion":
-        out.extend([
-            "series intensas",
-            "fuerza pesada",
-            "doble sesión",
-        ])
+        out.extend(
+            [
+                "series intensas",
+                "fuerza pesada",
+                "doble sesión",
+            ]
+        )
     elif level_key == "suave_controlado":
-        out.extend([
-            "encadenar fuerza pesada con carrera intensa",
-            "rodaje que se te vaya a Z4-Z5",
-            "más volumen del previsto por sensaciones de inicio",
-        ])
+        out.extend(
+            [
+                "encadenar fuerza pesada con carrera intensa",
+                "rodaje que se te vaya a Z4-Z5",
+                "más volumen del previsto por sensaciones de inicio",
+            ]
+        )
     else:
-        out.extend([
-            "hacer dos sesiones duras en el mismo día",
-            "alargar volumen por encima de lo planificado",
-        ])
+        out.extend(
+            [
+                "hacer dos sesiones duras en el mismo día",
+                "alargar volumen por encima de lo planificado",
+            ]
+        )
 
     run_load = _brief_num((latest_run or {}).get("training_load"))
     if run_load is not None and run_load >= 220:
@@ -5887,7 +6574,9 @@ def _brief_nutrition_recovery(decision: dict[str, Any], ctx: dict[str, Any]) -> 
             "post": "Proteína + hidrato moderado tras la sesión para recuperar sin castigar el sueño.",
             "hidratacion": "Rehidrata de forma simple y constante; si sudas mucho, mete sodio.",
             "sueno": "Hoy el sueño es un objetivo del plan, no un detalle.",
-            "nota": f"Sueño {sleep} / kcal activas {active_kcal}" if sleep is not None or active_kcal is not None else None,
+            "nota": f"Sueño {sleep} / kcal activas {active_kcal}"
+            if sleep is not None or active_kcal is not None
+            else None,
         }
 
     return {
@@ -5895,7 +6584,9 @@ def _brief_nutrition_recovery(decision: dict[str, Any], ctx: dict[str, Any]) -> 
         "post": "Proteína + hidratos dentro de la primera hora si la sesión ha sido seria.",
         "hidratacion": "Rehidrata y repón sales si la sesión es larga o calurosa.",
         "sueno": "Protege el sueño para consolidar la carga.",
-        "nota": f"Body Battery {bb} · sueño {sleep}" if bb is not None or sleep is not None else None,
+        "nota": f"Body Battery {bb} · sueño {sleep}"
+        if bb is not None or sleep is not None
+        else None,
     }
 
 
@@ -5923,10 +6614,12 @@ def get_hybrid_user_briefing(limit: int = 12, target_date: str | None = None) ->
         "resumen_decision": decision.get("summary"),
     }
 
+
 # === MCPX HYBRID USER BRIEFING END ===
 
 
 # === MCPX HYBRID NUTRITION BRIEFING START ===
+
 
 def _nutrition_num(value: Any) -> float | None:
     try:
@@ -5957,14 +6650,18 @@ def _nutrition_reference_for_activity(activity_id: Any) -> dict[str, Any] | None
         "activity_id": str(activity_id),
         "water_estimated_ml": _nutrition_int(summary.get("waterEstimated")),
         "calories_total": _nutrition_int(summary.get("calories")),
-        "duration_min": round(float(summary.get("duration") or 0) / 60.0, 1) if summary.get("duration") is not None else None,
+        "duration_min": round(float(summary.get("duration") or 0) / 60.0, 1)
+        if summary.get("duration") is not None
+        else None,
         "training_load": _nutrition_num(summary.get("activityTrainingLoad")),
         "activity_type": full.get("activity_type"),
         "activity_name": full.get("activity_name"),
     }
 
 
-def _nutrition_focus(decision: dict[str, Any], ctx: dict[str, Any], latest_strength: dict[str, Any] | None) -> str:
+def _nutrition_focus(
+    decision: dict[str, Any], ctx: dict[str, Any], latest_strength: dict[str, Any] | None
+) -> str:
     level_key = decision.get("level_key")
     bb = _nutrition_int(ctx.get("body_battery_current"))
     sleep = _nutrition_int(ctx.get("sleep_score"))
@@ -5991,19 +6688,23 @@ def _nutrition_pre_training(decision: dict[str, Any], ctx: dict[str, Any]) -> di
             "ejemplos": [
                 "yogur o queso fresco + fruta",
                 "tostadas con jamón, pavo o huevos",
-                "comida normal con arroz/patata y proteína"
+                "comida normal con arroz/patata y proteína",
             ],
         }
 
     if level_key == "suave_controlado":
-        extra = "Evita entrenar completamente vacío." if (bb is not None and bb <= 40) or (sleep is not None and sleep <= 65) else "No necesitas una carga alta de hidratos."
+        extra = (
+            "Evita entrenar completamente vacío."
+            if (bb is not None and bb <= 40) or (sleep is not None and sleep <= 65)
+            else "No necesitas una carga alta de hidratos."
+        )
         return {
             "objetivo": "tener energía disponible sin pesadez",
             "recomendacion": "Si entrenas tras muchas horas sin comer, mete 20-40 g de hidratos y algo fácil de digerir 30-90 min antes.",
             "ejemplos": [
                 "plátano + yogur",
                 "tostada con miel o mermelada",
-                "fruta + batido o vaso de leche"
+                "fruta + batido o vaso de leche",
             ],
             "nota": extra,
         }
@@ -6014,12 +6715,16 @@ def _nutrition_pre_training(decision: dict[str, Any], ctx: dict[str, Any]) -> di
         "ejemplos": [
             "arroz o avena + proteína ligera",
             "pan o tostadas + fruta",
-            "yogur + cereales + fruta"
+            "yogur + cereales + fruta",
         ],
     }
 
 
-def _nutrition_post_training(decision: dict[str, Any], latest_run_ref: dict[str, Any] | None, latest_strength_ref: dict[str, Any] | None) -> dict[str, Any]:
+def _nutrition_post_training(
+    decision: dict[str, Any],
+    latest_run_ref: dict[str, Any] | None,
+    latest_strength_ref: dict[str, Any] | None,
+) -> dict[str, Any]:
     level_key = decision.get("level_key")
 
     if level_key == "descanso_recuperacion":
@@ -6029,7 +6734,7 @@ def _nutrition_post_training(decision: dict[str, Any], latest_run_ref: dict[str,
             "ejemplos": [
                 "tortilla o pollo con patata/arroz",
                 "yogur alto en proteína + fruta",
-                "legumbre + proteína + verduras"
+                "legumbre + proteína + verduras",
             ],
         }
 
@@ -6043,7 +6748,7 @@ def _nutrition_post_training(decision: dict[str, Any], latest_run_ref: dict[str,
             "ejemplos": [
                 "batido o yogur alto en proteína + fruta + cereales",
                 "arroz/patata/pan + pollo, atún o huevos",
-                "queso fresco batido + fruta + avena"
+                "queso fresco batido + fruta + avena",
             ],
             "nota": note,
         }
@@ -6057,13 +6762,17 @@ def _nutrition_post_training(decision: dict[str, Any], latest_run_ref: dict[str,
         "ejemplos": [
             "arroz/pasta/patata + proteína magra",
             "batido + fruta + pan o cereales",
-            "comida completa con hidrato principal y proteína suficiente"
+            "comida completa con hidrato principal y proteína suficiente",
         ],
         "nota": note,
     }
 
 
-def _nutrition_hydration(decision: dict[str, Any], latest_run_ref: dict[str, Any] | None, latest_strength_ref: dict[str, Any] | None) -> dict[str, Any]:
+def _nutrition_hydration(
+    decision: dict[str, Any],
+    latest_run_ref: dict[str, Any] | None,
+    latest_strength_ref: dict[str, Any] | None,
+) -> dict[str, Any]:
     level_key = decision.get("level_key")
 
     refs = []
@@ -6124,7 +6833,9 @@ def _nutrition_avoid_today(decision: dict[str, Any], ctx: dict[str, Any]) -> lis
     return dedup
 
 
-def _nutrition_reasoning(ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None) -> list[str]:
+def _nutrition_reasoning(
+    ctx: dict[str, Any], latest_run: dict[str, Any] | None, latest_strength: dict[str, Any] | None
+) -> list[str]:
     out = []
 
     readiness = _nutrition_int(ctx.get("training_readiness"))
@@ -6147,13 +6858,17 @@ def _nutrition_reasoning(ctx: dict[str, Any], latest_run: dict[str, Any] | None,
     if latest_run and latest_run.get("training_load") is not None:
         out.append(f"Última sesión endurance carga {latest_run['training_load']}")
     if latest_strength and latest_strength.get("total_volume_kg_estimated") is not None:
-        out.append(f"Última fuerza volumen {int(round(float(latest_strength['total_volume_kg_estimated'])))} kg")
+        out.append(
+            f"Última fuerza volumen {int(round(float(latest_strength['total_volume_kg_estimated'])))} kg"
+        )
 
     return out
 
 
 @mcp.tool
-def get_hybrid_nutrition_briefing(limit: int = 12, target_date: str | None = None) -> dict[str, Any]:
+def get_hybrid_nutrition_briefing(
+    limit: int = 12, target_date: str | None = None
+) -> dict[str, Any]:
     """Plan nutricional diario práctico usando la decisión híbrida y el contexto reciente."""
     decision_pack = get_hybrid_coach_decision(limit=limit, target_date=target_date)
 
@@ -6164,13 +6879,17 @@ def get_hybrid_nutrition_briefing(limit: int = 12, target_date: str | None = Non
     latest_strength = latest.get("strength")
 
     latest_run_ref = _nutrition_reference_for_activity((latest_run or {}).get("activity_id"))
-    latest_strength_ref = _nutrition_reference_for_activity((latest_strength or {}).get("activity_id"))
+    latest_strength_ref = _nutrition_reference_for_activity(
+        (latest_strength or {}).get("activity_id")
+    )
 
     return {
         "target_date": decision_pack.get("target_date"),
         "foco_nutricional": _nutrition_focus(decision, ctx, latest_strength),
         "antes_de_entrenar": _nutrition_pre_training(decision, ctx),
-        "despues_de_entrenar": _nutrition_post_training(decision, latest_run_ref, latest_strength_ref),
+        "despues_de_entrenar": _nutrition_post_training(
+            decision, latest_run_ref, latest_strength_ref
+        ),
         "hidratacion": _nutrition_hydration(decision, latest_run_ref, latest_strength_ref),
         "evitar_hoy": _nutrition_avoid_today(decision, ctx),
         "por_que": _nutrition_reasoning(ctx, latest_run, latest_strength),
@@ -6178,8 +6897,9 @@ def get_hybrid_nutrition_briefing(limit: int = 12, target_date: str | None = Non
             "driver_principal": decision.get("primary_driver"),
             "accion_recomendada": decision.get("recommended_action"),
             "resumen_decision": decision.get("summary"),
-        }
+        },
     }
+
 
 # === MCPX HYBRID NUTRITION BRIEFING END ===
 
@@ -6193,9 +6913,7 @@ _HISTORY_SLEEP_BETWEEN_DAYS_S = 0.35
 
 def _compact_activity_for_history(activity: dict) -> dict:
     """Normalización compacta optimizada para listas históricas largas."""
-    activity_type = (
-        activity.get("activityType") or activity.get("activityTypeDTO") or {}
-    )
+    activity_type = activity.get("activityType") or activity.get("activityTypeDTO") or {}
     type_key = activity_type.get("typeKey")
     summary = activity.get("summaryDTO") or {}
 
@@ -6208,9 +6926,7 @@ def _compact_activity_for_history(activity: dict) -> dict:
         "type": type_key,
         "type_es": _ACTIVITY_TYPE_ES.get(type_key, type_key) if type_key else None,
         "activity_family": _activity_family(type_key),
-        "start_time_local": (
-            activity.get("startTimeLocal") or summary.get("startTimeLocal")
-        ),
+        "start_time_local": (activity.get("startTimeLocal") or summary.get("startTimeLocal")),
         "duration_min": round(float(duration_s) / 60, 1) if duration_s is not None else None,
         "distance_km": round(float(distance_m) / 1000, 2) if distance_m is not None else None,
         "avg_hr": activity.get("averageHR") or summary.get("averageHR"),
@@ -6246,11 +6962,7 @@ def get_activities_paged(limit: int = 100, offset: int = 0) -> dict:
     if not isinstance(activities, list):
         activities = []
 
-    normalized = [
-        _compact_activity_for_history(a)
-        for a in activities
-        if isinstance(a, dict)
-    ]
+    normalized = [_compact_activity_for_history(a) for a in activities if isinstance(a, dict)]
 
     return {
         "offset": offset,
@@ -6286,9 +6998,7 @@ def get_activities_in_range(
                 api, ("get_activities_by_date",), start, end, activity_type
             )
         else:
-            activities, err = _optional_call_first(
-                api, ("get_activities_by_date",), start, end
-            )
+            activities, err = _optional_call_first(api, ("get_activities_by_date",), start, end)
 
     if activities is None:
         raise RuntimeError(err or f"No pude leer actividades entre {start} y {end}")
@@ -6296,11 +7006,7 @@ def get_activities_in_range(
     if not isinstance(activities, list):
         activities = []
 
-    normalized = [
-        _compact_activity_for_history(a)
-        for a in activities
-        if isinstance(a, dict)
-    ]
+    normalized = [_compact_activity_for_history(a) for a in activities if isinstance(a, dict)]
     normalized.sort(key=lambda x: x.get("start_time_local") or "", reverse=True)
 
     return {
@@ -6316,9 +7022,7 @@ def _compact_wellness_for_range(api, target_date: str) -> dict:
     """Snapshot wellness ligero para una fecha.
     No usa FETCH_LOCK ni llama a _get_api() — debe invocarse con api ya obtenido.
     """
-    summary, _ = _optional_call_first(
-        api, ("get_user_summary", "get_stats"), target_date
-    )
+    summary, _ = _optional_call_first(api, ("get_user_summary", "get_stats"), target_date)
     sleep, _ = _optional_call_first(api, ("get_sleep_data",), target_date)
     hrv, _ = _optional_call_first(api, ("get_hrv_data",), target_date)
 
@@ -6416,7 +7120,9 @@ def get_wellness_range(
         "note": (
             f"Rango recortado a {_HISTORY_MAX_WELLNESS_DAYS} dias. "
             f"Llama de nuevo con start_date={end_dt.isoformat()} para continuar."
-        ) if clipped else None,
+        )
+        if clipped
+        else None,
         "days": days_data,
         "errors": errors if errors else None,
     }
@@ -6472,9 +7178,7 @@ def get_fitness_age(target_date: str | None = None) -> dict:
 
     with _fetch_lock():
         api = _get_api()
-        data, err = _optional_call_first(
-            api, ("get_fitnessage_data", "get_fitness_age"), parsed
-        )
+        data, err = _optional_call_first(api, ("get_fitnessage_data", "get_fitness_age"), parsed)
 
     if data is None:
         raise RuntimeError(err or "No se pudo obtener la edad física")
@@ -6492,9 +7196,11 @@ def get_endurance_score(
     Formato: YYYY-MM-DD.
     """
     ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_input_date(start_date) if start_date else (
-        date.fromisoformat(ed) - timedelta(days=27)
-    ).isoformat()
+    sd = (
+        _parse_input_date(start_date)
+        if start_date
+        else (date.fromisoformat(ed) - timedelta(days=27)).isoformat()
+    )
 
     with _fetch_lock():
         api = _get_api()
@@ -6516,9 +7222,11 @@ def get_hill_score(
     Formato: YYYY-MM-DD.
     """
     ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_input_date(start_date) if start_date else (
-        date.fromisoformat(ed) - timedelta(days=27)
-    ).isoformat()
+    sd = (
+        _parse_input_date(start_date)
+        if start_date
+        else (date.fromisoformat(ed) - timedelta(days=27)).isoformat()
+    )
 
     with _fetch_lock():
         api = _get_api()
@@ -6620,9 +7328,11 @@ def get_weigh_ins(
     Sin fechas devuelve los últimos 30 días. Formato: YYYY-MM-DD.
     """
     ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_input_date(start_date) if start_date else (
-        date.fromisoformat(ed) - timedelta(days=29)
-    ).isoformat()
+    sd = (
+        _parse_input_date(start_date)
+        if start_date
+        else (date.fromisoformat(ed) - timedelta(days=29)).isoformat()
+    )
 
     with _fetch_lock():
         api = _get_api()
@@ -6647,9 +7357,7 @@ def add_weigh_in(
 
     with _fetch_lock():
         api = _get_api()
-        data, err = _optional_call_first(
-            api, ("add_weigh_in",), weight_kg, "kg", parsed
-        )
+        data, err = _optional_call_first(api, ("add_weigh_in",), weight_kg, "kg", parsed)
 
     # Garmin responde 204 (sin cuerpo) en éxito; la librería devuelve None en ese caso.
     if data is None and err:
@@ -6659,6 +7367,7 @@ def add_weigh_in(
 
 
 # === EXTRA API TOOLS START ===
+
 
 @mcp.tool
 def get_activity_splits(activity_id: str) -> dict:
@@ -6684,7 +7393,9 @@ def get_activity_split_summaries(activity_id: str) -> dict:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_split_summaries",), activity_id)
     if data is None:
-        raise RuntimeError(err or f"No se pudieron obtener los resúmenes de splits de {activity_id}")
+        raise RuntimeError(
+            err or f"No se pudieron obtener los resúmenes de splits de {activity_id}"
+        )
     return {"activity_id": activity_id, "split_summaries": data}
 
 
@@ -6698,7 +7409,9 @@ def get_activity_hr_in_timezones(activity_id: str) -> dict:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_activity_hr_in_timezones",), activity_id)
     if data is None:
-        raise RuntimeError(err or f"No se pudo obtener la distribución de FC por zonas de {activity_id}")
+        raise RuntimeError(
+            err or f"No se pudo obtener la distribución de FC por zonas de {activity_id}"
+        )
     return {"activity_id": activity_id, "hr_in_timezones": data}
 
 
@@ -6809,9 +7522,11 @@ def get_daily_steps(
     Sin fechas usa los últimos 7 días. Formato: YYYY-MM-DD.
     """
     ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_input_date(start_date) if start_date else (
-        date.fromisoformat(ed) - timedelta(days=6)
-    ).isoformat()
+    sd = (
+        _parse_input_date(start_date)
+        if start_date
+        else (date.fromisoformat(ed) - timedelta(days=6)).isoformat()
+    )
     with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(api, ("get_daily_steps",), sd, ed)
@@ -6844,9 +7559,11 @@ def get_blood_pressure(
     Sin fechas usa los últimos 7 días. Formato: YYYY-MM-DD.
     """
     ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_input_date(start_date) if start_date else (
-        date.fromisoformat(ed) - timedelta(days=6)
-    ).isoformat()
+    sd = (
+        _parse_input_date(start_date)
+        if start_date
+        else (date.fromisoformat(ed) - timedelta(days=6)).isoformat()
+    )
     with _fetch_lock():
         api = _get_api()
         data, err = _optional_call_first(
@@ -6884,10 +7601,20 @@ def get_progress_summary(
     Sin fechas usa los últimos 30 días. Formato: YYYY-MM-DD.
     """
     ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_input_date(start_date) if start_date else (
-        date.fromisoformat(ed) - timedelta(days=29)
-    ).isoformat()
-    valid = {"distance","duration","elevationGain","movingDuration","calories","bmrCalories","steps"}
+    sd = (
+        _parse_input_date(start_date)
+        if start_date
+        else (date.fromisoformat(ed) - timedelta(days=29)).isoformat()
+    )
+    valid = {
+        "distance",
+        "duration",
+        "elevationGain",
+        "movingDuration",
+        "calories",
+        "bmrCalories",
+        "steps",
+    }
     if metric not in valid:
         metric = "distance"
     with _fetch_lock():
@@ -6975,7 +7702,9 @@ def get_gear_stats(gear_uuid: str) -> dict:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_gear_stats",), gear_uuid)
     if data is None:
-        raise RuntimeError(err or f"No se pudieron obtener las estadísticas del material {gear_uuid}")
+        raise RuntimeError(
+            err or f"No se pudieron obtener las estadísticas del material {gear_uuid}"
+        )
     return {"gear_uuid": gear_uuid, "stats": data}
 
 
@@ -7148,7 +7877,13 @@ def set_gear_default(activity_type: str, gear_uuid: str, is_default: bool = True
 
     if data is None and err:
         raise RuntimeError(err)
-    return {"ok": True, "activity_type": activity_type, "gear_uuid": gear_uuid, "is_default": is_default, "response": data}
+    return {
+        "ok": True,
+        "activity_type": activity_type,
+        "gear_uuid": gear_uuid,
+        "is_default": is_default,
+        "response": data,
+    }
 
 
 @mcp.tool
@@ -7177,7 +7912,9 @@ def get_respiration_data(target_date: str | None = None) -> dict:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_respiration_data",), parsed)
     if data is None:
-        raise RuntimeError(err or f"No se pudieron obtener los datos de respiración del día {parsed}")
+        raise RuntimeError(
+            err or f"No se pudieron obtener los datos de respiración del día {parsed}"
+        )
     return {"date": parsed, "respiration": data}
 
 
@@ -7192,7 +7929,9 @@ def get_hydration_data(target_date: str | None = None) -> dict:
         api = _get_api()
         data, err = _optional_call_first(api, ("get_hydration_data",), parsed)
     if data is None:
-        raise RuntimeError(err or f"No se pudieron obtener los datos de hidratación del día {parsed}")
+        raise RuntimeError(
+            err or f"No se pudieron obtener los datos de hidratación del día {parsed}"
+        )
     return {"date": parsed, "hydration": data}
 
 
@@ -7205,20 +7944,21 @@ def get_body_composition(
     Sin fechas devuelve los últimos 30 días. Formato: YYYY-MM-DD.
     """
     ed = _parse_input_date(end_date) if end_date else _today_local().isoformat()
-    sd = _parse_input_date(start_date) if start_date else (
-        date.fromisoformat(ed) - timedelta(days=29)
-    ).isoformat()
+    sd = (
+        _parse_input_date(start_date)
+        if start_date
+        else (date.fromisoformat(ed) - timedelta(days=29)).isoformat()
+    )
     with _fetch_lock():
         api = _get_api()
-        data, err = _optional_call_first(
-            api, ("get_body_composition", "get_weight_data"), sd, ed
-        )
+        data, err = _optional_call_first(api, ("get_body_composition", "get_weight_data"), sd, ed)
     if data is None:
         raise RuntimeError(err or "No se pudo obtener la composición corporal")
     return {"start_date": sd, "end_date": ed, "body_composition": data}
 
 
 # === WORKOUT & CALENDAR TOOLS ===
+
 
 @mcp.tool
 def get_scheduled_workouts(year: int | None = None, month: int | None = None) -> dict:
@@ -7239,10 +7979,24 @@ def get_scheduled_workouts(year: int | None = None, month: int | None = None) ->
             else:
                 data = api.connectapi(f"/calendar-service/year/{y}/month/{m - 1}")
         except Exception as e:
-            raise RuntimeError(f"No se pudieron obtener los entrenamientos planificados de {y}/{m:02d}: {e}")
+            raise RuntimeError(
+                f"No se pudieron obtener los entrenamientos planificados de {y}/{m:02d}: {e}"
+            )
     # Filtrar solo elementos tipo workout del calendario
-    items = data if isinstance(data, list) else (data.get("calendarItems") or data.get("items") or [data] if isinstance(data, dict) else [])
-    workouts = [i for i in items if isinstance(i, dict) and i.get("itemType", "").lower() in ("workout", "garmincoach", "")]
+    items = (
+        data
+        if isinstance(data, list)
+        else (
+            data.get("calendarItems") or data.get("items") or [data]
+            if isinstance(data, dict)
+            else []
+        )
+    )
+    workouts = [
+        i
+        for i in items
+        if isinstance(i, dict) and i.get("itemType", "").lower() in ("workout", "garmincoach", "")
+    ]
     return {
         "year": y,
         "month": m,
@@ -7264,16 +8018,24 @@ def get_todays_workout() -> dict:
             if hasattr(api, "get_workouts_calendar"):
                 data = api.get_workouts_calendar(today.year, today.month)
             else:
-                data = api.connectapi(f"/calendar-service/year/{today.year}/month/{today.month - 1}")
+                data = api.connectapi(
+                    f"/calendar-service/year/{today.year}/month/{today.month - 1}"
+                )
         except Exception as e:
             raise RuntimeError(f"No se pudo obtener el calendario de hoy: {e}")
-    items = data if isinstance(data, list) else (data.get("calendarItems") or data.get("items") or [])
+    items = (
+        data if isinstance(data, list) else (data.get("calendarItems") or data.get("items") or [])
+    )
     today_iso = today.isoformat()
-    todays = [i for i in items if isinstance(i, dict) and str(i.get("date", "")).startswith(today_iso)]
+    todays = [
+        i for i in items if isinstance(i, dict) and str(i.get("date", "")).startswith(today_iso)
+    ]
     return {
         "date": today_iso,
         "todays_items": todays,
-        "has_workout": any(i.get("itemType", "").lower() in ("workout", "garmincoach") for i in todays),
+        "has_workout": any(
+            i.get("itemType", "").lower() in ("workout", "garmincoach") for i in todays
+        ),
         "calendar_raw": data,
     }
 
@@ -7293,13 +8055,19 @@ def get_workout_for_date(target_date: str) -> dict:
             if hasattr(api, "get_workouts_calendar"):
                 data = api.get_workouts_calendar(target.year, target.month)
             else:
-                data = api.connectapi(f"/calendar-service/year/{target.year}/month/{target.month - 1}")
+                data = api.connectapi(
+                    f"/calendar-service/year/{target.year}/month/{target.month - 1}"
+                )
         except Exception as e:
             raise RuntimeError(f"No se pudo obtener el calendario para {parsed}: {e}")
 
-    items = data if isinstance(data, list) else (data.get("calendarItems") or data.get("items") or [])
+    items = (
+        data if isinstance(data, list) else (data.get("calendarItems") or data.get("items") or [])
+    )
     target_iso = target.isoformat()
-    matching = [i for i in items if isinstance(i, dict) and str(i.get("date", "")).startswith(target_iso)]
+    matching = [
+        i for i in items if isinstance(i, dict) and str(i.get("date", "")).startswith(target_iso)
+    ]
 
     workout_detail = None
     workout_id = None
@@ -7331,20 +8099,26 @@ def get_workout_for_date(target_date: str) -> dict:
                 target_type = s.get("targetType") or s.get("targetValueUnit") or ""
                 distance = s.get("distance") or ""
                 hr_zone = s.get("heartRateZone") or s.get("targetHRZone") or ""
-                steps_summary.append({
-                    "type": _translate_garmin(step_type) if isinstance(step_type, str) else step_type,
-                    "name": step_name,
-                    "duration": duration,
-                    "distance": distance,
-                    "target": target_val,
-                    "target_type": target_type,
-                    "hr_zone": hr_zone,
-                })
+                steps_summary.append(
+                    {
+                        "type": _translate_garmin(step_type)
+                        if isinstance(step_type, str)
+                        else step_type,
+                        "name": step_name,
+                        "duration": duration,
+                        "distance": distance,
+                        "target": target_val,
+                        "target_type": target_type,
+                        "hr_zone": hr_zone,
+                    }
+                )
 
     return {
         "date": parsed,
         "calendar_items": matching,
-        "has_workout": any(i.get("itemType", "").lower() in ("workout", "garmincoach") for i in matching),
+        "has_workout": any(
+            i.get("itemType", "").lower() in ("workout", "garmincoach") for i in matching
+        ),
         "workout_id": workout_id,
         "workout_detail": workout_detail,
         "steps_summary": steps_summary,
@@ -7365,7 +8139,9 @@ def get_workout_library(start: int = 0, limit: int = 20) -> dict:
             if hasattr(api, "get_workouts"):
                 data = api.get_workouts(start, limit)
             else:
-                data = api.connectapi(f"/workout-service/workouts?start={start}&limit={limit}&myWorkoutsOnly=true&sharedWorkoutsOnly=false")
+                data = api.connectapi(
+                    f"/workout-service/workouts?start={start}&limit={limit}&myWorkoutsOnly=true&sharedWorkoutsOnly=false"
+                )
         except Exception as e:
             raise RuntimeError(f"No se pudo obtener la biblioteca de entrenamientos: {e}")
     return {"start": start, "limit": limit, "workouts": data}
@@ -7413,8 +8189,10 @@ def get_training_plan_detail(plan_id: str) -> dict:
     with _fetch_lock():
         api = _get_api()
         data = None
-        for path in (f"/trainingplan-service/trainingplan/phased/{plan_id}",
-                     f"/trainingplan-service/trainingplan/fbt-adaptive/{plan_id}"):
+        for path in (
+            f"/trainingplan-service/trainingplan/phased/{plan_id}",
+            f"/trainingplan-service/trainingplan/fbt-adaptive/{plan_id}",
+        ):
             try:
                 data = api.connectapi(path)
                 if data:
@@ -7439,9 +8217,13 @@ def schedule_workout(workout_id: str, target_date: str) -> dict:
             if hasattr(api, "schedule_workout"):
                 data = api.schedule_workout(workout_id, parsed)
             else:
-                data = api.garth.post("connectapi", f"/workout-service/schedule/{workout_id}", json={"date": parsed})
+                data = api.garth.post(
+                    "connectapi", f"/workout-service/schedule/{workout_id}", json={"date": parsed}
+                )
         except Exception as e:
-            raise RuntimeError(f"No se pudo planificar el entrenamiento {workout_id} para {parsed}: {e}")
+            raise RuntimeError(
+                f"No se pudo planificar el entrenamiento {workout_id} para {parsed}: {e}"
+            )
     return {"ok": True, "workout_id": workout_id, "date": parsed, "response": data}
 
 
@@ -7472,17 +8254,21 @@ def _push_workout(api: Any, workout_id: str) -> Any:
         raise RuntimeError("No se pudo determinar el dispositivo Garmin del usuario")
     detail = api.get_workout_by_id(workout_id)
     workout_name = detail.get("workoutName", f"Workout {workout_id}")
-    payload = [{
-        "deviceId": int(device_id),
-        "messageUrl": f"workout-service/workout/FIT/{workout_id}",
-        "messageType": "workouts",
-        "groupName": None,
-        "messageName": workout_name,
-        "priority": 1,
-        "fileType": "FIT",
-        "metaDataId": workout_id,
-    }]
-    return api.client.post("connectapi", "/device-service/devicemessage/messages", json=payload, api=True)
+    payload = [
+        {
+            "deviceId": int(device_id),
+            "messageUrl": f"workout-service/workout/FIT/{workout_id}",
+            "messageType": "workouts",
+            "groupName": None,
+            "messageName": workout_name,
+            "priority": 1,
+            "fileType": "FIT",
+            "metaDataId": workout_id,
+        }
+    ]
+    return api.client.post(
+        "connectapi", "/device-service/devicemessage/messages", json=payload, api=True
+    )
 
 
 @mcp.tool
@@ -7496,7 +8282,9 @@ def push_workout_to_device(workout_id: str) -> dict:
         try:
             result = _push_workout(api, workout_id)
         except Exception as e:
-            raise RuntimeError(f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}")
+            raise RuntimeError(
+                f"No se pudo enviar el entrenamiento {workout_id} al dispositivo: {e}"
+            )
     return {"ok": True, "workout_id": workout_id, "pushed": True, "response": result}
 
 
@@ -7511,9 +8299,9 @@ def get_nutrition_log(target_date: str | None = None) -> dict:
         api = _get_api()
         food_log, meals, settings = None, None, None
         for method, path in (
-            ("food_log",    f"/nutrition-service/food/logs/{parsed}"),
-            ("meals",       f"/nutrition-service/meals/{parsed}"),
-            ("settings",    f"/nutrition-service/settings/{parsed}"),
+            ("food_log", f"/nutrition-service/food/logs/{parsed}"),
+            ("meals", f"/nutrition-service/meals/{parsed}"),
+            ("settings", f"/nutrition-service/settings/{parsed}"),
         ):
             try:
                 result = api.connectapi(path)
@@ -7526,13 +8314,16 @@ def get_nutrition_log(target_date: str | None = None) -> dict:
             except Exception:
                 pass
     if food_log is None and meals is None:
-        raise RuntimeError(f"No hay datos de nutrición para {parsed}. Asegúrate de registrar alimentos en Garmin Connect.")
+        raise RuntimeError(
+            f"No hay datos de nutrición para {parsed}. Asegúrate de registrar alimentos en Garmin Connect."
+        )
     return {
         "date": parsed,
         "food_log": food_log,
         "meals": meals,
         "settings": settings,
     }
+
 
 # === WORKOUT & CALENDAR TOOLS END ===
 
@@ -7542,8 +8333,11 @@ def get_nutrition_log(target_date: str | None = None) -> dict:
 
 # === NEW GARMIN API TOOLS START ===
 
+
 @mcp.tool
-def upload_activity(file_base64: str, name: str = "", description: str = "", activity_type: str = "") -> dict:
+def upload_activity(
+    file_base64: str, name: str = "", description: str = "", activity_type: str = ""
+) -> dict:
     """Sube un fichero .fit a Garmin Connect.
     file_base64: contenido del fichero codificado en base64.
     name: nombre de la actividad (opcional).
@@ -7553,6 +8347,7 @@ def upload_activity(file_base64: str, name: str = "", description: str = "", act
     import base64 as _b64
     import os
     import tempfile
+
     try:
         data = _b64.b64decode(file_base64)
     except Exception as e:
@@ -7577,6 +8372,7 @@ def download_activity(activity_id: str, format: str = "gpx") -> dict:
     format: 'gpx' (por defecto), 'tcx', 'kml', 'csv', 'fit' / 'original'.
     """
     import base64 as _b64
+
     fmt_map = {
         "gpx": "GPX",
         "tcx": "TCX",
@@ -7590,13 +8386,17 @@ def download_activity(activity_id: str, format: str = "gpx") -> dict:
         raise ValueError(f"Formato '{format}' no soportado. Usa: gpx, tcx, kml, csv, fit.")
     fmt_enum = getattr(Garmin.ActivityDownloadFormat, fmt_key, None)
     if fmt_enum is None:
-        raise ValueError(f"ActivityDownloadFormat.{fmt_key} no existe en esta versión de garminconnect.")
+        raise ValueError(
+            f"ActivityDownloadFormat.{fmt_key} no existe en esta versión de garminconnect."
+        )
     with _fetch_lock():
         api = _get_api()
         try:
             data = api.download_activity(int(activity_id), dl_fmt=fmt_enum)
         except Exception as e:
-            raise RuntimeError(f"Error descargando actividad {activity_id} en formato {format}: {e}")
+            raise RuntimeError(
+                f"Error descargando actividad {activity_id} en formato {format}: {e}"
+            )
     return {
         "activity_id": activity_id,
         "format": format,
@@ -7783,9 +8583,11 @@ def get_stats(target_date: str | None = None) -> dict:
         raise RuntimeError(err or f"No hay estadísticas para {parsed}.")
     return {"date": parsed, "stats": data}
 
+
 # === NEW GARMIN API TOOLS END ===
 
 # === MULTI-USER & COACHING TOOLS ===
+
 
 @mcp.tool
 def list_users() -> dict[str, Any]:
@@ -7796,12 +8598,14 @@ def list_users() -> dict[str, Any]:
     db = _load_users_db()
     users_list = []
     for uid, u in db.get("users", {}).items():
-        users_list.append({
-            "id": uid,
-            "display_name": u.get("display_name", ""),
-            "garmin_email": u.get("garmin_email", ""),
-            "created_at": u.get("created_at", ""),
-        })
+        users_list.append(
+            {
+                "id": uid,
+                "display_name": u.get("display_name", ""),
+                "garmin_email": u.get("garmin_email", ""),
+                "created_at": u.get("created_at", ""),
+            }
+        )
     return {"users": users_list, "total": len(users_list)}
 
 
@@ -7982,7 +8786,9 @@ def _import_plan_from_pdf_internal(
 
     plan_text = r.get("full_text", "")
     if not plan_text.strip():
-        return {"error": "El PDF no contiene texto extraíble. Puede ser un PDF escaneado (imagen) sin capa de texto."}
+        return {
+            "error": "El PDF no contiene texto extraíble. Puede ser un PDF escaneado (imagen) sin capa de texto."
+        }
 
     try:
         base_date = date.fromisoformat(start_date)
@@ -7991,13 +8797,23 @@ def _import_plan_from_pdf_internal(
 
     sessions = _parse_plan_text_to_sessions(plan_text)
     if not sessions:
-        return {"error": "No pude detectar sesiones en el PDF. El formato esperado es 'Semana X: Día descripción'."}
+        return {
+            "error": "No pude detectar sesiones en el PDF. El formato esperado es 'Semana X: Día descripción'."
+        }
 
     overview = [
         {
             "session": i + 1,
             "target_date": (base_date + timedelta(days=s["day_offset"])).isoformat(),
-            "day_of_week": ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")[s["day_offset"] % 7],
+            "day_of_week": (
+                "lunes",
+                "martes",
+                "miércoles",
+                "jueves",
+                "viernes",
+                "sábado",
+                "domingo",
+            )[s["day_offset"] % 7],
             "description": s["description"],
         }
         for i, s in enumerate(sessions)
@@ -8012,7 +8828,9 @@ def _import_plan_from_pdf_internal(
 
     result["source"] = "pdf"
     result["session_overview"] = overview
-    result["notes"] = "Cada sesión se ha creado con sus etapas (calentamiento, series, repeticiones, descanso y vuelta a la calma) a partir de la descripción."
+    result["notes"] = (
+        "Cada sesión se ha creado con sus etapas (calentamiento, series, repeticiones, descanso y vuelta a la calma) a partir de la descripción."
+    )
     return result
 
 
@@ -8028,18 +8846,31 @@ def _parse_plan_text_to_sessions(plan_text: str) -> list[dict[str, Any]]:
     lines = [line.strip() for line in plan_text.strip().splitlines() if line.strip()]
 
     day_map = {
-        "lunes": 0, "mon": 0, "martes": 1, "tue": 1, "miércoles": 2,
-        "miercoles": 2, "wed": 2, "jueves": 3, "thu": 3, "viernes": 4,
-        "fri": 4, "sábado": 5, "sabado": 5, "sat": 5, "domingo": 6, "sun": 6,
+        "lunes": 0,
+        "mon": 0,
+        "martes": 1,
+        "tue": 1,
+        "miércoles": 2,
+        "miercoles": 2,
+        "wed": 2,
+        "jueves": 3,
+        "thu": 3,
+        "viernes": 4,
+        "fri": 4,
+        "sábado": 5,
+        "sabado": 5,
+        "sat": 5,
+        "domingo": 6,
+        "sun": 6,
     }
     day_names = "|".join(day_map.keys())
-    day_re = re.compile(rf'\b({day_names})\b\s*[:\-]?\s*', re.I)
+    day_re = re.compile(rf"\b({day_names})\b\s*[:\-]?\s*", re.I)
 
     current_week = 0
     seen: dict[int, str] = {}
 
     def push(day_offset: int, text: str) -> None:
-        text = re.sub(r'\s+', ' ', text).strip(' .,;:-')
+        text = re.sub(r"\s+", " ", text).strip(" .,;:-")
         if not text:
             return
         # Merge múltiples fragmentos del mismo día en una única sesión.
@@ -8049,7 +8880,7 @@ def _parse_plan_text_to_sessions(plan_text: str) -> list[dict[str, Any]]:
             seen[day_offset] = text
 
     for line in lines:
-        week_match = re.match(r'(?:semana|week)\s*(\d+)', line, re.I)
+        week_match = re.match(r"(?:semana|week)\s*(\d+)", line, re.I)
         if week_match:
             current_week = int(week_match.group(1)) - 1
 
@@ -8061,11 +8892,11 @@ def _parse_plan_text_to_sessions(plan_text: str) -> list[dict[str, Any]]:
         # sigue a cada uno. Si la línea empieza por un día, todo lo posterior
         # (incluidas las partes con coma) pertenece a esa sesión.
         if week_match:
-            rest = line[week_match.end():]
+            rest = line[week_match.end() :]
             day_match = day_re.search(rest)
             if day_match:
                 day_of_week = day_map.get(day_match.group(1).lower(), 0)
-                text_after = rest[day_match.end():]
+                text_after = rest[day_match.end() :]
                 push(current_week * 7 + day_of_week, text_after)
             continue
 
@@ -8073,16 +8904,18 @@ def _parse_plan_text_to_sessions(plan_text: str) -> list[dict[str, Any]]:
         day_match = day_re.search(line)
         if day_match:
             day_of_week = day_map.get(day_match.group(1).lower(), 0)
-            text_after = line[day_match.end():]
+            text_after = line[day_match.end() :]
             push(current_week * 7 + day_of_week, text_after)
 
     for day_offset, text in sorted(seen.items()):
-        sessions.append({
-            "day_offset": day_offset,
-            "sport": "running",
-            "name": text[:50].strip(),
-            "description": text,
-        })
+        sessions.append(
+            {
+                "day_offset": day_offset,
+                "sport": "running",
+                "name": text[:50].strip(),
+                "description": text,
+            }
+        )
     return sessions
 
 
@@ -8128,19 +8961,26 @@ def create_workout_from_description(
     for i, s in enumerate(steps):
         gs = _garmin_workout_step_from_desc(s, i + 1)
         workout_steps.append(gs)
-        if gs.get("endConditionValue") is not None and gs.get("endCondition", {}).get("conditionTypeKey") == "time":
+        if (
+            gs.get("endConditionValue") is not None
+            and gs.get("endCondition", {}).get("conditionTypeKey") == "time"
+        ):
             total_seconds += float(gs["endConditionValue"])
 
     sport_type_id_map = {
-        "running": 1, "cycling": 2, "swimming": 3, "walking": 4,
-        "strength_training": 6, "cardio": 6, "hiking": 7, "multi_sport": 5,
+        "running": 1,
+        "cycling": 2,
+        "swimming": 3,
+        "walking": 4,
+        "strength_training": 6,
+        "cardio": 6,
+        "hiking": 7,
+        "multi_sport": 5,
     }
     sport_key = sport.lower().replace(" ", "_")
     if sport_key not in sport_type_id_map:
         supported = ", ".join(sorted(sport_type_id_map))
-        raise RuntimeError(
-            f"Deporte no soportado: {sport!r}. Usa uno de: {supported}."
-        )
+        raise RuntimeError(f"Deporte no soportado: {sport!r}. Usa uno de: {supported}.")
     sport_type_id = sport_type_id_map[sport_key]
     sport_type = {"sportTypeId": sport_type_id, "sportTypeKey": sport_key, "displayOrder": 1}
 
@@ -8182,7 +9022,8 @@ def create_workout_from_description(
         "workout_id": workout_id,
         "scheduled": schedule_result is not None,
         "scheduled_date": target_date,
-        "pushed_to_device": push_result is not None and (not isinstance(push_result, dict) or "error" not in push_result),
+        "pushed_to_device": push_result is not None
+        and (not isinstance(push_result, dict) or "error" not in push_result),
         "name": name,
         "sport": sport,
         "steps_count": len(steps),
@@ -8306,33 +9147,58 @@ def import_natural_language_plan(
 
     current_week = 0
     for line in lines:
-        week_match = re.match(r'(?:semana|week)\s*(\d+)', line, re.I)
+        week_match = re.match(r"(?:semana|week)\s*(\d+)", line, re.I)
         if week_match:
             current_week = int(week_match.group(1)) - 1
 
-        parts = [p.strip() for p in re.split(r'[,;]+', line) if p.strip()]
+        parts = [p.strip() for p in re.split(r"[,;]+", line) if p.strip()]
         for part in parts:
-            if re.match(r'(?:semana|week)\s*\d+', part, re.I):
+            if re.match(r"(?:semana|week)\s*\d+", part, re.I):
                 continue
-            day_match = re.match(r'(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|mon|tue|wed|thu|fri|sat|sun)\s*[:\-]?\s*', part, re.I)
+            day_match = re.match(
+                r"(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|mon|tue|wed|thu|fri|sat|sun)\s*[:\-]?\s*",
+                part,
+                re.I,
+            )
             day_name = ""
             clean_part = part
             if day_match:
                 day_name = day_match.group(1).lower()
-                clean_part = part[day_match.end():]
-            day_map = {"lunes": 0, "mon": 0, "martes": 1, "tue": 1, "miércoles": 2, "miercoles": 2, "wed": 2, "jueves": 3, "thu": 3, "viernes": 4, "fri": 4, "sábado": 5, "sabado": 5, "sat": 5, "domingo": 6, "sun": 6}
+                clean_part = part[day_match.end() :]
+            day_map = {
+                "lunes": 0,
+                "mon": 0,
+                "martes": 1,
+                "tue": 1,
+                "miércoles": 2,
+                "miercoles": 2,
+                "wed": 2,
+                "jueves": 3,
+                "thu": 3,
+                "viernes": 4,
+                "fri": 4,
+                "sábado": 5,
+                "sabado": 5,
+                "sat": 5,
+                "domingo": 6,
+                "sun": 6,
+            }
             day_of_week = day_map.get(day_name, len(sessions) % 7)
             week_offset = current_week * 7 + day_of_week
 
-            sessions.append({
-                "day_offset": week_offset,
-                "sport": "running",
-                "name": clean_part[:50].strip(),
-                "description": clean_part,
-            })
+            sessions.append(
+                {
+                    "day_offset": week_offset,
+                    "sport": "running",
+                    "name": clean_part[:50].strip(),
+                    "description": clean_part,
+                }
+            )
 
     if not sessions:
-        raise RuntimeError("No pude parsear el plan de entrenamiento. Asegúrate de usar el formato 'Semana X: Día descripción'.")
+        raise RuntimeError(
+            "No pude parsear el plan de entrenamiento. Asegúrate de usar el formato 'Semana X: Día descripción'."
+        )
 
     return create_training_plan(
         plan_name=plan_name,
@@ -8379,7 +9245,9 @@ def check_plan_adherence(
     with _fetch_lock():
         api = _get_api(user["id"])
         try:
-            activities, _ = _optional_call_first(api, ("get_activities_by_date",), start_date, end_date)
+            activities, _ = _optional_call_first(
+                api, ("get_activities_by_date",), start_date, end_date
+            )
             if isinstance(activities, list):
                 completed = activities
         except Exception:
@@ -8390,8 +9258,13 @@ def check_plan_adherence(
         "scheduled_count": len(scheduled_list),
         "completed_count": len(completed),
         "adherence_pct": round(len(completed) / max(1, len(scheduled_list)) * 100, 1),
-        "scheduled": [{"date": s.get("date"), "name": s.get("workoutName", "")} for s in scheduled_list[:20]],
-        "completed": [{"date": a.get("startTimeLocal", "")[:10], "name": a.get("activityName", "")} for a in completed[:20]],
+        "scheduled": [
+            {"date": s.get("date"), "name": s.get("workoutName", "")} for s in scheduled_list[:20]
+        ],
+        "completed": [
+            {"date": a.get("startTimeLocal", "")[:10], "name": a.get("activityName", "")}
+            for a in completed[:20]
+        ],
     }
 
 
@@ -8409,7 +9282,9 @@ def get_weekly_report() -> dict[str, Any]:
     with _fetch_lock():
         api = _get_api(user["id"])
         try:
-            activities, _ = _optional_call_first(api, ("get_activities_by_date",), monday.isoformat(), sunday.isoformat())
+            activities, _ = _optional_call_first(
+                api, ("get_activities_by_date",), monday.isoformat(), sunday.isoformat()
+            )
         except Exception:
             activities = []
 
@@ -8436,7 +9311,10 @@ def get_weekly_report() -> dict[str, Any]:
             "total_duration_min": round(total_duration_min, 1),
             "total_calories": total_calories,
         },
-        "by_type": {k: {kk: round(vv, 2) if isinstance(vv, float) else vv for kk, vv in v.items()} for k, v in by_type.items()},
+        "by_type": {
+            k: {kk: round(vv, 2) if isinstance(vv, float) else vv for kk, vv in v.items()}
+            for k, v in by_type.items()
+        },
         "activities": [_normalize_activity(a) for a in activities[:10]],
     }
 
@@ -8474,7 +9352,11 @@ def predict_race_distance(distance_km: float) -> dict[str, Any]:
     recent_runs = []
     if isinstance(activities, list):
         for a in activities:
-            if a.get("activityType", {}).get("typeKey") in ("running", "trail_running", "treadmill_running"):
+            if a.get("activityType", {}).get("typeKey") in (
+                "running",
+                "trail_running",
+                "treadmill_running",
+            ):
                 recent_runs.append(a)
 
     predictions = {}
@@ -8510,9 +9392,7 @@ def predict_race_distance(distance_km: float) -> dict[str, Any]:
 # === ROUTE GENERATION TOOLS ===
 
 ROUTE_GEN_TIMEOUT_SECONDS = 60
-_route_gen_executor = ThreadPoolExecutor(
-    max_workers=2, thread_name_prefix="route-gen"
-)
+_route_gen_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="route-gen")
 _route_graph_cache_data: dict[str, Any] = {}
 _route_graph_cache_lock = threading.Lock()
 
@@ -8534,7 +9414,9 @@ def _run_with_timeout(fn, timeout_s: float = ROUTE_GEN_TIMEOUT_SECONDS, *args, *
         )
 
 
-def _get_route_graph(lat: float, lon: float, radius_m: int = 5000, network_type: str = "walk") -> Any:
+def _get_route_graph(
+    lat: float, lon: float, radius_m: int = 5000, network_type: str = "walk"
+) -> Any:
     """Descarga y cachea el grafo de caminos de OpenStreetMap."""
     import osmnx as ox
 
@@ -8584,15 +9466,15 @@ def _generate_loop_route(
         node_lon = data.get("x", data.get("lon", 0))
         dlat = radians(node_lat - lat)
         dlon = radians(node_lon - lon)
-        a = sin(dlat/2)**2 + cos(radians(lat)) * cos(radians(node_lat)) * sin(dlon/2)**2
-        dist = 2 * 6371000 * atan2(sqrt(a), sqrt(1-a))
+        a = sin(dlat / 2) ** 2 + cos(radians(lat)) * cos(radians(node_lat)) * sin(dlon / 2) ** 2
+        dist = 2 * 6371000 * atan2(sqrt(a), sqrt(1 - a))
         if target_m * 0.3 < dist < target_m * 0.7:
             candidates.append((node_id, dist))
 
     candidates.sort(key=lambda x: x[1])
 
     results = []
-    for cand_node, _ in candidates[:min(10, len(candidates))]:
+    for cand_node, _ in candidates[: min(10, len(candidates))]:
         try:
             path_out = nx.shortest_path(G, orig_node, cand_node, weight="length")
             path_back = nx.shortest_path(G, cand_node, orig_node, weight="length")
@@ -8605,29 +9487,33 @@ def _generate_loop_route(
                     continue
                 seen.add(node)
                 nd = G.nodes[node]
-                coords.append({"lat": nd.get("y", nd.get("lat", 0)), "lon": nd.get("x", nd.get("lon", 0))})
+                coords.append(
+                    {"lat": nd.get("y", nd.get("lat", 0)), "lon": nd.get("x", nd.get("lon", 0))}
+                )
                 total_dist += 1
 
             total_dist_m = sum(
-                G.edges[path_out[i], path_out[i+1], 0].get("length", 0)
-                for i in range(len(path_out)-1)
+                G.edges[path_out[i], path_out[i + 1], 0].get("length", 0)
+                for i in range(len(path_out) - 1)
             ) + sum(
-                G.edges[path_back[i], path_back[i+1], 0].get("length", 0)
-                for i in range(len(path_back)-1)
+                G.edges[path_back[i], path_back[i + 1], 0].get("length", 0)
+                for i in range(len(path_back) - 1)
             )
 
             deviation = abs(total_dist_m - target_m)
             if deviation > tolerance:
                 continue
 
-            results.append({
-                "distance_km": round(total_dist_m / 1000, 2),
-                "distance_m": round(total_dist_m),
-                "elevation_gain_m": elevation_gain_target,
-                "points": coords,
-                "point_count": len(coords),
-                "deviation_pct": round(deviation / target_m * 100, 1),
-            })
+            results.append(
+                {
+                    "distance_km": round(total_dist_m / 1000, 2),
+                    "distance_m": round(total_dist_m),
+                    "elevation_gain_m": elevation_gain_target,
+                    "points": coords,
+                    "point_count": len(coords),
+                    "deviation_pct": round(deviation / target_m * 100, 1),
+                }
+            )
         except Exception:
             continue
 
@@ -8678,7 +9564,9 @@ def suggest_routes(
 
     for i, route in enumerate(routes):
         route["name"] = f"Ruta {i + 1}: {route['distance_km']}km"
-        route["description"] = f"Ruta circular de {route['distance_km']}km con {route['point_count']} puntos GPS"
+        route["description"] = (
+            f"Ruta circular de {route['distance_km']}km con {route['point_count']} puntos GPS"
+        )
 
     return {
         "query": {
@@ -8711,7 +9599,9 @@ def suggest_routes_from_profile(
     home_lat = user.get("home_lat")
     home_lon = user.get("home_lon")
     if not home_lat or not home_lon:
-        raise RuntimeError("No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon.")
+        raise RuntimeError(
+            "No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon."
+        )
 
     return suggest_routes(
         distance_km=distance_km,
@@ -8807,6 +9697,7 @@ def upload_route_to_garmin(
                 result = api.upload_activity(tmp_path)
             finally:
                 import os
+
                 os.unlink(tmp_path)
 
         return {"ok": True, "result": result, "name": name}
@@ -8848,15 +9739,19 @@ def get_gear_list() -> dict:
         for g in gears:
             if not isinstance(g, dict):
                 continue
-            items.append({
-                "id": g.get("gearPk") or g.get("gearId"),
-                "name": g.get("displayName") or g.get("name"),
-                "type": g.get("type") or g.get("gearType"),
-                "total_distance_km": round(_to_float_or_none(g.get("totalDistance")) / 1000, 1) if g.get("totalDistance") is not None else None,
-                "custom_make": g.get("customMake"),
-                "custom_model": g.get("customModel"),
-                "applicable_activities": g.get("applicableActivities"),
-            })
+            items.append(
+                {
+                    "id": g.get("gearPk") or g.get("gearId"),
+                    "name": g.get("displayName") or g.get("name"),
+                    "type": g.get("type") or g.get("gearType"),
+                    "total_distance_km": round(_to_float_or_none(g.get("totalDistance")) / 1000, 1)
+                    if g.get("totalDistance") is not None
+                    else None,
+                    "custom_make": g.get("customMake"),
+                    "custom_model": g.get("customModel"),
+                    "applicable_activities": g.get("applicableActivities"),
+                }
+            )
     return {"gear_list": items, "count": len(items), "raw": data}
 
 
@@ -8876,7 +9771,11 @@ def get_sync_status() -> dict:
 
     last_used = data
     if isinstance(last_used, dict):
-        last = last_used.get("lastUsed") or last_used.get("lastUsedTimestamp") or last_used.get("last_exercise_time")
+        last = (
+            last_used.get("lastUsed")
+            or last_used.get("lastUsedTimestamp")
+            or last_used.get("last_exercise_time")
+        )
         return {
             "sincronizado": last_used,
             "dispositivo": last_used.get("deviceName") if isinstance(last_used, dict) else None,
@@ -8924,20 +9823,28 @@ def calculate_training_load(target_date: str | None = None) -> dict:
         load["training_status"] = (dash.get("trainingStatus") or {}).get("typeKey")
         load["training_load"] = _climb(dash, "trainingLoad", "current") or dash.get("trainingLoad")
         load["focus"] = _climb(dash, "trainingFocus", "typeKey")
-        load["vo2max_running"] = _climb(dash, "lastRunning", "vo2Max", "value") or _climb(dash, "lastRunning", "vo2Max")
-        load["vo2max_cycling"] = _climb(dash, "lastCycling", "vo2Max", "value") or _climb(dash, "lastCycling", "vo2Max")
+        load["vo2max_running"] = _climb(dash, "lastRunning", "vo2Max", "value") or _climb(
+            dash, "lastRunning", "vo2Max"
+        )
+        load["vo2max_cycling"] = _climb(dash, "lastCycling", "vo2Max", "value") or _climb(
+            dash, "lastCycling", "vo2Max"
+        )
     except Exception:
         pass
 
     try:
-        bal = _climb(data, "mostRecentTrainingLoadBalance", "metricsTrainingLoadBalanceDTOMap") or {}
+        bal = (
+            _climb(data, "mostRecentTrainingLoadBalance", "metricsTrainingLoadBalanceDTOMap") or {}
+        )
         if isinstance(bal, dict) and bal:
             key = next(iter(bal.values()))
             load["load_balance"] = key
             load["acute_load"] = key.get("acuteLoad")
             load["chronic_load"] = key.get("chronicLoad")
             load["train_load_ratio"] = key.get("trainingLoadRatio")
-            load["load_balance_commentary"] = key.get("loadBalanceCommentary") or key.get("loadBalanceCommentaryShort")
+            load["load_balance_commentary"] = key.get("loadBalanceCommentary") or key.get(
+                "loadBalanceCommentaryShort"
+            )
     except Exception:
         pass
 
@@ -8965,7 +9872,9 @@ def detect_fatigue_risk(target_date: str | None = None) -> dict:
     hrv_status = None
     try:
         if isinstance(hrv, dict) and hrv.get("hrvSummary"):
-            hrv_status = hrv["hrvSummary"].get("hrvStatus") or hrv["hrvSummary"].get("lastNightStatus")
+            hrv_status = hrv["hrvSummary"].get("hrvStatus") or hrv["hrvSummary"].get(
+                "lastNightStatus"
+            )
         elif isinstance(hrv, dict):
             hrv_status = hrv.get("hrvStatus")
     except Exception:
@@ -8975,8 +9884,14 @@ def detect_fatigue_risk(target_date: str | None = None) -> dict:
     readiness_short = None
     try:
         if isinstance(ready, dict):
-            readiness_score = ready.get("score") or (ready.get("trainingReadinessScore") or {}).get("score")
-            stages = (ready.get("trainingReadiness") or {}).get("trainingReadinessStageEnum") if isinstance(ready.get("trainingReadiness"), dict) else None
+            readiness_score = ready.get("score") or (ready.get("trainingReadinessScore") or {}).get(
+                "score"
+            )
+            stages = (
+                (ready.get("trainingReadiness") or {}).get("trainingReadinessStageEnum")
+                if isinstance(ready.get("trainingReadiness"), dict)
+                else None
+            )
             if stages:
                 other = stages.get("otherStageDTO")
                 if isinstance(other, dict):
@@ -9001,7 +9916,12 @@ def detect_fatigue_risk(target_date: str | None = None) -> dict:
         if "good" in hrv_lower or "balanced" in hrv_lower or "equilibr" in hrv_lower:
             score += 20
             markers.append(f"HRV: {hrv_status} (bien)")
-        elif "poor" in hrv_lower or "low" in hrv_lower or "deficient" in hrv_lower or "desequilibrado" in hrv_lower:
+        elif (
+            "poor" in hrv_lower
+            or "low" in hrv_lower
+            or "deficient" in hrv_lower
+            or "desequilibrado" in hrv_lower
+        ):
             score -= 20
             markers.append(f"HRV: {hrv_status} (cuidado)")
         else:
@@ -9138,7 +10058,10 @@ def calculate_pace_zones(target_date: str | None = None) -> dict:
                     or dash.get("vo2MaxValue")
                 )
             if not vo2:
-                status = ts.get("mostRecentTrainingStatus", {}).get("dashboardTrainingStatusData", {}) or {}
+                status = (
+                    ts.get("mostRecentTrainingStatus", {}).get("dashboardTrainingStatusData", {})
+                    or {}
+                )
                 vo2 = status.get("lastRunning", {}).get("vo2Max", {}).get("value")
     except Exception:
         pass
@@ -9169,11 +10092,23 @@ def calculate_pace_zones(target_date: str | None = None) -> dict:
         "threshold_pace_min_per_km": round(pace_min_per_km, 2),
         "threshold_pace_display": fmt(pace_min_per_km),
         "zones": {
-            "zone1_recuperacion": {"pace": fmt(pace_min_per_km * 1.25), "min_per_km": round(pace_min_per_km * 1.25, 2)},
-            "zone2_rodaje_suave": {"pace": fmt(pace_min_per_km * 1.15), "min_per_km": round(pace_min_per_km * 1.15, 2)},
-            "zone3_aerobic": {"pace": fmt(pace_min_per_km * 1.05), "min_per_km": round(pace_min_per_km * 1.05, 2)},
+            "zone1_recuperacion": {
+                "pace": fmt(pace_min_per_km * 1.25),
+                "min_per_km": round(pace_min_per_km * 1.25, 2),
+            },
+            "zone2_rodaje_suave": {
+                "pace": fmt(pace_min_per_km * 1.15),
+                "min_per_km": round(pace_min_per_km * 1.15, 2),
+            },
+            "zone3_aerobic": {
+                "pace": fmt(pace_min_per_km * 1.05),
+                "min_per_km": round(pace_min_per_km * 1.05, 2),
+            },
             "zone4_umbral": {"pace": fmt(pace_min_per_km), "min_per_km": round(pace_min_per_km, 2)},
-            "zone5_vo2max": {"pace": fmt(pace_min_per_km * 0.92), "min_per_km": round(pace_min_per_km * 0.92, 2)},
+            "zone5_vo2max": {
+                "pace": fmt(pace_min_per_km * 0.92),
+                "min_per_km": round(pace_min_per_km * 0.92, 2),
+            },
         },
     }
 
@@ -9199,7 +10134,9 @@ def plan_this_week(
     # Estimación del volumen semanal reciente
     recent_summary = {}
     try:
-        recent_summary = summarize_period((monday - timedelta(days=7)).isoformat(), (monday - timedelta(days=1)).isoformat())
+        recent_summary = summarize_period(
+            (monday - timedelta(days=7)).isoformat(), (monday - timedelta(days=1)).isoformat()
+        )
     except Exception:
         pass
     recent_km = recent_summary.get("total_distance_km", 0) or 0
@@ -9223,37 +10160,45 @@ def plan_this_week(
             # Sesión más larga el fin de semana
             dist = round(per_session * 1.4, 2)
             kind = "Larga suave (Z2-Z3)"
-            steps = json.dumps([
-                {"type": "warmup", "duration_min": 10},
-                {"type": "active", "distance_km": dist, "target_hr_zone": 2 if dist > 8 else 3},
-                {"type": "cooldown", "duration_min": 5},
-            ])
+            steps = json.dumps(
+                [
+                    {"type": "warmup", "duration_min": 10},
+                    {"type": "active", "distance_km": dist, "target_hr_zone": 2 if dist > 8 else 3},
+                    {"type": "cooldown", "duration_min": 5},
+                ]
+            )
         elif i % 3 == 0:
             kind = "Ritmo / series"
             dist = round(per_session * 0.8, 2)
-            steps = json.dumps([
-                {"type": "warmup", "duration_min": 10},
-                {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
-                {"type": "rest", "duration_min": 2},
-                {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
-                {"type": "rest", "duration_min": 2},
-                {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
-                {"type": "cooldown", "duration_min": 5},
-            ])
+            steps = json.dumps(
+                [
+                    {"type": "warmup", "duration_min": 10},
+                    {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
+                    {"type": "rest", "duration_min": 2},
+                    {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
+                    {"type": "rest", "duration_min": 2},
+                    {"type": "interval", "distance_km": round(dist / 3, 2), "target_hr_zone": 4},
+                    {"type": "cooldown", "duration_min": 5},
+                ]
+            )
         else:
             kind = "Rodaje suave"
-            steps = json.dumps([
-                {"type": "warmup", "duration_min": 10},
-                {"type": "active", "distance_km": per_session, "target_hr_zone": 2},
-                {"type": "cooldown", "duration_min": 5},
-            ])
+            steps = json.dumps(
+                [
+                    {"type": "warmup", "duration_min": 10},
+                    {"type": "active", "distance_km": per_session, "target_hr_zone": 2},
+                    {"type": "cooldown", "duration_min": 5},
+                ]
+            )
 
-        sessions.append({
-            "day_offset": day_offset,
-            "sport": "running",
-            "name": f"{kind} ({day_names[day_offset]})",
-            "steps": json.loads(steps),
-        })
+        sessions.append(
+            {
+                "day_offset": day_offset,
+                "sport": "running",
+                "name": f"{kind} ({day_names[day_offset]})",
+                "steps": json.loads(steps),
+            }
+        )
 
     result = {
         "ok": True,
@@ -9283,7 +10228,9 @@ def get_todays_schedule(plan_start_date: str | None = None) -> dict:
         with _fetch_lock():
             api = _get_api(user["id"])
             today_parts = today.split("-")
-            sched, sched_err = _optional_call_first(api, ("get_scheduled_workouts",), today_parts[0], today_parts[1])
+            sched, sched_err = _optional_call_first(
+                api, ("get_scheduled_workouts",), today_parts[0], today_parts[1]
+            )
         if isinstance(sched, dict):
             scheduled = sched
     except Exception:
@@ -9300,14 +10247,16 @@ def get_todays_schedule(plan_start_date: str | None = None) -> dict:
 
     workout_today = None
     if isinstance(scheduled, dict):
-        for group in (scheduled.get("workoutSchedules") or []):
+        for group in scheduled.get("workoutSchedules") or []:
             if not isinstance(group, dict):
                 continue
             if str(group.get("scheduledWorkoutDate") or "")[:10] == today:
                 w = group.get("workout") or {}
                 workout_today = {
                     "name": w.get("workoutName"),
-                    "sport": (w.get("sport") or {}).get("sportTypeKey") if isinstance(w.get("sport"), dict) else None,
+                    "sport": (w.get("sport") or {}).get("sportTypeKey")
+                    if isinstance(w.get("sport"), dict)
+                    else None,
                 }
 
     plan_hint = ""
@@ -9328,7 +10277,8 @@ def get_todays_schedule(plan_start_date: str | None = None) -> dict:
         "scheduled_workout_today": workout_today,
         "plan_hint": plan_hint,
         "recommendation": (
-            "Sigue tu entrenamiento programado." if workout_today
+            "Sigue tu entrenamiento programado."
+            if workout_today
             else "Hoy hay entrenamiento propuesto en tu plan/programa."
         ),
     }
@@ -9349,9 +10299,36 @@ def list_tools_spanish() -> dict:
         first_line = (doc or "").strip().split("\n")[0] if doc else ""
         category = "otros"
         lower = (name + " " + first_line).lower()
-        if any(k in lower for k in ("sueño", "sleep", "hrv", "vfc", "body battery", "battery", "respiración", "respiration", "hidratación", "hydration", "salud")):
+        if any(
+            k in lower
+            for k in (
+                "sueño",
+                "sleep",
+                "hrv",
+                "vfc",
+                "body battery",
+                "battery",
+                "respiración",
+                "respiration",
+                "hidratación",
+                "hydration",
+                "salud",
+            )
+        ):
             category = "salud y recuperación"
-        elif any(k in lower for k in ("actividad", "activity", "actividades", "entrenamiento", "workout", "plan", "series", "training")):
+        elif any(
+            k in lower
+            for k in (
+                "actividad",
+                "activity",
+                "actividades",
+                "entrenamiento",
+                "workout",
+                "plan",
+                "series",
+                "training",
+            )
+        ):
             category = "entrenamiento y planes"
         elif any(k in lower for k in ("ruta", "route", "gpx", "course")):
             category = "rutas"
@@ -9369,9 +10346,11 @@ def list_tools_spanish() -> dict:
 
 def _list_tools_sync() -> list[tuple[str, str]]:
     import asyncio
+
     async def _go():
         mcp_tools = await mcp.list_tools()
         return [(t.name, t.description) for t in mcp_tools]
+
     return asyncio.run(_go())
 
 
@@ -9425,10 +10404,13 @@ def route_to_poi(
     home_lat = user.get("home_lat")
     home_lon = user.get("home_lon")
     if not home_lat or not home_lon:
-        raise RuntimeError("No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon.")
+        raise RuntimeError(
+            "No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon."
+        )
 
     try:
         import requests as _req
+
         resp = _req.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": place, "format": "json", "limit": 1},
@@ -9463,7 +10445,9 @@ def route_to_poi(
 
     for i, route in enumerate(routes):
         route["name"] = f"Ruta hacia {poi_name[:30]} ({i + 1})"
-        route["description"] = f"Ruta circular de {route['distance_km']}km pasando por {poi_name[:60]}"
+        route["description"] = (
+            f"Ruta circular de {route['distance_km']}km pasando por {poi_name[:60]}"
+        )
         route["destination"] = {"place": poi_name, "lat": poi_lat, "lon": poi_lon}
 
     return {
@@ -9506,7 +10490,9 @@ def generate_periodized_plan(
     start_date = race_dt - timedelta(weeks=total_weeks)
 
     if not plan_name:
-        dist_name = {5: "5K", 10: "10K", 21.1: "Media Maratón", 42.2: "Maratón"}.get(race_distance_km, f"{race_distance_km}K")
+        dist_name = {5: "5K", 10: "10K", 21.1: "Media Maratón", 42.2: "Maratón"}.get(
+            race_distance_km, f"{race_distance_km}K"
+        )
         plan_name = f"Preparación {dist_name} - {total_weeks} semanas"
 
     base_km = current_weekly_km if current_weekly_km > 0 else 20
@@ -9515,13 +10501,21 @@ def generate_periodized_plan(
     sessions = []
     for week in range(total_weeks):
         week_num = week + 1
-        phase = "base" if week < total_weeks * 0.4 else "build" if week < total_weeks * 0.75 else "taper"
+        phase = (
+            "base"
+            if week < total_weeks * 0.4
+            else "build"
+            if week < total_weeks * 0.75
+            else "taper"
+        )
         week_km = base_km
         if phase == "base":
             week_km = base_km + (base_km * 0.3 * week / (total_weeks * 0.4))
         elif phase == "build":
             peak_week = int(total_weeks * 0.75)
-            week_km = base_km * 1.3 + (base_km * 0.2 * (week - total_weeks * 0.4) / (peak_week - total_weeks * 0.4))
+            week_km = base_km * 1.3 + (
+                base_km * 0.2 * (week - total_weeks * 0.4) / (peak_week - total_weeks * 0.4)
+            )
         else:
             taper_week = total_weeks - week
             week_km = base_km * 1.5 * (1 - 0.5 * (total_weeks * 0.75 - week) / (total_weeks * 0.25))
@@ -9531,13 +10525,48 @@ def generate_periodized_plan(
 
         day_offset = week * 7
         if sessions_per_week >= 3:
-            sessions.append({"day_offset": day_offset, "sport": "running", "name": f"W{week_num} Rodaje suave", "description": f"{easy_km:.1f}km Z2"})
-            sessions.append({"day_offset": day_offset + 2, "sport": "running", "name": f"W{week_num} Trabajo técnico", "description": f"{easy_km * 0.8:.1f}km con progresivos"})
-            sessions.append({"day_offset": day_offset + 5, "sport": "running", "name": f"W{week_num} Largo", "description": f"{long_km:.1f}km Z2"})
+            sessions.append(
+                {
+                    "day_offset": day_offset,
+                    "sport": "running",
+                    "name": f"W{week_num} Rodaje suave",
+                    "description": f"{easy_km:.1f}km Z2",
+                }
+            )
+            sessions.append(
+                {
+                    "day_offset": day_offset + 2,
+                    "sport": "running",
+                    "name": f"W{week_num} Trabajo técnico",
+                    "description": f"{easy_km * 0.8:.1f}km con progresivos",
+                }
+            )
+            sessions.append(
+                {
+                    "day_offset": day_offset + 5,
+                    "sport": "running",
+                    "name": f"W{week_num} Largo",
+                    "description": f"{long_km:.1f}km Z2",
+                }
+            )
         if sessions_per_week >= 4:
-            sessions.append({"day_offset": day_offset + 3, "sport": "running", "name": f"W{week_num} Tempo", "description": f"{easy_km * 0.7:.1f}km con 20min tempo Z3"})
+            sessions.append(
+                {
+                    "day_offset": day_offset + 3,
+                    "sport": "running",
+                    "name": f"W{week_num} Tempo",
+                    "description": f"{easy_km * 0.7:.1f}km con 20min tempo Z3",
+                }
+            )
         if sessions_per_week >= 5:
-            sessions.append({"day_offset": day_offset + 1, "sport": "running", "name": f"W{week_num} Recuperación", "description": f"{easy_km * 0.5:.1f}km muy suave"})
+            sessions.append(
+                {
+                    "day_offset": day_offset + 1,
+                    "sport": "running",
+                    "name": f"W{week_num} Recuperación",
+                    "description": f"{easy_km * 0.5:.1f}km muy suave",
+                }
+            )
 
     return create_training_plan(
         plan_name=plan_name,
@@ -9560,7 +10589,10 @@ _FRONTEND_EXTRA_ES_INSTRUCTIONS = (
 )
 try:
     _existing_instructions = getattr(mcp, "instructions", None)
-    if isinstance(_existing_instructions, str) and _FRONTEND_EXTRA_ES_INSTRUCTIONS not in _existing_instructions:
+    if (
+        isinstance(_existing_instructions, str)
+        and _FRONTEND_EXTRA_ES_INSTRUCTIONS not in _existing_instructions
+    ):
         mcp.instructions = _existing_instructions + _FRONTEND_EXTRA_ES_INSTRUCTIONS
 except Exception:
     pass
@@ -9587,32 +10619,80 @@ def _frontend_compact_dict(items: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _build_metricas_frontend_es(metrics: dict[str, Any]) -> dict[str, Any]:
-    return _frontend_compact_dict([
-        ("Body Battery", _frontend_pick(metrics, "body_battery_actual", "body_battery_current")),
-        ("Resumen de Body Battery", _frontend_pick(metrics, "body_battery_resumen_humano", "body_battery_texto")),
-        ("Predisposición para entrenar", _frontend_pick(metrics, "predisposicion_para_entrenar", "training_readiness_score")),
-        ("Estado de Predisposición para entrenar", _frontend_pick(metrics, "predisposicion_para_entrenar_estado", "training_readiness_status_es", "training_readiness_status")),
-        ("Resumen de Predisposición para entrenar", _frontend_pick(metrics, "predisposicion_para_entrenar_texto", "predisposicion_factores_resumen_humano")),
-        ("Estado de VFC", _frontend_pick(metrics, "estado_vfc", "hrv_status_es", "hrv_status")),
-        ("Resumen de VFC", _frontend_pick(metrics, "estado_vfc_resumen_humano")),
-        ("Puntuación de sueño", _frontend_pick(metrics, "puntuacion_de_sueno", "sleep_score")),
-        ("Duración del sueño", _frontend_pick(metrics, "duracion_de_sueno_texto")),
-        ("Resumen de sueño", _frontend_pick(metrics, "sueno_resumen_para_llm", "sueno_resumen_humano", "sueno_texto_seguro")),
-        ("Fases del sueño", _frontend_pick(metrics, "sueno_fases_para_llm", "sueno_fases_resumen_humano")),
-        ("Tiempo de recuperación", _frontend_pick(metrics, "recuperacion_texto_seguro", "training_readiness_recovery_answer_for_llm", "training_readiness_recovery_safe_text")),
-        ("Carga aguda", _frontend_pick(metrics, "acute_load")),
-        ("Estado de carga aguda", _frontend_pick(metrics, "acute_load_status_es", "acute_load_status")),
-        ("Estado de entreno", _frontend_pick(metrics, "training_status_es", "training_status")),
-        ("Resumen de estado de entreno", _frontend_pick(metrics, "estado_entreno_resumen_humano")),
-        ("VO2 máximo", _frontend_pick(metrics, "vo2max")),
-        ("Pasos", _frontend_pick(metrics, "steps")),
-        ("Resumen de pasos", _frontend_pick(metrics, "pasos_resumen_humano")),
-        ("Calorías", _frontend_pick(metrics, "calorias_resumen_humano", "total_kcal")),
-        ("Minutos de intensidad", _frontend_pick(metrics, "minutos_intensidad_resumen_humano")),
-        ("Estrés", _frontend_pick(metrics, "estres_resumen_humano", "stress_avg")),
-        ("Última sincronización", _frontend_pick(metrics, "snapshot_obtenido_local")),
-        ("Datos disponibles hasta", _frontend_pick(metrics, "datos_hasta_local")),
-    ])
+    return _frontend_compact_dict(
+        [
+            (
+                "Body Battery",
+                _frontend_pick(metrics, "body_battery_actual", "body_battery_current"),
+            ),
+            (
+                "Resumen de Body Battery",
+                _frontend_pick(metrics, "body_battery_resumen_humano", "body_battery_texto"),
+            ),
+            (
+                "Predisposición para entrenar",
+                _frontend_pick(metrics, "predisposicion_para_entrenar", "training_readiness_score"),
+            ),
+            (
+                "Estado de Predisposición para entrenar",
+                _frontend_pick(
+                    metrics,
+                    "predisposicion_para_entrenar_estado",
+                    "training_readiness_status_es",
+                    "training_readiness_status",
+                ),
+            ),
+            (
+                "Resumen de Predisposición para entrenar",
+                _frontend_pick(
+                    metrics,
+                    "predisposicion_para_entrenar_texto",
+                    "predisposicion_factores_resumen_humano",
+                ),
+            ),
+            ("Estado de VFC", _frontend_pick(metrics, "estado_vfc", "hrv_status_es", "hrv_status")),
+            ("Resumen de VFC", _frontend_pick(metrics, "estado_vfc_resumen_humano")),
+            ("Puntuación de sueño", _frontend_pick(metrics, "puntuacion_de_sueno", "sleep_score")),
+            ("Duración del sueño", _frontend_pick(metrics, "duracion_de_sueno_texto")),
+            (
+                "Resumen de sueño",
+                _frontend_pick(
+                    metrics, "sueno_resumen_para_llm", "sueno_resumen_humano", "sueno_texto_seguro"
+                ),
+            ),
+            (
+                "Fases del sueño",
+                _frontend_pick(metrics, "sueno_fases_para_llm", "sueno_fases_resumen_humano"),
+            ),
+            (
+                "Tiempo de recuperación",
+                _frontend_pick(
+                    metrics,
+                    "recuperacion_texto_seguro",
+                    "training_readiness_recovery_answer_for_llm",
+                    "training_readiness_recovery_safe_text",
+                ),
+            ),
+            ("Carga aguda", _frontend_pick(metrics, "acute_load")),
+            (
+                "Estado de carga aguda",
+                _frontend_pick(metrics, "acute_load_status_es", "acute_load_status"),
+            ),
+            ("Estado de entreno", _frontend_pick(metrics, "training_status_es", "training_status")),
+            (
+                "Resumen de estado de entreno",
+                _frontend_pick(metrics, "estado_entreno_resumen_humano"),
+            ),
+            ("VO2 máximo", _frontend_pick(metrics, "vo2max")),
+            ("Pasos", _frontend_pick(metrics, "steps")),
+            ("Resumen de pasos", _frontend_pick(metrics, "pasos_resumen_humano")),
+            ("Calorías", _frontend_pick(metrics, "calorias_resumen_humano", "total_kcal")),
+            ("Minutos de intensidad", _frontend_pick(metrics, "minutos_intensidad_resumen_humano")),
+            ("Estrés", _frontend_pick(metrics, "estres_resumen_humano", "stress_avg")),
+            ("Última sincronización", _frontend_pick(metrics, "snapshot_obtenido_local")),
+            ("Datos disponibles hasta", _frontend_pick(metrics, "datos_hasta_local")),
+        ]
+    )
 
 
 def _build_resumen_frontend_es(metrics: dict[str, Any]) -> list[str]:
@@ -9653,10 +10733,16 @@ def _attach_frontend_view_to_snapshot(snap: Any) -> Any:
     replacements = {
         "stress_label": metrics.get("stress_label_es"),
         "hrv_status": _frontend_pick(metrics, "estado_vfc", "hrv_status_es"),
-        "training_readiness_status": _frontend_pick(metrics, "predisposicion_para_entrenar_estado", "training_readiness_status_es"),
-        "training_readiness_message": _frontend_pick(metrics, "predisposicion_para_entrenar_texto", "training_readiness_message_es"),
+        "training_readiness_status": _frontend_pick(
+            metrics, "predisposicion_para_entrenar_estado", "training_readiness_status_es"
+        ),
+        "training_readiness_message": _frontend_pick(
+            metrics, "predisposicion_para_entrenar_texto", "training_readiness_message_es"
+        ),
         "acute_load_status": metrics.get("acute_load_status_es"),
-        "training_status": _frontend_pick(metrics, "training_status_es", "estado_entreno_resumen_humano"),
+        "training_status": _frontend_pick(
+            metrics, "training_status_es", "estado_entreno_resumen_humano"
+        ),
     }
     for base_key, value in replacements.items():
         if _frontend_non_empty(value):
@@ -9707,14 +10793,16 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any]:
     if _frontend_non_empty(out.get("tipo_actividad")):
         parts.append(str(out.get("tipo_actividad")))
     if _frontend_non_empty(out.get("distance_km")):
-        parts.append(f'{out.get("distance_km")} km')
+        parts.append(f"{out.get('distance_km')} km")
     if _frontend_non_empty(out.get("duration_min")):
-        parts.append(f'{out.get("duration_min")} min')
+        parts.append(f"{out.get('duration_min')} min")
     if _frontend_non_empty(out.get("training_load")):
-        parts.append(f'carga {out.get("training_load")}')
+        parts.append(f"carga {out.get('training_load')}")
 
     out["resumen_frontend_es"] = " · ".join(parts) if parts else None
     return out
+
+
 # === FRONTEND GARMIN CONNECT ES OUTPUT PATCH END ===
 
 
@@ -9732,7 +10820,10 @@ _STRICT_GARMIN_CONNECT_ES_TERMS = (
 
 try:
     _current_instructions = getattr(mcp, "instructions", None)
-    if isinstance(_current_instructions, str) and _STRICT_GARMIN_CONNECT_ES_TERMS not in _current_instructions:
+    if (
+        isinstance(_current_instructions, str)
+        and _STRICT_GARMIN_CONNECT_ES_TERMS not in _current_instructions
+    ):
         mcp.instructions = _current_instructions + _STRICT_GARMIN_CONNECT_ES_TERMS
 except Exception:
     pass
