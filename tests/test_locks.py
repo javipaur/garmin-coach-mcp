@@ -104,9 +104,10 @@ def test_watchdog_rotates_stale_fetch_lock_even_with_cache_ok():
     t.start()
     assert entered.wait(2)
 
-    # Simulamos un hilo zombi: retenido desde hace muchísimo tiempo.
+    # Simulamos un hilo zombi: retenido desde hace muchísimo tiempo. Los tests
+    # se ejecutan sin usuario autenticado, así que la clave del lock es "global".
     with server._LOCK_STATE_LOCK:
-        server._LOCK_STATES["fetch"]["since"] = time.monotonic() - 10_000_000
+        server._LOCK_STATES["fetch"]["global"]["since"] = time.monotonic() - 10_000_000
 
     with server.CACHE_LOCK:
         server.CACHE["status"] = "ok"
@@ -161,3 +162,96 @@ def test_lock_holder_info_reports_held_details():
 
     info_released = server._lock_holder_info("fetch")
     assert info_released["locked"] is False
+
+
+def test_distinct_users_do_not_block_each_other():
+    """Bug real: un único FETCH_LOCK global hacía que dos usuarios distintos se
+    bloquearan entre sí ("El servidor está ocupado con otra consulta a Garmin").
+    Con locks por usuario, A puede consultar mientras B tiene el suyo cogido."""
+    result: dict[str, object] = {}
+    a_started = threading.Event()
+    b_released = threading.Event()
+
+    user_a = {"id": "aaaa"}
+    user_b = {"id": "bbbb"}
+
+    def _run_as(user, fn, *args, **kwargs):
+        # _fetch_lock resuelve el usuario vía current_user (ContextVar).
+        tok = server.current_user.set(user)
+        try:
+            fn(*args, **kwargs)
+        finally:
+            server.current_user.reset(tok)
+
+    def holder_a():
+        def _body():
+            with server._fetch_lock(timeout=5):
+                a_started.set()
+                # A aguanta el lock durante 2s; B debería poder entrar igualmente.
+                time.sleep(2)
+        _run_as(user_a, _body)
+
+    def contender_b():
+        def _body():
+            try:
+                with server._fetch_lock(timeout=5):
+                    result["b_got"] = True
+            except server._FetchLockTimeoutError:
+                result["b_busy"] = True
+            b_released.set()
+        _run_as(user_b, _body)
+
+    ta = threading.Thread(target=holder_a, daemon=True)
+    ta.start()
+    assert a_started.wait(2)
+
+    tb = threading.Thread(target=contender_b, daemon=True)
+    tb.start()
+    tb.join(4)
+
+    assert result.get("b_got") is True, f"B fue bloqueado por A: {result}"
+    assert result.get("b_busy") is None
+    assert b_released.is_set()
+    ta.join(3)
+
+
+def test_same_user_calls_serialize():
+    """Dos tool calls del MISMO usuario sí deben serializarse (comparten sesión)."""
+    result: dict[str, object] = {}
+    started = threading.Event()
+    user_a = {"id": "cccc"}
+
+    def _run_as(user, fn):
+        tok = server.current_user.set(user)
+        try:
+            fn()
+        finally:
+            server.current_user.reset(tok)
+
+    def holder():
+        def _body():
+            with server._fetch_lock(timeout=5):
+                started.set()
+                time.sleep(2)
+        _run_as(user_a, _body)
+
+    def contender():
+        def _body():
+            try:
+                with server._fetch_lock(timeout=0.4):
+                    result["got"] = True
+            except server._FetchLockTimeoutError:
+                result["busy"] = True
+        _run_as(user_a, _body)
+
+    t = threading.Thread(target=holder, daemon=True)
+    t.start()
+    assert started.wait(2)
+
+    c = threading.Thread(target=contender, daemon=True)
+    c.start()
+    c.join(3)
+    t.join(3)
+
+    assert result.get("busy") is True, f"mismo usuario no debía entrar: {result}"
+    assert result.get("got") is None

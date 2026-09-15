@@ -135,7 +135,14 @@ _LAST_MCP_CLIENT: str = ""
 _SERVER_START_TIME: float = time.time()
 
 CACHE_LOCK = threading.Lock()
+# Lock GLOBAL de fetch: respaldo para llamadas sin usuario autenticado (panel
+# admin, tests, tokens legacy de un solo usuario). Las tool calls de usuarios
+# autenticados usan un lock POR USUARIO (FETCH_LOCKS): cada usuario tiene su
+# propia sesión Garmin y solo debe serializarse contra sí mismo. Sin esta
+# separación, un usuario bloqueaba a todos los demás con "servidor ocupado".
 FETCH_LOCK = threading.Lock()
+_FETCH_LOCKS: dict[str, threading.Lock] = {}
+_FETCH_LOCKS_GUARD = threading.Lock()
 # Lock dedicado al refresh de fondo del snapshot. Es INDEPENDIENTE de FETCH_LOCK
 # (el que usan las tool calls). Sin esto, el refresh retenía FETCH_LOCK durante
 # todo el snapshot (puede tardar varios minutos con timeouts por paso) y todas
@@ -150,7 +157,7 @@ socket.setdefaulttimeout(GARMIN_TIMEOUT_SECONDS)
 
 
 def _rotate_fetch_lock() -> None:
-    """Sustituye FETCH_LOCK y REFRESH_LOCK por locks nuevos.
+    """Sustituye los locks de fetch (global + por usuario) y REFRESH_LOCK por locks nuevos.
 
     Uso: si el prewarm se queda colgado más de PREWARM_MAX_SECONDS (o el watchdog
     de locks detecta un lock retenido demasiado tiempo), se rota el lock para que
@@ -159,23 +166,45 @@ def _rotate_fetch_lock() -> None:
     de forma defensiva contra el objeto capturado, así que la rotación nunca
     produce `RuntimeError: release unlocked lock`.
     """
-    global FETCH_LOCK, REFRESH_LOCK
+    global FETCH_LOCK, REFRESH_LOCK, _FETCH_LOCKS
     with CACHE_LOCK:
         FETCH_LOCK = threading.Lock()
         REFRESH_LOCK = threading.Lock()
+        _FETCH_LOCKS = {}
     with _LOCK_STATE_LOCK:
         for name in _LOCK_STATES:
             _LOCK_STATES[name] = {}
 
 
 class _FetchLockTimeoutError(RuntimeError):
-    """Se lanza cuando una tool call no consigue FETCH_LOCK a tiempo."""
+    """Se lanza cuando una tool call no consigue su lock de fetch a tiempo."""
+
+
+def _fetch_lock_key() -> str:
+    """Clave del usuario actual para el lock de fetch. 'global' si no hay usuario.
+
+    El middleware MCP fija `current_user` por petición, así que dos usuarios
+    simultáneos obtienen claves distintas y ya no se bloquean entre sí.
+    """
+    user = _get_auth_user()
+    if user and user.get("id"):
+        return f"u:{user['id']}"
+    return "global"
+
+
+def _current_fetch_lock() -> threading.Lock:
+    """Resuelve el lock de fetch de la llamada actual (por usuario)."""
+    key = _fetch_lock_key()
+    if key == "global":
+        return FETCH_LOCK
+    with _FETCH_LOCKS_GUARD:
+        return _FETCH_LOCKS.setdefault(key, threading.Lock())
 
 
 def _acquire_fetch_lock(timeout: float | None = None) -> bool:
-    """Adquiere FETCH_LOCK sin bloquear para siempre."""
+    """Adquiere el lock de fetch del usuario actual sin bloquear para siempre."""
     t = FETCH_TOOL_TIMEOUT_SECONDS if timeout is None else timeout
-    return FETCH_LOCK.acquire(timeout=t)
+    return _current_fetch_lock().acquire(timeout=t)
 
 
 def _fetch_lock_or_raise(timeout: float | None = None) -> None:
@@ -190,13 +219,15 @@ def _fetch_lock_or_raise(timeout: float | None = None) -> None:
 
 # Estado de los locks para el watchdog y para /health. Persiste quién tiene cada
 # lock, desde cuándo (monotonic) y en qué paso del snapshot se quedó retenido.
+# Estructura: {nombre: {clave_usuario: {estado}}}. "fetch" tiene una entrada por
+# usuario; "refresh" una única entrada (el refresh de fondo es compartido).
 _LOCK_STATE_LOCK = threading.Lock()
-_LOCK_STATES: dict[str, dict[str, Any]] = {"fetch": {}, "refresh": {}}
+_LOCK_STATES: dict[str, dict[str, dict[str, Any]]] = {"fetch": {}, "refresh": {}}
 
 
-def _mark_lock_acquired(name: str, lock: threading.Lock) -> None:
+def _mark_lock_acquired(name: str, key: str, lock: threading.Lock) -> None:
     with _LOCK_STATE_LOCK:
-        _LOCK_STATES[name] = {
+        _LOCK_STATES.setdefault(name, {})[key] = {
             "held": True,
             "since": time.monotonic(),
             "thread": threading.current_thread().name,
@@ -204,46 +235,69 @@ def _mark_lock_acquired(name: str, lock: threading.Lock) -> None:
         }
 
 
-def _mark_lock_released(name: str, lock: threading.Lock) -> None:
+def _mark_lock_released(name: str, key: str, lock: threading.Lock) -> None:
     with _LOCK_STATE_LOCK:
-        st = _LOCK_STATES.get(name)
+        st = _LOCK_STATES.get(name, {}).get(key)
         if st and st.get("lock_id") == id(lock):
             st["held"] = False
             st.pop("since", None)
 
 
 def _lock_held_seconds(name: str) -> float | None:
-    """Segundos que el lock `name` lleva retenido de forma continuada (o None)."""
+    """Segundos que el lock `name` lleva retenido de forma continuada (o None).
+
+    Con locks por usuario el fetch puede estar retenido por varios usuarios a la
+    vez; se devuelve el tiempo de retención máximo entre todos ellos.
+    """
     with _LOCK_STATE_LOCK:
-        st = _LOCK_STATES.get(name) or {}
-    if not st.get("held"):
+        states = {k: dict(v) for k, v in (_LOCK_STATES.get(name) or {}).items()}
+    held = [st for st in states.values() if st.get("held") and st.get("since")]
+    if not held:
         _mark_lock_observed_not_held(name)
         return None
     now = time.monotonic()
-    since = st.get("since")
-    if since is None:
-        _mark_lock_observed_not_held(name)
-        return None
-    return now - since
+    return max(now - st["since"] for st in held)
 
 
 def _mark_lock_observed_not_held(name: str) -> None:
     with _LOCK_STATE_LOCK:
-        st = _LOCK_STATES.get(name)
-        if st and st.get("held"):
-            st["held"] = False
-            st.pop("since", None)
+        for st in (_LOCK_STATES.get(name) or {}).values():
+            if st.get("held"):
+                st["held"] = False
+                st.pop("since", None)
+
+
+def _lock_any_fetch_locked() -> bool:
+    """¿Algún lock de fetch (global o por usuario) está retenido ahora mismo?"""
+    with _FETCH_LOCKS_GUARD:
+        user_locked = any(lk.locked() for lk in _FETCH_LOCKS.values())
+    return bool(FETCH_LOCK.locked()) or user_locked
 
 
 def _lock_holder_info(name: str) -> dict[str, Any]:
     """Snapshot legible del estado de un lock para /health."""
     with _LOCK_STATE_LOCK:
-        st = dict(_LOCK_STATES.get(name) or {})
-    held_seconds = _lock_held_seconds(name)
+        states = {k: dict(v) for k, v in (_LOCK_STATES.get(name) or {}).items()}
+    held = [(k, st) for k, st in states.items() if st.get("held")]
+
+    def _locked() -> bool:
+        if not held:
+            return _lock_any_fetch_locked() if name == "fetch" else bool(REFRESH_LOCK.locked())
+        return True
+
+    now = time.monotonic()
+    held_seconds: float | None = None
+    thread: str | None = None
+    if held:
+        longest = max(held, key=lambda kv: kv[1].get("since") or 0)
+        thread = longest[1].get("thread")
+        since = longest[1].get("since")
+        if since is not None:
+            held_seconds = now - since
     info: dict[str, Any] = {
-        "locked": bool(FETCH_LOCK.locked() if name == "fetch" else REFRESH_LOCK.locked()),
+        "locked": _locked(),
         "held_seconds": held_seconds,
-        "thread": st.get("thread"),
+        "thread": thread,
         "fetch_step": None,
     }
     if name == "fetch":
@@ -259,23 +313,28 @@ def _lock_holder_info(name: str) -> dict[str, Any]:
 def _fetch_lock(timeout: float | None = None):
     """CM timeout-aware equivalente a `with _fetch_lock():`. Evita colgar hilos.
 
+    Usa un lock POR USUARIO (resuelto por el `current_user` de la petición MCP),
+    de modo que dos usuarios distintos pueden consultar Garmin a la vez; solo se
+    serializan las tool calls del MISMO usuario (que comparten su sesión).
+
     Libera el lock de forma defensiva contra el objeto capturado en la
     adquisición: si el watchdog rota el lock mientras esta sección está activa,
     se libera el lock viejo (que es el que realmente se adquirió) en lugar de
     romper con `RuntimeError: release unlocked lock`.
     """
     t = FETCH_TOOL_TIMEOUT_SECONDS if timeout is None else timeout
-    lock = FETCH_LOCK
+    key = _fetch_lock_key()
+    lock = _current_fetch_lock()
     if not lock.acquire(timeout=t):
         raise _FetchLockTimeoutError(
             "El servidor está ocupado con otra consulta a Garmin. "
             "Inténtalo de nuevo en unos segundos."
         )
-    _mark_lock_acquired("fetch", lock)
+    _mark_lock_acquired("fetch", key, lock)
     try:
         yield
     finally:
-        _mark_lock_released("fetch", lock)
+        _mark_lock_released("fetch", key, lock)
         try:
             lock.release()
         except RuntimeError:
@@ -292,11 +351,11 @@ def _refresh_lock(timeout: float | None = None):
             "El servidor está ocupado con otra consulta a Garmin. "
             "Inténtalo de nuevo en unos segundos."
         )
-    _mark_lock_acquired("refresh", lock)
+    _mark_lock_acquired("refresh", "refresh", lock)
     try:
         yield
     finally:
-        _mark_lock_released("refresh", lock)
+        _mark_lock_released("refresh", "refresh", lock)
         try:
             lock.release()
         except RuntimeError:
@@ -306,29 +365,33 @@ def _refresh_lock(timeout: float | None = None):
 def _lock_watchdog_tick(now: float | None = None) -> bool:
     """Una pasada del watchdog de locks: rota todo lock retenido más de su tope.
 
+    Con los locks por usuario, el fetch puede tener varios holders simultáneos
+    (uno por usuario). Se rota si CUALQUIER usuario lleva retenido su lock más
+    de su tope; en ese caso se rotan todos (global + por usuario + refresh).
+
     Devuelve True si rotó algún lock. Separada del bucle para poder testearla.
     """
     if now is None:
         now = time.monotonic()
-    stale: list[tuple[str, float]] = []
+    stale: list[tuple[str, str, float]] = []
     with _LOCK_STATE_LOCK:
         for name, limit in (
             ("fetch", LOCK_ROTATE_AFTER_SECONDS),
             ("refresh", REFRESH_LOCK_ROTATE_AFTER_SECONDS),
         ):
-            st = _LOCK_STATES.get(name) or {}
-            if not st.get("held"):
-                continue
-            since = st.get("since")
-            if since is None or not isinstance(since, (int, float)):
-                st["since"] = now  # sin marca temporal: empezamos a contar ya
-                continue
-            held = now - since
-            if held >= limit:
-                stale.append((name, held))
+            for key, st in (_LOCK_STATES.get(name) or {}).items():
+                if not st.get("held"):
+                    continue
+                since = st.get("since")
+                if since is None or not isinstance(since, (int, float)):
+                    st["since"] = now  # sin marca temporal: empezamos a contar ya
+                    continue
+                held = now - since
+                if held >= limit:
+                    stale.append((name, key, held))
     if not stale:
         return False
-    detail = ", ".join(f"{name} {held:.0f}s" for name, held in stale)
+    detail = ", ".join(f"{name}:{key} {held:.0f}s" for name, key, held in stale)
     log = logging.getLogger("locks")
     log.warning("lock retenido más de su tope (%s); rotando automáticamente", detail)
     with CACHE_LOCK:
