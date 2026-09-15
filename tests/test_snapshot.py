@@ -61,6 +61,7 @@ def make_config(fake):
     snapshot.configure(
         FETCH_LOCK=threading.Lock(),
         ACTIVITY_LIMIT=8,
+        SLEEP_STEP_TIMEOUT_SECONDS=30.0,
         _get_api=lambda: fake,
         _optional_call_first=lambda api, methods, *args: (getattr(api, methods[0])(*args), None),
         _collect_extra_raw=lambda api, day, training_status: ({}, {}, {}),

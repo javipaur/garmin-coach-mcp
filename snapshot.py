@@ -262,7 +262,11 @@ def _snapshot_base(target_date, include_recent_activities=False, _lock_fn=None):
             )
             _step_fetch("sueño")
             sleep, sleep_err = _bounded_optional_call_first(
-                api, ("get_sleep_data",), sleep_reference_day, label="sueño"
+                api,
+                ("get_sleep_data",),
+                sleep_reference_day,
+                label="sueño",
+                timeout=_dep("SLEEP_STEP_TIMEOUT_SECONDS"),
             )
             _step_fetch("estrés")
             stress, stress_err = _bounded_optional_call_first(

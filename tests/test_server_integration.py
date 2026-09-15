@@ -151,6 +151,7 @@ def _configure_real_chain_with_fake():
     snapshot.configure(
         FETCH_LOCK=server.FETCH_LOCK,
         ACTIVITY_LIMIT=server.ACTIVITY_LIMIT,
+        SLEEP_STEP_TIMEOUT_SECONDS=server.SLEEP_STEP_TIMEOUT_SECONDS,
         _get_api=lambda: FakeGarmin(),
         _optional_call_first=server._optional_call_first,
         _collect_extra_raw=server._collect_extra_raw,

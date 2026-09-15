@@ -34,6 +34,12 @@ REFRESH_LOCK_ROTATE_AFTER_SECONDS = max(
 SNAPSHOT_STALE_AFTER_SECONDS = max(
     300, int(os.getenv("SNAPSHOT_STALE_AFTER_SECONDS", str(max(300, CACHE_MINUTES * 60 * 2))))
 )
+# Tope (segundos) que el paso "sueño" del snapshot espera por cada día
+# candidato. El wrapper multi-día intenta hasta 3 offsets secuenciales, cada
+# uno con GARMIN_TIMEOUT_SECONDS de socket timeout.
+SLEEP_STEP_TIMEOUT_SECONDS = max(
+    60, int(os.getenv("SLEEP_STEP_TIMEOUT_SECONDS", str(GARMIN_TIMEOUT_SECONDS * 4)))
+)
 # TTL de la caché de wellness por usuario (coalescing de tools paralelas del
 # mismo día: la primera construye el snapshot y el resto sirve de caché).
 WELLNESS_CACHE_TTL_SECONDS = max(
