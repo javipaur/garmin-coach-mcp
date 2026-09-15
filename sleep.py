@@ -320,16 +320,22 @@ def _recompute_sleep_freshness_fields(metrics: dict[str, Any]) -> None:
 
 _SLEEP_SELECTION_DEBUG_LAST = None
 
+# El original se captura una sola vez, al importar, ANTES de que server.py
+# reemplace Garmin.get_sleep_data por el wrapper multi-día. Si se capturara
+# dentro de la llamada se enlazaría consigo mismo y habría recursión infinita.
+if "_Garmin_get_sleep_data_original" not in globals():
+    try:
+        from garminconnect import Garmin as _GArm_MOD
+
+        _Garmin_get_sleep_data_original = _GArm_MOD.get_sleep_data
+    except Exception:
+        _Garmin_get_sleep_data_original = None
+
 
 def _Garmin_get_sleep_data_multi_day(self, cdate):
-    from garminconnect import Garmin
-
     global _SLEEP_SELECTION_DEBUG_LAST
 
-    try:
-        _orig = Garmin.get_sleep_data
-    except Exception:
-        _orig = None
+    _orig = _Garmin_get_sleep_data_original
 
     if _orig is None:
         raise RuntimeError("No se pudo capturar Garmin.get_sleep_data original")
