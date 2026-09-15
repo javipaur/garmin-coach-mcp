@@ -244,7 +244,8 @@ def _current_fetch_step() -> str | None:
 def _snapshot_base(target_date, include_recent_activities=False, _lock_fn=None):
     global _CURRENT_FETCH_STEP
     target_date = _parse_date(target_date)
-    sleep_reference_day = target_date
+    api_date = target_date.isoformat() if target_date is not None else None
+    sleep_reference_day = api_date
     _init_fetch_log()
     lock_cm = _lock_fn or _dep("_fetch_lock_fn")
     try:
@@ -254,11 +255,11 @@ def _snapshot_base(target_date, include_recent_activities=False, _lock_fn=None):
 
             _step_fetch("resumen")
             summary, summary_err = _bounded_optional_call_first(
-                api, ("get_user_summary", "get_stats"), target_date, label="resumen"
+                api, ("get_user_summary", "get_stats"), api_date, label="resumen"
             )
             _step_fetch("frecuencia cardiaca")
             heart, heart_err = _bounded_optional_call_first(
-                api, ("get_heart_rates", "get_rhr_day"), target_date, label="fc"
+                api, ("get_heart_rates", "get_rhr_day"), api_date, label="fc"
             )
             _step_fetch("sueño")
             sleep, sleep_err = _bounded_optional_call_first(
@@ -270,27 +271,27 @@ def _snapshot_base(target_date, include_recent_activities=False, _lock_fn=None):
             )
             _step_fetch("estrés")
             stress, stress_err = _bounded_optional_call_first(
-                api, ("get_stress_data",), target_date, label="estrés"
+                api, ("get_stress_data",), api_date, label="estrés"
             )
             _step_fetch("body battery")
             body_battery, bb_err = _bounded_optional_call_first(
-                api, ("get_body_battery",), target_date, label="body_battery"
+                api, ("get_body_battery",), api_date, label="body_battery"
             )
             _step_fetch("VFC")
             hrv, hrv_err = _bounded_optional_call_first(
-                api, ("get_hrv_data",), target_date, label="VFC"
+                api, ("get_hrv_data",), api_date, label="VFC"
             )
             _step_fetch("métricas máximas")
             max_metrics, vo2_err = _bounded_optional_call_first(
-                api, ("get_max_metrics",), target_date, label="max_metrics"
+                api, ("get_max_metrics",), api_date, label="max_metrics"
             )
             _step_fetch("predisposición para entrenar")
             training_readiness, tr_err = _bounded_optional_call_first(
-                api, ("get_training_readiness",), target_date, label="training_readiness"
+                api, ("get_training_readiness",), api_date, label="training_readiness"
             )
             _step_fetch("estado de entreno")
             training_status, ts_err = _bounded_optional_call_first(
-                api, ("get_training_status",), target_date, label="training_status"
+                api, ("get_training_status",), api_date, label="training_status"
             )
 
             activities = []
@@ -315,7 +316,7 @@ def _snapshot_base(target_date, include_recent_activities=False, _lock_fn=None):
             def _worker_extra():
                 try:
                     _extra_box["result"] = _dep("_collect_extra_raw")(
-                        api, target_date, training_status
+                        api, api_date, training_status
                     )
                 except Exception as exc:
                     _extra_box["error"] = exc

@@ -1,3 +1,4 @@
+import contextlib
 import threading
 
 import snapshot
@@ -62,6 +63,8 @@ def make_config(fake):
         FETCH_LOCK=threading.Lock(),
         ACTIVITY_LIMIT=8,
         SLEEP_STEP_TIMEOUT_SECONDS=30.0,
+        _get_fetch_logger=lambda: None,
+        _fetch_lock_fn=lambda: contextlib.nullcontext(),
         _get_api=lambda: fake,
         _optional_call_first=lambda api, methods, *args: (getattr(api, methods[0])(*args), None),
         _collect_extra_raw=lambda api, day, training_status: ({}, {}, {}),
@@ -121,3 +124,44 @@ def test_attach_frontend_runs_last():
 
     result = snapshot._collect_day_snapshot("2026-09-11")
     assert result[0] == "ATTACHED"
+
+
+def test_snapshot_passes_iso_string_dates_to_api():
+    received = []
+
+    class RecordingFake(FakeGarmin):
+        def get_user_summary(self, day=None):
+            received.append(("get_user_summary", day))
+            return super().get_user_summary(day)
+
+        def get_heart_rates(self, day=None):
+            received.append(("get_heart_rates", day))
+            return super().get_heart_rates(day)
+
+        def get_stress_data(self, day=None):
+            received.append(("get_stress_data", day))
+            return super().get_stress_data(day)
+
+        def get_body_battery(self, day=None):
+            received.append(("get_body_battery", day))
+            return super().get_body_battery(day)
+
+        def get_max_metrics(self, day=None):
+            received.append(("get_max_metrics", day))
+            return super().get_max_metrics(day)
+
+        def get_training_readiness(self, day=None):
+            received.append(("get_training_readiness", day))
+            return super().get_training_readiness(day)
+
+        def get_training_status(self, day=None):
+            received.append(("get_training_status", day))
+            return super().get_training_status(day)
+
+    make_config(RecordingFake())
+    snapshot._collect_day_snapshot("2026-09-11")
+
+    assert received, "no se llamó a ninguna API"
+    for name, day in received:
+        assert isinstance(day, str), f"{name} recibió {type(day).__name__}: {day!r}"
+        assert day == "2026-09-11", f"{name} recibió {day!r}"
