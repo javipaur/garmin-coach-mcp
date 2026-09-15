@@ -99,6 +99,7 @@ from config import (
     TOKEN_HEARTBEAT_INTERVAL_SECONDS,
     TOKEN_REFRESH_LEAD_SECONDS,
     USERS_DB_DIR,
+    WELLNESS_CACHE_TTL_SECONDS,
 )
 from date_utils import (
     _isoish_to_local,
@@ -174,6 +175,89 @@ def _rotate_fetch_lock() -> None:
     with _LOCK_STATE_LOCK:
         for name in _LOCK_STATES:
             _LOCK_STATES[name] = {}
+
+
+# --- Caché de snapshot por usuario (wellness) ---
+# Un solo fetch por (usuario, día): la primera tool del día construye el
+# snapshot completo (todas las métricas) bajo `_fetch_lock`; las tools paralelas
+# del mismo día esperan a que termine en vez de competir por el lock y duplicar
+# llamadas HTTP a Garmin (los wrappers multi-día de VFC y sueño hacen varias
+# llamadas secuenciales de 45s bajo el lock).
+_USER_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}  # key -> {"fetched_at", "snapshot"}
+_USER_SNAPSHOT_GUARD = threading.Condition()
+_USER_SNAPSHOT_BUILDING: set[str] = set()
+
+
+def _user_snapshot_key(user_id: str | None, iso_date: str) -> str:
+    uid = user_id or "default"
+    return f"{uid}::{iso_date}"
+
+
+def _user_snapshot_is_fresh(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    fetched_at = entry.get("fetched_at")
+    if not isinstance(fetched_at, (int, float)):
+        return False
+    return time.monotonic() - fetched_at < WELLNESS_CACHE_TTL_SECONDS
+
+
+def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
+    """Devuelve el snapshot wellness del día para el usuario actual.
+
+    Coalescing (single-flight): si otra llamada del mismo usuario ya está
+    construyendo el snapshot del mismo día, esperamos a que termine en vez de
+    competir por `_fetch_lock` y hacer llamadas Garmin duplicadas. Si la caché
+    está fresca, se devuelve sin tocar el lock.
+    """
+    user = _get_auth_user()
+    user_id = user.get("id") if user else None
+    key = _user_snapshot_key(user_id, iso_date)
+    wait_timeout = max(120.0, float(WELLNESS_CACHE_TTL_SECONDS))
+
+    for _ in range(3):
+        cached = _USER_SNAPSHOT_CACHE.get(key)
+        if _user_snapshot_is_fresh(cached):
+            return cached["snapshot"]
+
+        with _USER_SNAPSHOT_GUARD:
+            cached = _USER_SNAPSHOT_CACHE.get(key)
+            if _user_snapshot_is_fresh(cached):
+                return cached["snapshot"]
+            if key in _USER_SNAPSHOT_BUILDING:
+                _USER_SNAPSHOT_GUARD.wait(timeout=wait_timeout)
+                cached = _USER_SNAPSHOT_CACHE.get(key)
+                if _user_snapshot_is_fresh(cached):
+                    return cached["snapshot"]
+                # El constructor falló o expiró la espera: reintenta siendo
+                # nosotros el constructor la próxima iteración.
+                continue
+            _USER_SNAPSHOT_BUILDING.add(key)
+            break
+    else:
+        raise _FetchLockTimeoutError(
+            "El servidor está ocupado construyendo el snapshot de wellness. "
+            "Inténtalo de nuevo en unos segundos."
+        )
+
+    try:
+        with _fetch_lock():
+            cached = _USER_SNAPSHOT_CACHE.get(key)
+            if _user_snapshot_is_fresh(cached):
+                return cached["snapshot"]
+            snapshot = _collect_day_snapshot(
+                iso_date, include_recent_activities=False, _lock_fn=_fetch_lock
+            )
+        with _USER_SNAPSHOT_GUARD:
+            _USER_SNAPSHOT_CACHE[key] = {
+                "fetched_at": time.monotonic(),
+                "snapshot": snapshot,
+            }
+            return snapshot
+    finally:
+        with _USER_SNAPSHOT_GUARD:
+            _USER_SNAPSHOT_BUILDING.discard(key)
+            _USER_SNAPSHOT_GUARD.notify_all()
 
 
 class _FetchLockTimeoutError(RuntimeError):
@@ -8509,11 +8593,10 @@ def get_max_metrics(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_max_metrics",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("max_metrics_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay métricas máximas para {parsed}.")
+        raise RuntimeError(f"No hay métricas máximas para {parsed}.")
     return {"date": parsed, "max_metrics": data}
 
 
@@ -8524,11 +8607,10 @@ def get_body_battery(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_body_battery",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("body_battery_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay datos de Body Battery para {parsed}.")
+        raise RuntimeError(f"No hay datos de Body Battery para {parsed}.")
     return {"date": parsed, "body_battery": data}
 
 
@@ -8538,11 +8620,10 @@ def get_heart_rates(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_heart_rates",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("heart_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay datos de FC para {parsed}.")
+        raise RuntimeError(f"No hay datos de FC para {parsed}.")
     return {"date": parsed, "heart_rates": data}
 
 
@@ -8552,11 +8633,10 @@ def get_sleep_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD de la noche (por defecto ayer).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_sleep_data",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("sleep_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay datos de sueño para {parsed}.")
+        raise RuntimeError(f"No hay datos de sueño para {parsed}.")
     return {"date": parsed, "sleep_data": data}
 
 
@@ -8566,11 +8646,10 @@ def get_hrv_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_hrv_data",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("hrv_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay datos de VFC para {parsed}.")
+        raise RuntimeError(f"No hay datos de VFC para {parsed}.")
     return {"date": parsed, "hrv_data": data}
 
 
@@ -8580,11 +8659,10 @@ def get_training_status(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_training_status",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("training_status_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay estado de entrenamiento para {parsed}.")
+        raise RuntimeError(f"No hay estado de entrenamiento para {parsed}.")
     return {"date": parsed, "training_status": data}
 
 
@@ -8594,11 +8672,10 @@ def get_training_readiness(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_training_readiness",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("training_readiness_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay datos de predisposición para {parsed}.")
+        raise RuntimeError(f"No hay datos de predisposición para {parsed}.")
     return {"date": parsed, "training_readiness": data}
 
 
@@ -8608,12 +8685,12 @@ def get_rhr_day(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_rhr_day",), parsed)
-    if data is None:
-        raise RuntimeError(err or f"No hay FC en reposo para {parsed}.")
-    return {"date": parsed, "rhr": data}
+    snap = _ensure_user_snapshot(parsed)
+    heart = (snap.get("raw_sources") or {}).get("heart_raw")
+    rhr = _resting_hr(heart)
+    if rhr is None:
+        raise RuntimeError(f"No hay FC en reposo para {parsed}.")
+    return {"date": parsed, "rhr": rhr}
 
 
 @mcp.tool
@@ -8622,11 +8699,10 @@ def get_stress_data(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_stress_data",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("stress_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay datos de estrés para {parsed}.")
+        raise RuntimeError(f"No hay datos de estrés para {parsed}.")
     return {"date": parsed, "stress_data": data}
 
 
@@ -8636,11 +8712,10 @@ def get_user_summary(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_user_summary",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("summary_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay resumen de usuario para {parsed}.")
+        raise RuntimeError(f"No hay resumen de usuario para {parsed}.")
     return {"date": parsed, "user_summary": data}
 
 
@@ -8650,11 +8725,10 @@ def get_stats(target_date: str | None = None) -> dict:
     Formato fecha: YYYY-MM-DD (por defecto hoy).
     """
     parsed = _parse_input_date(target_date)
-    with _fetch_lock():
-        api = _get_api()
-        data, err = _optional_call_first(api, ("get_stats",), parsed)
+    snap = _ensure_user_snapshot(parsed)
+    data = (snap.get("raw_sources") or {}).get("summary_raw")
     if data is None:
-        raise RuntimeError(err or f"No hay estadísticas para {parsed}.")
+        raise RuntimeError(f"No hay estadísticas para {parsed}.")
     return {"date": parsed, "stats": data}
 
 

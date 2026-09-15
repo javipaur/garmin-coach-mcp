@@ -34,6 +34,11 @@ REFRESH_LOCK_ROTATE_AFTER_SECONDS = max(
 SNAPSHOT_STALE_AFTER_SECONDS = max(
     300, int(os.getenv("SNAPSHOT_STALE_AFTER_SECONDS", str(max(300, CACHE_MINUTES * 60 * 2))))
 )
+# TTL de la caché de wellness por usuario (coalescing de tools paralelas del
+# mismo día: la primera construye el snapshot y el resto sirve de caché).
+WELLNESS_CACHE_TTL_SECONDS = max(
+    120, int(os.getenv("WELLNESS_CACHE_TTL_SECONDS", str(CACHE_MINUTES * 60)))
+)
 # Heartbeat de tokens Garmin: refresca los ficheros de tokens a punto de caducar
 # ANTES de que una llamada real descubra "login roto" en mitad del uso.
 TOKEN_HEARTBEAT_ENABLED = os.getenv("TOKEN_HEARTBEAT_ENABLED", "1").lower() in {
