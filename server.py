@@ -203,6 +203,20 @@ def _user_snapshot_is_fresh(entry: dict[str, Any] | None) -> bool:
     return time.monotonic() - fetched_at < WELLNESS_CACHE_TTL_SECONDS
 
 
+def _prune_user_snapshot_cache() -> None:
+    """Elimina entradas expiradas para evitar que la caché crezca sin límite."""
+    now = time.monotonic()
+    expired = [
+        key
+        for key, entry in _USER_SNAPSHOT_CACHE.items()
+        if not isinstance(entry, dict)
+        or not isinstance(entry.get("fetched_at"), (int, float))
+        or now - entry["fetched_at"] >= WELLNESS_CACHE_TTL_SECONDS
+    ]
+    for key in expired:
+        _USER_SNAPSHOT_CACHE.pop(key, None)
+
+
 def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
     """Devuelve el snapshot wellness del día para el usuario actual.
 
@@ -214,7 +228,9 @@ def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
     user = _get_auth_user()
     user_id = user.get("id") if user else None
     key = _user_snapshot_key(user_id, iso_date)
-    wait_timeout = max(120.0, float(WELLNESS_CACHE_TTL_SECONDS))
+    # Los waiters esperan como mucho el tiempo máximo de construcción del
+    # snapshot (sueño multi-día + login + resto de pasos), no el TTL completo.
+    wait_timeout = max(120.0, float(SLEEP_STEP_TIMEOUT_SECONDS) + 120.0)
 
     for _ in range(3):
         cached = _USER_SNAPSHOT_CACHE.get(key)
@@ -257,6 +273,7 @@ def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
                 "fetched_at": time.monotonic(),
                 "snapshot": snapshot,
             }
+            _prune_user_snapshot_cache()
             return snapshot
     finally:
         with _USER_SNAPSHOT_GUARD:
@@ -8634,7 +8651,8 @@ def get_heart_rates(target_date: str | None = None) -> dict:
 @mcp.tool
 def get_sleep_data(target_date: str | None = None) -> dict:
     """Datos completos de sueño: fases, duración, puntuación, respiración nocturna, SpO2.
-    Formato fecha: YYYY-MM-DD de la noche (por defecto ayer).
+    Si no se pasa fecha, devuelve la última noche completada (selección
+    automática entre hoy y los días previos).
     """
     parsed = _parse_input_date(target_date)
     snap = _ensure_user_snapshot(parsed)

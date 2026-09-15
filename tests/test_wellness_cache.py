@@ -269,3 +269,25 @@ def test_tools_serve_from_cached_snapshot(monkeypatch):
     assert out["stress_data"]["stressQualifier"] == "Bajo"
 
     assert len(collector.calls) == 1
+
+
+def test_cache_prunes_expired_entries(monkeypatch):
+    collector = FakeCollector()
+    _configure_collector(monkeypatch, collector)
+
+    server._ensure_user_snapshot("2026-09-15")
+    server._ensure_user_snapshot("2026-09-16")
+    with server._USER_SNAPSHOT_GUARD:
+        dirty = server._user_snapshot_key("u-test", "2026-09-15")
+        server._USER_SNAPSHOT_CACHE[dirty]["fetched_at"] = (
+            time.monotonic() - config.WELLNESS_CACHE_TTL_SECONDS - 10
+        )
+    assert len(server._USER_SNAPSHOT_CACHE) == 2
+
+    server._ensure_user_snapshot("2026-09-17")
+    keys = list(server._USER_SNAPSHOT_CACHE.keys())
+    assert len(keys) == 2
+    # La entrada expirada se purgó; quedan 16 y 17.
+    assert server._user_snapshot_key("u-test", "2026-09-15") not in keys
+    assert server._user_snapshot_key("u-test", "2026-09-16") in keys
+    assert server._user_snapshot_key("u-test", "2026-09-17") in keys

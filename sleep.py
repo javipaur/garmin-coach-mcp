@@ -341,6 +341,7 @@ def _Garmin_get_sleep_data_multi_day(self, cdate):
     candidates = []
 
     offsets = (-1, 0, -2) if requested_date == _today_local() else (0, -1, -2)
+    first_offset = offsets[0]
     for offset in offsets:
         day = (requested_date + timedelta(days=offset)).isoformat()
         try:
@@ -371,6 +372,10 @@ def _Garmin_get_sleep_data_multi_day(self, cdate):
 
         if candidate["end_dt"] <= now_local:
             candidates.append(candidate)
+            # Para fechas pasadas, el día pedido (offset 0) es la noche exacta;
+            # si ya tiene datos, no hace falta consultar los días previos.
+            if first_offset == 0 and offset == 0:
+                break
 
     selected = None
     if candidates:
