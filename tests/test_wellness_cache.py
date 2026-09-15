@@ -291,3 +291,115 @@ def test_cache_prunes_expired_entries(monkeypatch):
     assert server._user_snapshot_key("u-test", "2026-09-15") not in keys
     assert server._user_snapshot_key("u-test", "2026-09-16") in keys
     assert server._user_snapshot_key("u-test", "2026-09-17") in keys
+
+
+def test_force_rebuilds_even_when_cache_fresh(monkeypatch):
+    collector = FakeCollector()
+    _configure_collector(monkeypatch, collector)
+
+    server._ensure_user_snapshot("2026-09-15")
+    server._ensure_user_snapshot("2026-09-15", force=True)
+
+    assert len(collector.calls) == 2
+
+
+def test_force_waits_concurrent_builder_and_rebuilds(monkeypatch):
+    collector = FakeCollector()
+    _configure_collector(monkeypatch, collector)
+
+    results_n = []
+    results_f = []
+    errors = []
+
+    def normal():
+        try:
+            results_n.append(server._ensure_user_snapshot("2026-09-15"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def forced():
+        try:
+            results_f.append(
+                server._ensure_user_snapshot("2026-09-15", force=True)
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    tn = threading.Thread(target=normal)
+    tn.start()
+    time.sleep(0.05)  # el builder normal ya está en marcha (FakeCollector duerme 0.2s)
+
+    tf = threading.Thread(target=forced)
+    tf.start()
+    tn.join()
+    tf.join()
+
+    assert not errors
+    assert len(results_n) == 1
+    assert len(results_f) == 1
+    # force espera al builder en curso y luego reconstruye (single-flight: 2 builds).
+    assert len(collector.calls) == 2
+
+
+def test_get_cached_snapshot_devuelve_datos_del_usuario(monkeypatch):
+    fetched_at = server._now_iso()
+    snap = {
+        "date": "2026-09-15",
+        "fetched_at": fetched_at,
+        "metrics": {"pasos": 3044, "datos_hasta_local": "2026-09-15T12:00:00"},
+        "raw_sources": {},
+    }
+    monkeypatch.setattr(
+        server, "_ensure_user_snapshot", lambda iso_date: dict(snap)
+    )
+
+    out = server.get_cached_snapshot()
+
+    assert out["status"] == "ok"
+    assert out["snapshot"]["metrics"]["pasos"] == 3044
+    assert out["consecutive_refresh_failures"] == 0
+    assert out["last_error"] is None
+    assert out["stale"] is False
+    assert out["cache_age_seconds"] < 60
+    assert out["snapshot_obtenido_local"] == server._isoish_to_local(fetched_at)
+    assert out["ultima_sincronizacion_conector_local"] == server._isoish_to_local(
+        fetched_at
+    )
+    assert out["datos_hasta_local"] == "2026-09-15T12:00:00"
+
+
+def test_get_cached_snapshot_marca_stale_snapshot_antiguo(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_ensure_user_snapshot",
+        lambda iso_date: {
+            "date": iso_date,
+            "fetched_at": "2020-01-01T00:00:00+00:00",
+            "metrics": {},
+            "raw_sources": {},
+        },
+    )
+    out = server.get_cached_snapshot()
+    assert out["stale"] is True
+    assert out["cache_age_seconds"] > 0
+
+
+def test_refresh_snapshot_llama_con_force(monkeypatch):
+    calls = []
+
+    def fake_ensure(iso_date, force=False):
+        calls.append((iso_date, force))
+        return {
+            "date": iso_date,
+            "fetched_at": server._now_iso(),
+            "metrics": {},
+            "raw_sources": {},
+        }
+
+    monkeypatch.setattr(server, "_ensure_user_snapshot", fake_ensure)
+
+    out = server.refresh_snapshot()
+
+    assert calls and calls[-1][0] == server._today_local().isoformat()
+    assert calls[-1][1] is True
+    assert out["snapshot"]["date"] == server._today_local().isoformat()

@@ -217,13 +217,16 @@ def _prune_user_snapshot_cache() -> None:
         _USER_SNAPSHOT_CACHE.pop(key, None)
 
 
-def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
+def _ensure_user_snapshot(iso_date: str, force: bool = False) -> dict[str, Any]:
     """Devuelve el snapshot wellness del día para el usuario actual.
 
     Coalescing (single-flight): si otra llamada del mismo usuario ya está
     construyendo el snapshot del mismo día, esperamos a que termine en vez de
     competir por `_fetch_lock` y hacer llamadas Garmin duplicadas. Si la caché
     está fresca, se devuelve sin tocar el lock.
+
+    Con `force=True` se ignora la caché fresca y se reconstruye desde Garmin
+    (esperando, eso sí, a que termine cualquier construcción en curso).
     """
     user = _get_auth_user()
     user_id = user.get("id") if user else None
@@ -232,22 +235,25 @@ def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
     # snapshot (sueño multi-día + login + resto de pasos), no el TTL completo.
     wait_timeout = max(120.0, float(SLEEP_STEP_TIMEOUT_SECONDS) + 120.0)
 
+    def fresh(cached: dict[str, Any] | None) -> bool:
+        return (not force) and _user_snapshot_is_fresh(cached)
+
     for _ in range(3):
         cached = _USER_SNAPSHOT_CACHE.get(key)
-        if _user_snapshot_is_fresh(cached):
+        if fresh(cached):
             return cached["snapshot"]
 
         with _USER_SNAPSHOT_GUARD:
             cached = _USER_SNAPSHOT_CACHE.get(key)
-            if _user_snapshot_is_fresh(cached):
+            if fresh(cached):
                 return cached["snapshot"]
             if key in _USER_SNAPSHOT_BUILDING:
                 _USER_SNAPSHOT_GUARD.wait(timeout=wait_timeout)
                 cached = _USER_SNAPSHOT_CACHE.get(key)
-                if _user_snapshot_is_fresh(cached):
+                if fresh(cached):
                     return cached["snapshot"]
-                # El constructor falló o expiró la espera: reintenta siendo
-                # nosotros el constructor la próxima iteración.
+                # El constructor falló, expiró la espera o pedimos refresh:
+                # reintentamos siendo nosotros el constructor la próxima iteración.
                 continue
             _USER_SNAPSHOT_BUILDING.add(key)
             break
@@ -263,7 +269,7 @@ def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
         # (threading.Lock no es reentrante). El coalescing (_USER_SNAPSHOT_BUILDING)
         # garantiza un solo constructor por (usuario, día).
         cached = _USER_SNAPSHOT_CACHE.get(key)
-        if _user_snapshot_is_fresh(cached):
+        if fresh(cached):
             return cached["snapshot"]
         snapshot = _collect_day_snapshot(
             iso_date, include_recent_activities=False, _lock_fn=_fetch_lock
@@ -566,17 +572,15 @@ def _git_revision() -> str:
     return rev
 
 
-def _cache_age_seconds() -> float | None:
-    """Segundos desde el último refresh de la caché (o None si nunca refrescó).
+def _ts_age_seconds(value: Any) -> float | None:
+    """Segundos desde un timestamp ISO (o None si no es interpretable).
 
     Normaliza timestamps ISO naive a UTC: los que llegan en formato "Z" o sin
     zona horaria se tratan como UTC (es lo que emiten _now_iso() y Garmin).
     """
-    with CACHE_LOCK:
-        last = CACHE.get("last_refresh")
-    if not last:
+    if not value:
         return None
-    s = str(last)
+    s = str(value)
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     if s.endswith("+00:00") is False and "+" not in s and "-" not in s[10:]:
@@ -589,6 +593,13 @@ def _cache_age_seconds() -> float | None:
         return None
     age = (datetime.now(dt.tzinfo) - dt).total_seconds()
     return max(0.0, age)
+
+
+def _cache_age_seconds() -> float | None:
+    """Segundos desde el último refresh de la caché global (o None si nunca refrescó)."""
+    with CACHE_LOCK:
+        last = CACHE.get("last_refresh")
+    return _ts_age_seconds(last)
 
 
 def _cache_is_stale() -> bool:
@@ -3911,44 +3922,51 @@ async def setup_protection_submit(request: Request) -> Response:
     return resp
 
 
-@mcp.tool
-def get_cached_snapshot() -> dict[str, Any]:
-    """Última foto cacheada del día actual, con métricas normalizadas y raw_sources."""
-    with CACHE_LOCK:
-        snapshot = deepcopy(CACHE["snapshot"])
-        status = CACHE["status"]
-        last_refresh = CACHE["last_refresh"]
-        last_success_refresh = CACHE["last_success_refresh"]
-        consecutive_failures = CACHE["consecutive_refresh_failures"]
-        last_error = CACHE["last_error"]
+def _user_snapshot_envelope(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Envelope de get_cached_snapshot/refresh_snapshot para el usuario conectado.
+
+    Sustituye la foto global (CACHE) por el snapshot wellness del usuario del
+    api_key: cada usuario ve siempre SUS métricas, nunca las de la cuenta por
+    defecto del contenedor.
+    """
     metrics = {}
     if isinstance(snapshot, dict):
         metrics = snapshot.get("metrics") or {}
+    fetched_at = snapshot.get("fetched_at") if isinstance(snapshot, dict) else None
+    age = _ts_age_seconds(fetched_at)
 
     return {
-        "status": status,
-        "last_refresh": last_refresh,
-        "last_refresh_local": _isoish_to_local(last_refresh),
-        "last_success_refresh": last_success_refresh,
-        "cache_age_seconds": _cache_age_seconds(),
-        "stale": _cache_is_stale(),
-        "consecutive_refresh_failures": consecutive_failures,
-        "last_error": last_error,
-        "snapshot_obtenido_local": _isoish_to_local(snapshot.get("fetched_at"))
+        "status": "ok",
+        "last_refresh": fetched_at,
+        "last_refresh_local": _isoish_to_local(fetched_at),
+        "last_success_refresh": fetched_at,
+        "cache_age_seconds": age,
+        "stale": age is not None and age > SNAPSHOT_STALE_AFTER_SECONDS,
+        "consecutive_refresh_failures": 0,
+        "last_error": None,
+        "snapshot_obtenido_local": _isoish_to_local(fetched_at)
         if isinstance(snapshot, dict)
         else None,
         "datos_hasta_local": metrics.get("datos_hasta_local")
         if isinstance(metrics, dict)
         else None,
-        "ultima_sincronizacion_conector_local": _isoish_to_local(last_refresh),
-        "snapshot": snapshot,
+        "ultima_sincronizacion_conector_local": _isoish_to_local(fetched_at),
+        "snapshot": deepcopy(snapshot),
     }
 
 
 @mcp.tool
+def get_cached_snapshot() -> dict[str, Any]:
+    """Última foto cacheada del día actual del usuario conectado, con métricas normalizadas y raw_sources."""
+    return _user_snapshot_envelope(_ensure_user_snapshot(_today_local().isoformat()))
+
+
+@mcp.tool
 def refresh_snapshot() -> dict[str, Any]:
-    """Fuerza una actualización inmediata desde Garmin."""
-    return _refresh_cache_sync()
+    """Fuerza una actualización inmediata desde Garmin para el usuario conectado."""
+    return _user_snapshot_envelope(
+        _ensure_user_snapshot(_today_local().isoformat(), force=True)
+    )
 
 
 @mcp.tool
