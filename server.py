@@ -241,13 +241,16 @@ def _ensure_user_snapshot(iso_date: str) -> dict[str, Any]:
         )
 
     try:
-        with _fetch_lock():
-            cached = _USER_SNAPSHOT_CACHE.get(key)
-            if _user_snapshot_is_fresh(cached):
-                return cached["snapshot"]
-            snapshot = _collect_day_snapshot(
-                iso_date, include_recent_activities=False, _lock_fn=_fetch_lock
-            )
+        # NO envolvemos con _fetch_lock() aquí porque _snapshot_base ya lo
+        # adquiere vía _lock_fn=_fetch_lock. Hacerlo causaría deadlock
+        # (threading.Lock no es reentrante). El coalescing (_USER_SNAPSHOT_BUILDING)
+        # garantiza un solo constructor por (usuario, día).
+        cached = _USER_SNAPSHOT_CACHE.get(key)
+        if _user_snapshot_is_fresh(cached):
+            return cached["snapshot"]
+        snapshot = _collect_day_snapshot(
+            iso_date, include_recent_activities=False, _lock_fn=_fetch_lock
+        )
         with _USER_SNAPSHOT_GUARD:
             _USER_SNAPSHOT_CACHE[key] = {
                 "fetched_at": time.monotonic(),
