@@ -7,6 +7,6 @@ scikit-learn>=1.9.0
 gpxpy>=1.6.2
 requests>=2.34.2
 qrcode>=8.2
-Pillow>=12.3.0
+Pillow>=13.0.0
 pypdf>=6.18.0
 httpx>=0.24
