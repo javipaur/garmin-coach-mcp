@@ -1,5 +1,5 @@
 fastmcp==4.0.3
-garminconnect==0.3.13
+garminconnect==0.3.20
 curl_cffi>=0.15.0
 osmnx>=2.1.1
 networkx>=3.6.1
