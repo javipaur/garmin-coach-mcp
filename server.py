@@ -8891,18 +8891,26 @@ def _distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
     return 2 * 6371000 * atan2(sqrt(a), sqrt(1 - a))
 
 
-@mcp.tool
-def infer_home_base(
-    days: int = 180,
-    max_activities: int = 200,
-    apply: bool = False,
-) -> dict[str, Any]:
-    """Infiere la ubicación base (casa) agrupando los puntos de salida de tus actividades.
+def _cluster_points(
+    points: list[tuple[float, float]], radius_m: float = 1500
+) -> list[list[tuple[float, float]]]:
+    """Agrupa coordinates cercanas usando el primer punto de cada cluster como semilla."""
+    clusters: list[list[tuple[float, float]]] = []
+    for point in points:
+        for cluster in clusters:
+            center_lat = sum(p[0] for p in cluster) / len(cluster)
+            center_lon = sum(p[1] for p in cluster) / len(cluster)
+            if _distance_meters(point[0], point[1], center_lat, center_lon) <= radius_m:
+                cluster.append(point)
+                break
+        else:
+            clusters.append([point])
+    clusters.sort(key=lambda c: -len(c))
+    return clusters
 
-    days: cuántos días hacia atrás se analizan.
-    max_activities: máximo de actividades recientes a leer.
-    apply: False (default) solo propone; True guarda el resultado en tu perfil.
-    """
+
+def _recent_activity_points(days: int, max_activities: int) -> list[tuple[float, float]]:
+    """Lee actividades recientes y devuelve sus puntos de salida con coordenadas válidas."""
     from datetime import date as _date
 
     user = _get_auth_user()
@@ -8938,19 +8946,47 @@ def infer_home_base(
 
     if not points:
         raise RuntimeError("No hay actividades recientes con coordenadas de salida válidas")
+    return points
 
-    clusters: list[list[tuple[float, float]]] = []
-    for point in points:
-        for cluster in clusters:
-            center_lat = sum(p[0] for p in cluster) / len(cluster)
-            center_lon = sum(p[1] for p in cluster) / len(cluster)
-            if _distance_meters(point[0], point[1], center_lat, center_lon) <= 1500:
-                cluster.append(point)
-                break
-        else:
-            clusters.append([point])
 
-    clusters.sort(key=lambda c: (-len(c), -sum(p[0] for p in c) / len(c)))
+@mcp.tool
+def get_popular_areas(
+    days: int = 180,
+    max_activities: int = 200,
+    min_activities: int = 2,
+) -> dict[str, Any]:
+    """Zonas donde sueles entrenar, inferidas de los puntos de salida de tus actividades."""
+    points = _recent_activity_points(days, max_activities)
+    clusters = [c for c in _cluster_points(points) if len(c) >= max(1, min_activities)]
+    areas = [
+        {
+            "lat": round(sum(p[0] for p in c) / len(c), 6),
+            "lon": round(sum(p[1] for p in c) / len(c), 6),
+            "activities": len(c),
+        }
+        for c in clusters
+    ]
+    return {"areas": areas, "count": len(areas), "activities_considered": len(points)}
+
+
+@mcp.tool
+def infer_home_base(
+    days: int = 180,
+    max_activities: int = 200,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Infiere la ubicación base (casa) agrupando los puntos de salida de tus actividades.
+
+    days: cuántos días hacia atrás se analizan.
+    max_activities: máximo de actividades recientes a leer.
+    apply: False (default) solo propone; True guarda el resultado en tu perfil.
+    """
+    user = _get_auth_user()
+    if not user:
+        raise RuntimeError("No autenticado")
+
+    points = _recent_activity_points(days, max_activities)
+    clusters = _cluster_points(points)
     best = clusters[0]
     home_lat = round(sum(p[0] for p in best) / len(best), 6)
     home_lon = round(sum(p[1] for p in best) / len(best), 6)
@@ -9802,77 +9838,101 @@ def _generate_loop_route(
     network_type: str = "walk",
     max_results: int = 3,
 ) -> list[dict[str, Any]]:
-    """Genera rutas circulares desde un punto dado."""
-    from math import atan2, cos, radians, sin, sqrt
-
+    """Genera circuitos reales (ida por un lado, vuelta por otro) desde un punto dado."""
     import networkx as nx
     import osmnx as ox
 
-    G = _get_route_graph(lat, lon, network_type=network_type)
-    orig_node = ox.distance.nearest_nodes(G, lon, lat)
-
     target_m = target_distance_km * 1000
     tolerance = target_m * 0.15
+    radius_m = max(1500, min(6000, int(target_m * 0.6)))
 
-    all_nodes = list(G.nodes(data=True))
+    G = _get_route_graph(lat, lon, radius_m=radius_m, network_type=network_type)
+    orig_node = ox.distance.nearest_nodes(G, lon, lat)
+
     candidates = []
-    for node_id, data in all_nodes:
+    for node_id, data in G.nodes(data=True):
         node_lat = data.get("y", data.get("lat", 0))
         node_lon = data.get("x", data.get("lon", 0))
-        dlat = radians(node_lat - lat)
-        dlon = radians(node_lon - lon)
-        a = sin(dlat / 2) ** 2 + cos(radians(lat)) * cos(radians(node_lat)) * sin(dlon / 2) ** 2
-        dist = 2 * 6371000 * atan2(sqrt(a), sqrt(1 - a))
+        dist = _distance_meters(lat, lon, node_lat, node_lon)
         if target_m * 0.3 < dist < target_m * 0.7:
             candidates.append((node_id, dist))
-
     candidates.sort(key=lambda x: x[1])
+    candidates = candidates[:8]
+
+    def _edge_attrs(u: Any, v: Any) -> dict[str, Any]:
+        data = G.get_edge_data(u, v)
+        if not data:
+            return {}
+        if 0 in data:
+            return data[0]
+        return next(iter(data.values()), {})
 
     results = []
-    for cand_node, _ in candidates[: min(10, len(candidates))]:
-        try:
-            path_out = nx.shortest_path(G, orig_node, cand_node, weight="length")
-            path_back = nx.shortest_path(G, cand_node, orig_node, weight="length")
-
-            total_dist = 0
-            coords = []
-            seen = set()
-            for node in path_out + path_back[1:]:
-                if node in seen:
+    for i, (node_a, _) in enumerate(candidates):
+        for node_b, _ in candidates[i + 1 :]:
+            try:
+                legs = [
+                    nx.shortest_path(G, orig_node, node_a, weight="length"),
+                    nx.shortest_path(G, node_a, node_b, weight="length"),
+                    nx.shortest_path(G, node_b, orig_node, weight="length"),
+                ]
+                full_path: list[Any] = []
+                for leg in legs:
+                    full_path.extend(leg if not full_path else leg[1:])
+                if len(full_path) < 4 or full_path[0] != full_path[-1]:
                     continue
-                seen.add(node)
-                nd = G.nodes[node]
-                coords.append(
-                    {"lat": nd.get("y", nd.get("lat", 0)), "lon": nd.get("x", nd.get("lon", 0))}
+
+                lengths = []
+                surfaces: dict[str, int] = {}
+                elevation_gain = 0.0
+                seen_edges: set[frozenset[Any]] = set()
+                for u, v in zip(full_path, full_path[1:], strict=False):
+                    attrs = _edge_attrs(u, v)
+                    lengths.append(float(attrs.get("length", 0) or 0))
+                    surface = attrs.get("surface") or attrs.get("highway") or "unknown"
+                    surfaces[str(surface)] = surfaces.get(str(surface), 0) + 1
+                    u_elev = G.nodes[u].get("elevation")
+                    v_elev = G.nodes[v].get("elevation")
+                    if u_elev is not None and v_elev is not None:
+                        elevation_gain += max(0.0, float(v_elev) - float(u_elev))
+                    seen_edges.add(frozenset((u, v)))
+
+                total_dist_m = sum(lengths)
+                deviation = abs(total_dist_m - target_m)
+                if deviation > tolerance:
+                    continue
+
+                points = [
+                    {
+                        "lat": G.nodes[n].get("y", G.nodes[n].get("lat", 0)),
+                        "lon": G.nodes[n].get("x", G.nodes[n].get("lon", 0)),
+                    }
+                    for n in full_path
+                ]
+                is_loop = len(seen_edges) == len(lengths)
+                surface_label = (
+                    "mixed"
+                    if len(surfaces) > 1 and max(surfaces.values()) <= len(lengths) / 2
+                    else max(surfaces, key=surfaces.get)
+                    if surfaces
+                    else "unknown"
                 )
-                total_dist += 1
-
-            total_dist_m = sum(
-                G.edges[path_out[i], path_out[i + 1], 0].get("length", 0)
-                for i in range(len(path_out) - 1)
-            ) + sum(
-                G.edges[path_back[i], path_back[i + 1], 0].get("length", 0)
-                for i in range(len(path_back) - 1)
-            )
-
-            deviation = abs(total_dist_m - target_m)
-            if deviation > tolerance:
+                results.append(
+                    {
+                        "distance_km": round(total_dist_m / 1000, 2),
+                        "distance_m": round(total_dist_m),
+                        "elevation_gain_m": round(elevation_gain or elevation_gain_target),
+                        "surface": surface_label,
+                        "is_loop": is_loop,
+                        "points": points,
+                        "point_count": len(points),
+                        "deviation_pct": round(deviation / target_m * 100, 1),
+                    }
+                )
+            except Exception:
                 continue
 
-            results.append(
-                {
-                    "distance_km": round(total_dist_m / 1000, 2),
-                    "distance_m": round(total_dist_m),
-                    "elevation_gain_m": elevation_gain_target,
-                    "points": coords,
-                    "point_count": len(coords),
-                    "deviation_pct": round(deviation / target_m * 100, 1),
-                }
-            )
-        except Exception:
-            continue
-
-    results.sort(key=lambda r: r["deviation_pct"])
+    results.sort(key=lambda r: (not r["is_loop"], r["deviation_pct"]))
     return results[:max_results]
 
 
@@ -9936,7 +9996,7 @@ def suggest_routes(
     }
 
 
-@mcp.tool(timeout=45)
+@mcp.tool(timeout=90)
 def suggest_routes_from_profile(
     distance_km: float,
     elevation_gain_m: int = 0,
@@ -9945,18 +10005,20 @@ def suggest_routes_from_profile(
     max_results: int = 3,
 ) -> dict[str, Any]:
     """
-    Genera rutas desde la ubicación base del usuario (home_lat/home_lon del perfil).
+    Genera rutas desde la ubicación base del usuario; si no está configurada,
+    la infiere de las actividades recientes.
     """
     user = _get_auth_user()
     if not user:
         raise RuntimeError("No autenticado")
 
-    home_lat = user.get("home_lat")
-    home_lon = user.get("home_lon")
+    profile = get_user_profile()
+    home_lat = profile.get("home_lat")
+    home_lon = profile.get("home_lon")
     if not home_lat or not home_lon:
-        raise RuntimeError(
-            "No tienes ubicación base configurada. Usa update_user_profile para establecer home_lat y home_lon."
-        )
+        best = _cluster_points(_recent_activity_points(180, 200))[0]
+        home_lat = round(sum(p[0] for p in best) / len(best), 6)
+        home_lon = round(sum(p[1] for p in best) / len(best), 6)
 
     return suggest_routes(
         distance_km=distance_km,
