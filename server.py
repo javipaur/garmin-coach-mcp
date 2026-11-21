@@ -9870,13 +9870,8 @@ def suggest_routes_from_profile(
     )
 
 
-@mcp.tool
-def export_route_gpx(route_data: dict) -> dict[str, Any]:
-    """
-    Exporta una ruta como archivo GPX en base64.
-
-    route_data: dict con la ruta devuelta por suggest_routes (debe contener 'points').
-    """
+def _build_route_gpx_xml(route_data: dict, name: str, description: str = "") -> str:
+    """Serializa los puntos de una ruta a GPX para exportar o importar como course."""
     import gpxpy
     import gpxpy.gpx
 
@@ -9885,18 +9880,28 @@ def export_route_gpx(route_data: dict) -> dict[str, Any]:
         raise RuntimeError("La ruta no tiene puntos GPS")
 
     gpx = gpxpy.gpx.GPX()
-    gpx.name = route_data.get("name", "Ruta Garmin Coach")
-    gpx.description = route_data.get("description", "")
-
+    gpx.name = name
+    gpx.description = description
     track = gpxpy.gpx.GPXTrack()
     gpx.tracks.append(track)
     segment = gpxpy.gpx.GPXTrackSegment()
     track.segments.append(segment)
-
     for pt in points:
         segment.points.append(gpxpy.gpx.GPXTrackPoint(pt["lat"], pt["lon"]))
+    return gpx.to_xml()
 
-    gpx_xml = gpx.to_xml()
+
+@mcp.tool
+def export_route_gpx(route_data: dict) -> dict[str, Any]:
+    """
+    Exporta una ruta como archivo GPX en base64.
+
+    route_data: dict con la ruta devuelta por suggest_routes (debe contener 'points').
+    """
+    points = route_data.get("points", [])
+    gpx_xml = _build_route_gpx_xml(
+        route_data, route_data.get("name", "Ruta Garmin Coach"), route_data.get("description", "")
+    )
     b64 = base64.b64encode(gpx_xml.encode("utf-8")).decode("ascii")
 
     return {
@@ -9914,7 +9919,7 @@ def upload_route_to_garmin(
     description: str = "",
 ) -> dict[str, Any]:
     """
-    Sube una ruta como course a Garmin Connect.
+    Sube una ruta como course navegable a Garmin Connect (no como actividad).
 
     route_data: dict con la ruta devuelta por suggest_routes.
     name: nombre de la ruta en Garmin.
@@ -9928,37 +9933,91 @@ def upload_route_to_garmin(
     if not points:
         raise RuntimeError("La ruta no tiene puntos GPS")
 
+    gpx_xml = _build_route_gpx_xml(route_data, name, description)
+    tmp_path = None
     try:
-        import gpxpy
-        import gpxpy.gpx
-
-        gpx = gpxpy.gpx.GPX()
-        gpx.name = name
-        gpx.description = description
-        track = gpxpy.gpx.GPXTrack()
-        gpx.tracks.append(track)
-        segment = gpxpy.gpx.GPXTrackSegment()
-        track.segments.append(segment)
-        for pt in points:
-            segment.points.append(gpxpy.gpx.GPXTrackPoint(pt["lat"], pt["lon"]))
-
-        gpx_xml = gpx.to_xml()
         with _tempfile.NamedTemporaryFile(suffix=".gpx", delete=False, mode="w") as f:
             f.write(gpx_xml)
             tmp_path = f.name
 
         with _fetch_lock():
             api = _get_api(user["id"])
-            try:
-                result = api.upload_activity(tmp_path)
-            finally:
-                import os
+            with open(tmp_path, "rb") as gpx_file:
+                parsed = api.client.post(
+                    "connectapi",
+                    "course-service/course/import",
+                    files={"file": (f"{name}.gpx", gpx_file)},
+                    api=True,
+                    timeout=60,
+                )
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Garmin no devolvió la ruta importada")
 
-                os.unlink(tmp_path)
+            geo_points = parsed.get("geoPoints") or []
+            if len(geo_points) < 2:
+                raise RuntimeError("Garmin no devolvió puntos suficientes para la ruta")
 
-        return {"ok": True, "result": result, "name": name}
+            course_payload = {
+                "activityTypePk": 1,
+                "hasTurnDetectionDisabled": False,
+                "geoPoints": geo_points,
+                "courseLines": [],
+                "coursePoints": parsed.get("coursePoints") or [],
+                "startPoint": geo_points[0],
+                "elapsedSeconds": None,
+                "openStreetMap": False,
+                "coordinateSystem": "WGS84",
+                "rulePK": 2,
+                "courseName": name,
+                "matchedToSegments": False,
+                "includeLaps": False,
+                "hasPaceBand": False,
+                "hasPowerGuide": False,
+                "favorite": False,
+                "speedMeterPerSecond": None,
+                "sourceTypeId": 3,
+            }
+            course = api.client.post(
+                "connectapi",
+                "course-service/course",
+                json=course_payload,
+                api=True,
+                timeout=60,
+            )
+        if not isinstance(course, dict):
+            raise RuntimeError("Garmin no devolvió el course creado")
+        return {
+            "ok": True,
+            "course_id": course.get("courseId"),
+            "name": course.get("courseName") or name,
+        }
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError(f"Error subiendo ruta: {e}")
+    finally:
+        if tmp_path:
+            import os
+
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+@mcp.tool
+def get_course_list() -> dict[str, Any]:
+    """Lista las rutas (courses) guardadas en Garmin Connect."""
+    user = _get_auth_user()
+    if not user:
+        raise RuntimeError("No autenticado")
+
+    with _fetch_lock():
+        api = _get_api(user["id"])
+        data = api.connectapi("web-gateway/course/owner/")
+
+    courses = (data or {}).get("coursesForUser") or [] if isinstance(data, dict) else []
+    return {"courses": courses, "count": len(courses), "raw": data}
 
 
 @mcp.tool
