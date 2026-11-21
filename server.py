@@ -10004,6 +10004,113 @@ def suggest_routes(
     }
 
 
+def _extract_track_points(details: Any) -> list[dict[str, float]]:
+    """Extrae puntos GPS del payload real de Garmin (geoPolylineDTO.polyline)."""
+    if not isinstance(details, dict):
+        return []
+    geo = details.get("geoPolylineDTO")
+    if not isinstance(geo, dict):
+        return []
+    polyline = geo.get("polyline")
+    if not isinstance(polyline, list):
+        return []
+    points: list[dict[str, float]] = []
+    for item in polyline:
+        if isinstance(item, dict):
+            lat = item.get("lat", item.get("latitude"))
+            lon = item.get("lon", item.get("longitude"))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            lat, lon = item[0], item[1]
+        else:
+            continue
+        if lat is None or lon is None:
+            continue
+        try:
+            points.append({"lat": float(lat), "lon": float(lon)})
+        except (TypeError, ValueError):
+            continue
+    return points
+
+
+def _routes_from_activity_tracks(
+    distance_km: float,
+    max_results: int = 3,
+    max_activities: int = 30,
+    tolerance_pct: float = 20.0,
+) -> list[dict[str, Any]]:
+    """Genera rutas reutilizando tracks GPS de actividades reales del usuario.
+
+    Evita depender de Overpass público, que devuelve 502 cuando está saturado.
+    """
+    api = _get_api()
+    activities, err = _optional_call_first(api, ("get_activities",), 0, max_activities)
+    if activities is None:
+        return []
+
+    target_m = distance_km * 1000
+    tolerance = target_m * tolerance_pct / 100
+    routes: list[dict[str, Any]] = []
+
+    for activity in activities:
+        if len(routes) >= max_results:
+            break
+        if not isinstance(activity, dict):
+            continue
+        activity_id = activity.get("activityId")
+        if activity_id is None:
+            continue
+        activity_type = activity.get("activityType") or activity.get("activityTypeDTO") or {}
+        type_key = activity_type.get("typeKey") if isinstance(activity_type, dict) else None
+        if _activity_family(type_key) not in {"endurance", "cycling"}:
+            continue
+
+        try:
+            details, _ = _optional_call_first(api, ("get_activity_details",), str(activity_id))
+            points = _extract_track_points(details)
+            if len(points) < 4:
+                continue
+            lengths = [
+                _distance_meters(
+                    points[i]["lat"], points[i]["lon"], points[i + 1]["lat"], points[i + 1]["lon"]
+                )
+                for i in range(len(points) - 1)
+            ]
+            total_m = sum(lengths)
+            deviation = abs(total_m - target_m)
+            if deviation > tolerance:
+                continue
+            summary = activity.get("summaryDTO") or {}
+            elevation = 0.0
+            if isinstance(summary, dict):
+                elevation = float(summary.get("elevationGain") or 0)
+            is_loop = (
+                _distance_meters(
+                    points[0]["lat"], points[0]["lon"], points[-1]["lat"], points[-1]["lon"]
+                )
+                < 100
+            )
+            routes.append(
+                {
+                    "distance_km": round(total_m / 1000, 2),
+                    "distance_m": round(total_m),
+                    "elevation_gain_m": round(elevation, 1),
+                    "surface": "mixed",
+                    "is_loop": is_loop,
+                    "points": points,
+                    "point_count": len(points),
+                    "deviation_pct": round(deviation / target_m * 100, 1),
+                    "source": "activity_track",
+                    "activity_id": str(activity_id),
+                    "name": activity.get("activityName") or f"Ruta real {activity_id}",
+                }
+            )
+        except Exception:
+            continue
+
+    routes.sort(key=lambda r: r["deviation_pct"])
+    return routes
+
+
 @mcp.tool(timeout=90)
 def suggest_routes_from_profile(
     distance_km: float,
@@ -10027,6 +10134,26 @@ def suggest_routes_from_profile(
         best = _cluster_points(_recent_activity_points(180, 200))[0]
         home_lat = round(sum(p[0] for p in best) / len(best), 6)
         home_lon = round(sum(p[1] for p in best) / len(best), 6)
+
+    # Preferimos tracks ya corridos por el usuario: no dependen de Overpass,
+    # que devuelve 502 cuando está saturado.
+    track_routes = _routes_from_activity_tracks(
+        distance_km=distance_km,
+        max_results=max_results,
+    )
+    if track_routes:
+        return {
+            "query": {
+                "distance_km": distance_km,
+                "lat": home_lat,
+                "lon": home_lon,
+                "sport": sport,
+                "surface": surface,
+                "source": "activity_track",
+            },
+            "routes": track_routes,
+            "count": len(track_routes),
+        }
 
     return suggest_routes(
         distance_km=distance_km,
