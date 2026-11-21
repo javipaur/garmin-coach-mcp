@@ -118,7 +118,7 @@ from sleep import (
     _parse_iso_date_or_today,
 )
 from workout import (
-    _garmin_workout_step_from_desc,
+    _garmin_workout_steps_from_desc,
     _parse_workout_steps_text,
 )
 
@@ -3964,9 +3964,7 @@ def get_cached_snapshot() -> dict[str, Any]:
 @mcp.tool
 def refresh_snapshot() -> dict[str, Any]:
     """Fuerza una actualización inmediata desde Garmin para el usuario conectado."""
-    return _user_snapshot_envelope(
-        _ensure_user_snapshot(_today_local().isoformat(), force=True)
-    )
+    return _user_snapshot_envelope(_ensure_user_snapshot(_today_local().isoformat(), force=True))
 
 
 @mcp.tool
@@ -9122,7 +9120,17 @@ def create_workout_from_description(
     name: nombre del entrenamiento.
     description: pasos del entrenamiento. Formatos aceptados:
       - JSON lista de pasos: [{"type":"warmup","duration_min":10}, {"type":"active","distance_km":5,"target_hr_zone":2}, ...]
-      - Texto simple: "calentamiento 10min, 5km Z2, vuelta a la calma 5min"
+      - Series como bloque repeat real (NO escribas las repeticiones una a una):
+        [{"type":"warmup","duration_min":10},
+         {"type":"repeat","iterations":5,"steps":[
+             {"type":"interval","distance_km":1,"target_pace":"4:10-4:15/km"},
+             {"type":"rest","duration_min":2}]},
+         {"type":"cooldown","duration_min":5}]
+      - Texto simple: "calentamiento 10min, 5x1000m ritmo 4:10-4:15/km, rec 2min, vuelta a la calma 5min"
+      - Texto en español: "4 km entre 4:30 y 4:35" o "4x1km de 4:20 a 4:25/km rec 90s"
+    target_pace acepta rangos "4:10-4:15/km", "entre 4:30 y 4:35", "de 4:20 a 4:25/km",
+    un valor "4:30/km" o target_pace_mps en m/s.
+    Los pasos de distancia terminan al llegar a la distancia, no por botón lap.
     target_date: si se especifica (YYYY-MM-DD), programa el entrenamiento en esa fecha.
     auto_push_to_device: si True, envía el entrenamiento al reloj Garmin conectado.
     """
@@ -9144,16 +9152,20 @@ def create_workout_from_description(
     if not steps:
         raise RuntimeError("No pude parsear la descripción del entrenamiento")
 
-    workout_steps = []
-    total_seconds = 0.0
-    for i, s in enumerate(steps):
-        gs = _garmin_workout_step_from_desc(s, i + 1)
-        workout_steps.append(gs)
-        if (
-            gs.get("endConditionValue") is not None
-            and gs.get("endCondition", {}).get("conditionTypeKey") == "time"
-        ):
-            total_seconds += float(gs["endConditionValue"])
+    workout_steps = _garmin_workout_steps_from_desc(steps)
+
+    def _estimate_seconds(step_list: list[dict[str, Any]]) -> float:
+        total = 0.0
+        for step in step_list:
+            if step.get("type") == "RepeatGroupDTO":
+                total += _estimate_seconds(step.get("workoutSteps", [])) * float(
+                    step.get("numberOfIterations", 1)
+                )
+            elif step.get("endCondition", {}).get("conditionTypeKey") == "time":
+                total += float(step.get("endConditionValue") or 0)
+        return total
+
+    total_seconds = _estimate_seconds(workout_steps)
 
     sport_type_id_map = {
         "running": 1,
@@ -9234,14 +9246,25 @@ def create_training_plan(
       - day_offset: días desde start_date (0=lunes de la semana 1)
       - sport: "running", "cycling", etc.
       - name: nombre del entrenamiento
-      - steps: lista de pasos con type, duration_min/distance_km, target_hr_zone, etc.
-      - description: alternativa a steps en texto libre
+      - steps: lista de pasos con type, duration_min/distance_km, target_hr_zone,
+        target_pace o bloques {"type":"repeat","iterations":N,"steps":[...]}.
+      - description: alternativa a steps en texto libre ("5x1000m ritmo 4:10-4:15/km, rec 2min"
+        o "4 km entre 4:30 y 4:35").
     auto_push_to_device: si True, envía cada entrenamiento al reloj Garmin.
 
     Ejemplo de sesión:
     {"day_offset": 0, "sport": "running", "name": "Rodaje suave", "steps": [
         {"type": "warmup", "duration_min": 5},
         {"type": "active", "distance_km": 5, "target_hr_zone": 2},
+        {"type": "cooldown", "duration_min": 5}
+    ]}
+    Ejemplo de series:
+    {"day_offset": 2, "sport": "running", "name": "Series 5x1000", "steps": [
+        {"type": "warmup", "duration_min": 10},
+        {"type": "repeat", "iterations": 5, "steps": [
+            {"type": "interval", "distance_km": 1, "target_pace": "4:10-4:15/km"},
+            {"type": "rest", "duration_min": 2}
+        ]},
         {"type": "cooldown", "duration_min": 5}
     ]}
     """

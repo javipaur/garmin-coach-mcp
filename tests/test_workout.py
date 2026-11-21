@@ -1,7 +1,11 @@
+import pytest
+
 from workout import (
     _garmin_workout_step_from_desc,
+    _garmin_workout_steps_from_desc,
     _parse_distance_to_m,
     _parse_duration_min,
+    _parse_pace_range,
     _parse_workout_steps_text,
 )
 
@@ -9,6 +13,7 @@ from workout import (
 def test_parse_distance_to_m_km():
     assert _parse_distance_to_m("5 km") == 5000.0
     assert _parse_distance_to_m("Corre 10km") == 10000.0
+    assert _parse_distance_to_m("4 k") == 4000.0
 
 
 def test_parse_distance_to_m_meters():
@@ -58,21 +63,28 @@ def test_parse_workout_steps_text_hr_zone():
 def test_parse_workout_steps_text_series():
     desc = "3x800m Z4, rec 400m"
     steps = _parse_workout_steps_text(desc)
-    assert len(steps) == 4
-    for step in steps[:3]:
-        assert step["type"] == "interval"
-        assert step["distance_m"] == 800
-        assert step["target_hr_zone"] == 4
-    assert steps[3]["type"] == "rest"
-    assert steps[3]["distance_m"] == 400
+    assert len(steps) == 1
+    group = steps[0]
+    assert group["type"] == "repeat"
+    assert group["iterations"] == 3
+    assert len(group["steps"]) == 2
+    interval, rest = group["steps"]
+    assert interval["type"] == "interval"
+    assert interval["distance_m"] == 800
+    assert interval["target_hr_zone"] == 4
+    assert rest["type"] == "rest"
+    assert rest["distance_m"] == 400
 
 
 def test_parse_workout_steps_text_series_time():
     desc = "4x1km, descanso 2min"
     steps = _parse_workout_steps_text(desc)
-    assert len(steps) == 5
-    assert steps[0]["distance_km"] == 1.0
-    assert steps[4]["duration_min"] == 2.0
+    assert len(steps) == 1
+    group = steps[0]
+    assert group["type"] == "repeat"
+    assert group["iterations"] == 4
+    assert group["steps"][0]["distance_km"] == 1.0
+    assert group["steps"][1]["duration_min"] == 2.0
 
 
 def test_parse_workout_steps_text_standalone_zone():
@@ -103,5 +115,126 @@ def test_workout_step_from_desc_hr_zone():
 
 def test_workout_step_from_desc_distance():
     step = _garmin_workout_step_from_desc({"type": "active", "distance_m": 1000}, 3)
+    assert step["endCondition"]["conditionTypeId"] == 3
     assert step["endCondition"]["conditionTypeKey"] == "distance"
+    assert step["endCondition"]["displayOrder"] == 3
     assert step["endConditionValue"] == 1000.0
+
+
+def test_parse_pace_range():
+    low, high = _parse_pace_range("ritmo 4:10-4:15/km")
+    assert low == pytest.approx(1000 / (4 * 60 + 15), abs=0.001)
+    assert high == pytest.approx(1000 / (4 * 60 + 10), abs=0.001)
+    assert low < high
+
+    assert _parse_pace_range("4:30/km") == pytest.approx(
+        (1000 / (4 * 60 + 30), 1000 / (4 * 60 + 30)), abs=0.001
+    )
+    assert _parse_pace_range("entre 4:30 y 4:35") == pytest.approx(
+        (1000 / (4 * 60 + 35), 1000 / (4 * 60 + 30)), abs=0.001
+    )
+    assert _parse_pace_range("de 4:20 a 4:25/km") == pytest.approx(
+        (1000 / (4 * 60 + 25), 1000 / (4 * 60 + 20)), abs=0.001
+    )
+    assert _parse_pace_range("sin ritmo") is None
+
+
+def test_parse_workout_steps_text_pace_range_in_spanish():
+    steps = _parse_workout_steps_text("4 km entre 4:30 y 4:35")
+    assert steps == [
+        {"type": "active", "distance_km": 4.0, "target_pace": "4:30 y 4:35"}
+    ]
+
+
+def test_garmin_pace_target_uses_fast_value_first():
+    """Garmin descarta los valores si targetValueOne no es el ritmo más rápido."""
+    garmin = _garmin_workout_step_from_desc(
+        {"type": "active", "distance_km": 4, "target_pace": "entre 4:30 y 4:35"}, 1
+    )
+    assert garmin["targetType"]["workoutTargetTypeKey"] == "pace.zone"
+    assert garmin["targetValueOne"] == pytest.approx(1000 / 270, abs=0.001)
+    assert garmin["targetValueTwo"] == pytest.approx(1000 / 275, abs=0.001)
+    assert garmin["targetValueOne"] > garmin["targetValueTwo"]
+
+
+def test_parse_workout_steps_text_rest_seconds():
+    steps = _parse_workout_steps_text("3x800m rec 90s")
+    assert steps[0]["steps"][1]["duration_min"] == pytest.approx(1.5)
+
+
+def test_parse_workout_steps_text_series_pace():
+    desc = "Calentamiento 10 min, 5x1000m ritmo 4:10-4:15/km, rec 2min, Vuelta a la calma 5 min"
+    steps = _parse_workout_steps_text(desc)
+    assert [s["type"] for s in steps] == ["warmup", "repeat", "cooldown"]
+    group = steps[1]
+    assert group["iterations"] == 5
+    assert group["steps"][0]["target_pace"] == "4:10-4:15/km"
+    assert group["steps"][1]["duration_min"] == 2.0
+
+
+def test_garmin_workout_steps_from_desc_repeat_group():
+    steps = [
+        {"type": "warmup", "duration_min": 10},
+        {
+            "type": "repeat",
+            "iterations": 5,
+            "steps": [
+                {"type": "interval", "distance_km": 1, "target_pace": "4:10-4:15/km"},
+                {"type": "rest", "duration_min": 2},
+            ],
+        },
+        {"type": "cooldown", "duration_min": 5},
+    ]
+    garmin = _garmin_workout_steps_from_desc(steps)
+    assert [s["type"] for s in garmin] == [
+        "ExecutableStepDTO",
+        "RepeatGroupDTO",
+        "ExecutableStepDTO",
+    ]
+    group = garmin[1]
+    assert group["stepOrder"] == 2
+    assert group["stepType"] == {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6}
+    assert group["numberOfIterations"] == 5
+    assert group["endCondition"]["conditionTypeId"] == 7
+    assert group["endCondition"]["conditionTypeKey"] == "iterations"
+    assert group["endConditionValue"] == 5.0
+    assert group["smartRepeat"] is False
+
+    interval, recovery = group["workoutSteps"]
+    assert interval["stepOrder"] == 3
+    assert interval["endCondition"]["conditionTypeId"] == 3
+    assert interval["endCondition"]["conditionTypeKey"] == "distance"
+    assert interval["endConditionValue"] == 1000.0
+    assert interval["targetType"] == {
+        "workoutTargetTypeId": 6,
+        "workoutTargetTypeKey": "pace.zone",
+        "displayOrder": 1,
+    }
+    assert interval["targetValueOne"] == pytest.approx(1000 / 250, abs=0.001)
+    assert interval["targetValueTwo"] == pytest.approx(1000 / 255, abs=0.001)
+
+    assert recovery["stepOrder"] == 4
+    assert recovery["stepType"]["stepTypeKey"] == "recovery"
+    assert recovery["endConditionValue"] == 120.0
+
+    assert garmin[2]["stepOrder"] == 5
+    assert garmin[2]["stepType"]["stepTypeKey"] == "cooldown"
+
+
+def test_garmin_workout_steps_from_desc_accepts_json_repeat_keys():
+    steps = [
+        {
+            "type": "REPEAT",
+            "reps": 3,
+            "workout_steps": [
+                {"type": "active", "distance_m": 400, "target_pace_mps": 3.9},
+                {"type": "recuperacion", "duration_sec": 90},
+            ],
+        }
+    ]
+    garmin = _garmin_workout_steps_from_desc(steps)
+    group = garmin[0]
+    assert group["numberOfIterations"] == 3
+    assert group["workoutSteps"][0]["targetType"]["workoutTargetTypeKey"] == "pace.zone"
+    assert group["workoutSteps"][0]["targetValueOne"] == pytest.approx(3.9)
+    assert group["workoutSteps"][1]["stepType"]["stepTypeKey"] == "recovery"
