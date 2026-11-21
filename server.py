@@ -8882,6 +8882,105 @@ def get_user_profile() -> dict[str, Any]:
     }
 
 
+def _distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    from math import atan2, cos, radians, sin, sqrt
+
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return 2 * 6371000 * atan2(sqrt(a), sqrt(1 - a))
+
+
+@mcp.tool
+def infer_home_base(
+    days: int = 180,
+    max_activities: int = 200,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Infiere la ubicación base (casa) agrupando los puntos de salida de tus actividades.
+
+    days: cuántos días hacia atrás se analizan.
+    max_activities: máximo de actividades recientes a leer.
+    apply: False (default) solo propone; True guarda el resultado en tu perfil.
+    """
+    from datetime import date as _date
+
+    user = _get_auth_user()
+    if not user:
+        raise RuntimeError("No autenticado")
+
+    cutoff = _date.today() - timedelta(days=max(1, days))
+    with _fetch_lock():
+        api = _get_api(user["id"])
+        activities, err = _optional_call_first(
+            api, ("get_activities",), 0, max(1, min(200, int(max_activities)))
+        )
+    if activities is None:
+        raise RuntimeError(err or "No se pudo leer el historial de actividades")
+
+    points: list[tuple[float, float]] = []
+    for activity in activities or []:
+        if not isinstance(activity, dict):
+            continue
+        raw_date = activity.get("startTimeLocal") or activity.get("startTimeGMT") or ""
+        try:
+            activity_date = _date.fromisoformat(str(raw_date)[:10])
+        except ValueError:
+            continue
+        if activity_date < cutoff:
+            continue
+        lat = _to_float_or_none(activity.get("startLatitude") or activity.get("start_lat"))
+        lon = _to_float_or_none(activity.get("startLongitude") or activity.get("start_lon"))
+        if lat is None or lon is None:
+            continue
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            points.append((lat, lon))
+
+    if not points:
+        raise RuntimeError("No hay actividades recientes con coordenadas de salida válidas")
+
+    clusters: list[list[tuple[float, float]]] = []
+    for point in points:
+        for cluster in clusters:
+            center_lat = sum(p[0] for p in cluster) / len(cluster)
+            center_lon = sum(p[1] for p in cluster) / len(cluster)
+            if _distance_meters(point[0], point[1], center_lat, center_lon) <= 1500:
+                cluster.append(point)
+                break
+        else:
+            clusters.append([point])
+
+    clusters.sort(key=lambda c: (-len(c), -sum(p[0] for p in c) / len(c)))
+    best = clusters[0]
+    home_lat = round(sum(p[0] for p in best) / len(best), 6)
+    home_lon = round(sum(p[1] for p in best) / len(best), 6)
+    home_name = "Casa (inferida de actividades)"
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "home_lat": home_lat,
+        "home_lon": home_lon,
+        "home_name": home_name,
+        "activities_considered": len(points),
+        "cluster_count": len(clusters),
+        "candidates": [
+            {
+                "home_lat": round(sum(p[0] for p in c) / len(c), 6),
+                "home_lon": round(sum(p[1] for p in c) / len(c), 6),
+                "activities": len(c),
+            }
+            for c in clusters[:5]
+        ],
+        "applied": False,
+    }
+
+    if apply:
+        _update_user(user["id"], home_lat=home_lat, home_lon=home_lon, home_name=home_name)
+        result["applied"] = True
+
+    return result
+
+
 @mcp.tool
 def update_user_profile(
     display_name: str | None = None,
