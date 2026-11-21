@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_request
 from garminconnect import (
     Garmin,
     GarminConnectAuthenticationError,
@@ -10240,6 +10241,13 @@ def get_route_map_url(
     route_name = name or route_data.get("name") or "Ruta Garmin Coach"
     query = f"d={encoded}&n={_urlparse.quote(route_name, safe='')}"
     base = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    if not base:
+        # En Dokploy no siempre se configura PUBLIC_URL; reconstruimos la URL
+        # pública desde la request HTTP (cabeceras X-Forwarded-* del proxy).
+        try:
+            base = _public_base_url(get_http_request()).rstrip("/")
+        except Exception:
+            base = ""
     viewer_url = f"{base}/rutas#{query}" if base else f"/rutas#{query}"
 
     center_lat = sum(c[0] for c in coords) / len(coords)

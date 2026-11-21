@@ -1,4 +1,5 @@
 import pytest
+from starlette.requests import Request
 
 import server
 
@@ -29,6 +30,31 @@ def test_get_route_map_url_builds_shareable_and_external_links(monkeypatch):
     assert "Ruta%2010K" in result["viewer_url"]
     assert result["external_url"].startswith("https://www.openstreetmap.org/")
     assert result["point_count"] == 2
+
+
+def test_get_route_map_url_uses_http_request_when_public_url_is_unset(monkeypatch):
+    monkeypatch.delenv("PUBLIC_URL", raising=False)
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "query_string": b"",
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "headers": [
+            (b"x-forwarded-proto", b"https"),
+            (b"x-forwarded-host", b"garmin.javierpalacio.es"),
+        ],
+    }
+    monkeypatch.setattr(server, "get_http_request", lambda: Request(scope))
+    route = {
+        "name": "Ruta 8K",
+        "points": [{"lat": 42.84, "lon": -2.68}, {"lat": 42.85, "lon": -2.69}],
+    }
+
+    result = server.get_route_map_url(route)
+
+    assert result["viewer_url"].startswith("https://garmin.javierpalacio.es/rutas#d=")
 
 
 def test_get_route_map_url_rejects_empty_routes():
