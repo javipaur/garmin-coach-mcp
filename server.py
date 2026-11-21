@@ -8342,6 +8342,51 @@ def get_workout_library(start: int = 0, limit: int = 20) -> dict:
     return {"start": start, "limit": limit, "workouts": data}
 
 
+def _normalize_workout_id(workout_id: str) -> str:
+    raw = str(workout_id).strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        raise ValueError(f"ID de entrenamiento no válido: {workout_id!r}")
+    return raw
+
+
+@mcp.tool
+def delete_workout(workout_id: str) -> dict:
+    """Elimina un entrenamiento de la biblioteca de Garmin Connect.
+
+    workout_id: ID numérico del entrenamiento (get_workout_library / get_workout_for_date).
+    Esta operación no se puede deshacer.
+    """
+    wid = _normalize_workout_id(workout_id)
+    with _fetch_lock():
+        api = _get_api()
+        try:
+            api.delete_workout(wid)
+        except Exception as e:
+            raise RuntimeError(f"No se pudo borrar el entrenamiento {wid}: {e}")
+    return {"ok": True, "workout_id": wid, "deleted": 1}
+
+
+@mcp.tool
+def delete_workouts(workout_ids: list[str], dry_run: bool = True) -> dict:
+    """Elimina varios entrenamientos de la biblioteca. Por defecto solo simula (dry_run=True).
+
+    workout_ids: lista de IDs numéricos.
+    dry_run: True (default) no borra nada y devuelve la lista; False ejecuta el borrado.
+    """
+    normalized = [_normalize_workout_id(wid) for wid in workout_ids]
+    if dry_run:
+        return {"ok": True, "dry_run": True, "workouts": normalized, "deleted": 0}
+
+    with _fetch_lock():
+        api = _get_api()
+        for wid in normalized:
+            try:
+                api.delete_workout(wid)
+            except Exception as e:
+                raise RuntimeError(f"No se pudo borrar el entrenamiento {wid}: {e}")
+    return {"ok": True, "dry_run": False, "workouts": normalized, "deleted": len(normalized)}
+
+
 @mcp.tool
 def get_workout_detail(workout_id: str) -> dict:
     """Detalle completo de un entrenamiento: pasos, series, zonas de FC/potencia y objetivos.
