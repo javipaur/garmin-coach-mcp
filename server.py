@@ -10127,6 +10127,119 @@ def get_route_map_url(
     }
 
 
+@mcp.tool(timeout=120)
+def create_route_workout(
+    route_data: dict,
+    name: str,
+    workout_description: str,
+    description: str = "",
+    target_date: str | None = None,
+    confirm_calendar: bool = False,
+    sport: str = "running",
+    push_to_device: bool = True,
+) -> dict[str, Any]:
+    """Crea un course navegable y su entrenamiento, y lo deja listo para el reloj.
+
+    route_data: ruta devuelta por suggest_routes / suggest_routes_from_profile.
+    name: nombre del course y del entrenamiento en Garmin Connect.
+    workout_description: pasos del entrenamiento (acepta lo mismo que
+      create_workout_from_description).
+    description: descripción del course.
+    target_date: fecha YYYY-MM-DD para programar el entrenamiento.
+    confirm_calendar: debe ser True para programar; evita tocar el calendario
+      por accidente.
+    sport: deporte del entrenamiento.
+    push_to_device: empuja el entrenamiento al último reloj usado si es compatible.
+
+    El course se guarda en Garmin Connect pero no se puede enviar al reloj por
+    API: usa «Send to Device» en la web/app y sincroniza el reloj.
+    """
+    if not route_data.get("points"):
+        raise RuntimeError("La ruta no tiene puntos GPS")
+    if target_date and not confirm_calendar:
+        raise RuntimeError(
+            "Necesitas confirmar explícitamente (confirm_calendar=True) antes de tocar el calendario."
+        )
+
+    push_device = None
+    if push_to_device:
+        last_used = get_device_last_used().get("device_last_used") or {}
+        device_id = last_used.get("userDeviceId") or last_used.get("deviceId")
+        devices = get_devices().get("devices") or []
+        match = next(
+            (d for d in devices if str(d.get("deviceId")) == str(device_id)),
+            None,
+        )
+        if match is None:
+            raise RuntimeError(
+                "No se encontró el último dispositivo usado entre los dispositivos de la cuenta"
+            )
+        label = (
+            match.get("productDisplayName")
+            or match.get("displayName")
+            or last_used.get("deviceName")
+            or str(device_id)
+        )
+        if not match.get("courseCapable") or not match.get("customWorkoutCapable"):
+            raise RuntimeError(
+                f"El último dispositivo usado ({label}) no es compatible con courses "
+                "y entrenamientos personalizados"
+            )
+        push_device = label
+
+    course = upload_route_to_garmin(route_data, name=name, description=description)
+    course_id = course.get("course_id")
+
+    workout = create_workout_from_description(
+        sport=sport,
+        name=name,
+        description=workout_description,
+        target_date=None,
+        auto_push_to_device=False,
+    )
+    workout_id = str(workout.get("workout_id")) if workout.get("workout_id") else None
+    if not workout_id:
+        raise RuntimeError("No se pudo crear el entrenamiento")
+
+    schedule_id = None
+    if target_date:
+        scheduled = schedule_workout(workout_id, target_date)
+        response = scheduled.get("response") if isinstance(scheduled, dict) else None
+        if isinstance(response, dict):
+            schedule_id = response.get("scheduledWorkoutId") or response.get("id")
+
+    push_error = None
+    if push_to_device:
+        try:
+            with _fetch_lock():
+                api = _get_api()
+                _push_workout(api, workout_id)
+        except Exception as e:
+            push_error = str(e)
+
+    map_info = get_route_map_url(route_data, name)
+
+    return {
+        "ok": True,
+        "course_id": course_id,
+        "workout_id": workout_id,
+        "schedule_id": schedule_id,
+        "scheduled": target_date is not None,
+        "scheduled_date": target_date,
+        "pushed_to_device": push_to_device and push_error is None,
+        "push_device": push_device,
+        "push_error": push_error,
+        "viewer_url": map_info.get("viewer_url"),
+        "external_url": map_info.get("external_url"),
+        "course_send_instructions": (
+            "El course ya está en Garmin Connect. Envíalo al reloj con «Send to Device» "
+            "en la web/app de Garmin Connect; llegará en la próxima sincronización."
+        ),
+        "name": name,
+        "sport": sport,
+    }
+
+
 def _render_route_map_html() -> str:
     """Página Leaflet que dibuja una ruta codificada en el fragmento de la URL."""
     return """<!doctype html>
