@@ -4694,9 +4694,8 @@ def _summarize_strength_sets(exercise_sets_payload: Any) -> dict[str, Any] | Non
                 active_sets_count += 1
                 if duration_s is not None:
                     active_time_s += duration_s
-            elif set_type == "REST":
-                if duration_s is not None:
-                    rest_time_s += duration_s
+            elif set_type == "REST" and duration_s is not None:
+                rest_time_s += duration_s
 
             total_reps += reps
             total_volume_kg += volume_kg

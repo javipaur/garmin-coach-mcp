@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - run: pip install ruff==0.17.6
       - run: ruff check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py server.py
       - run: ruff format --check config.py date_utils.py localization.py recovery.py activity.py workout.py coaching.py sleep.py auth.py snapshot.py
       - uses: gitleaks/gitleaks-action@v3
