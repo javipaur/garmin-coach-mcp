@@ -2220,6 +2220,22 @@ async def route_map(_: Request) -> Response:
     return HTMLResponse(_render_route_map_html())
 
 
+@mcp.custom_route("/rutas/gpx", methods=["GET"])
+async def route_gpx_download(request: Request) -> Response:
+    """Descarga la ruta del visor como GPX (la ruta viaja en la query string)."""
+    from starlette.responses import PlainTextResponse
+
+    try:
+        xml, filename = _gpx_payload_from_query(dict(request.query_params))
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    return Response(
+        content=xml,
+        media_type="application/gpx+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
     lock_info = _lock_holder_info("fetch")
@@ -8397,6 +8413,101 @@ def delete_workouts(workout_ids: list[str], dry_run: bool = True) -> dict:
     return {"ok": True, "dry_run": False, "workouts": normalized, "deleted": len(normalized)}
 
 
+def _normalize_workout_name(name: Any) -> str:
+    """Nombre canónico para comparar entrenos con copias tipo «(2)» o «copia»."""
+    clean = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    return re.sub(r"\s*\(?(?:copia|copy|\d+)\)?\s*$", "", clean).strip()
+
+
+def _steps_signature(detail: dict | None) -> str:
+    """Firma estable de los pasos de un entreno; dos entrenos iguales dan la misma firma."""
+    steps = (detail or {}).get("workoutSteps") or (detail or {}).get("steps") or []
+    keys = (
+        "stepType",
+        "type",
+        "stepOrder",
+        "duration",
+        "durationType",
+        "distance",
+        "distanceUnit",
+        "targetType",
+        "targetValueOne",
+        "targetValueTwo",
+        "endCondition",
+    )
+    normalized = [{k: s.get(k) for k in keys if k in s} for s in steps if isinstance(s, dict)]
+    return json.dumps(normalized, sort_keys=True, default=str)
+
+
+@mcp.tool
+def find_duplicate_workouts(limit: int = 100, by: str = "both") -> dict[str, Any]:
+    """Detecta entrenos duplicados en la biblioteca y propone cuáles borrar.
+
+    by: 'name' (nombre), 'steps' (pasos idénticos) o 'both' (por defecto).
+    Solo informa: no borra nada ni toca el calendario.
+    """
+    if by not in {"name", "steps", "both"}:
+        raise ValueError("by debe ser 'name', 'steps' o 'both'")
+    limit = max(1, min(500, int(limit)))
+    library = get_workout_library(start=0, limit=limit)
+    workouts = library.get("workouts") or []
+    if isinstance(workouts, dict):
+        workouts = workouts.get("workouts") or []
+
+    name_groups: dict[str, list[dict[str, Any]]] = {}
+    step_groups: dict[str, list[dict[str, Any]]] = {}
+    scanned = 0
+    for item in workouts:
+        if not isinstance(item, dict):
+            continue
+        wid = item.get("workoutId") or item.get("id") or item.get("workout_id")
+        if wid is None:
+            continue
+        wid = int(wid)
+        name = item.get("workoutName") or item.get("name") or f"Workout {wid}"
+        scanned += 1
+        member = {"id": wid, "name": str(name)}
+
+        normalized_name = _normalize_workout_name(name)
+        if normalized_name and by in {"name", "both"}:
+            name_groups.setdefault(normalized_name, []).append(member)
+
+        if by in {"steps", "both"}:
+            try:
+                detail = get_workout_detail(str(wid)).get("workout") or {}
+            except Exception:
+                detail = {}
+            signature = _steps_signature(detail if isinstance(detail, dict) else {})
+            if signature and signature != "[]":
+                step_groups.setdefault(signature, []).append(member)
+
+    combined: dict[tuple[int, ...], dict[str, Any]] = {}
+    for reason, groups in (("name", name_groups), ("steps", step_groups)):
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            ids = tuple(sorted(m["id"] for m in members))
+            entry = combined.setdefault(
+                ids,
+                {
+                    "workout_ids": list(ids),
+                    "name": members[0]["name"],
+                    "reasons": [],
+                },
+            )
+            if reason not in entry["reasons"]:
+                entry["reasons"].append(reason)
+
+    duplicates = []
+    for entry in sorted(combined.values(), key=lambda e: e["workout_ids"]):
+        ids = entry["workout_ids"]
+        entry["suggested_keep"] = max(ids)
+        entry["suggested_delete"] = [wid for wid in ids if wid != max(ids)]
+        duplicates.append(entry)
+
+    return {"count": len(duplicates), "duplicates": duplicates, "scanned": scanned}
+
+
 @mcp.tool
 def rename_workout(workout_id: str, new_name: str) -> dict:
     """Cambia el nombre de un entrenamiento conservando sus pasos y su ID."""
@@ -10264,6 +10375,19 @@ def _decode_polyline(encoded: str) -> list[tuple[float, float]]:
     return decoded
 
 
+def _public_map_base_url() -> str:
+    """Base pública del servidor, desde PUBLIC_URL o desde la request HTTP."""
+    base = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    if base:
+        return base
+    # En Dokploy no siempre se configura PUBLIC_URL; reconstruimos la URL
+    # pública desde la request HTTP (cabeceras X-Forwarded-* del proxy).
+    try:
+        return _public_base_url(get_http_request()).rstrip("/")
+    except Exception:
+        return ""
+
+
 @mcp.tool
 def get_route_map_url(
     route_data: dict,
@@ -10284,14 +10408,7 @@ def get_route_map_url(
     encoded = _encode_polyline(coords)
     route_name = name or route_data.get("name") or "Ruta Garmin Coach"
     query = f"d={encoded}&n={_urlparse.quote(route_name, safe='')}"
-    base = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
-    if not base:
-        # En Dokploy no siempre se configura PUBLIC_URL; reconstruimos la URL
-        # pública desde la request HTTP (cabeceras X-Forwarded-* del proxy).
-        try:
-            base = _public_base_url(get_http_request()).rstrip("/")
-        except Exception:
-            base = ""
+    base = _public_map_base_url()
     viewer_url = f"{base}/rutas#{query}" if base else f"/rutas#{query}"
 
     center_lat = sum(c[0] for c in coords) / len(coords)
@@ -10303,6 +10420,196 @@ def get_route_map_url(
         "external_url": external_url,
         "encoded_polyline": encoded,
         "point_count": len(coords),
+    }
+
+
+@mcp.tool
+def get_route_gpx_url(
+    route_data: dict,
+    name: str = "",
+) -> dict[str, Any]:
+    """Enlace de descarga GPX de una ruta, para abrir o importar en otro navegador."""
+    import urllib.parse as _urlparse
+
+    points = route_data.get("points") or []
+    coords = [(float(p["lat"]), float(p["lon"])) for p in points]
+    if not coords:
+        raise RuntimeError("La ruta no tiene puntos GPS")
+    encoded = _encode_polyline(coords)
+    route_name = name or route_data.get("name") or "Ruta Garmin Coach"
+    query = f"d={encoded}&n={_urlparse.quote(route_name, safe='')}"
+    base = _public_map_base_url()
+    gpx_url = f"{base}/rutas/gpx?{query}" if base else f"/rutas/gpx?{query}"
+    return {"gpx_url": gpx_url, "point_count": len(coords)}
+
+
+@mcp.tool
+def recommend_long_run_day(
+    days: int = 7,
+    lat: float | None = None,
+    lon: float | None = None,
+    route_data: dict | None = None,
+    prefer_weekend: bool = True,
+) -> dict[str, Any]:
+    """Elige el mejor día para la tirada larga según tiempo y calendario.
+
+    Cruza el pronóstico de Open-Meteo con los entrenamientos ya programados.
+    Solo recomienda: no crea, programa ni modifica nada en Garmin Connect.
+    """
+    days = max(1, min(7, int(days)))
+    if lat is None or lon is None:
+        points = (route_data or {}).get("points") or []
+        coords: list[tuple[float, float]] = []
+        for point in points:
+            try:
+                coords.append((float(point["lat"]), float(point["lon"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if coords:
+            lat = sum(c[0] for c in coords) / len(coords)
+            lon = sum(c[1] for c in coords) / len(coords)
+    forecast = get_route_weather(route_data=route_data, lat=lat, lon=lon)
+    weather_days = forecast.get("days") or []
+    if not weather_days:
+        raise RuntimeError("El pronóstico meteorológico no incluye días futuros")
+
+    today = _today_local()
+    last_day = today + timedelta(days=days - 1)
+
+    # Leer el calendario de los meses que toca el rango (puede cruzar mes).
+    busy: dict[str, list[str]] = {}
+    with _fetch_lock():
+        api = _get_api()
+        months = sorted(
+            {
+                ((today + timedelta(days=i)).year, (today + timedelta(days=i)).month)
+                for i in range(days)
+            }
+        )
+        for year, month in months:
+            try:
+                data = (
+                    api.get_workouts_calendar(year, month)
+                    if hasattr(api, "get_workouts_calendar")
+                    else api.connectapi(f"/calendar-service/year/{year}/month/{month - 1}")
+                )
+            except Exception:
+                continue
+            items = (
+                data
+                if isinstance(data, list)
+                else (
+                    data.get("calendarItems") or data.get("items") or []
+                    if isinstance(data, dict)
+                    else []
+                )
+            )
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("itemType", "").lower() not in ("workout", "garmincoach", ""):
+                    continue
+                item_date = str(item.get("date") or "")[:10]
+                if not item_date:
+                    continue
+                title = item.get("workoutName") or item.get("name") or "entrenamiento"
+                busy.setdefault(item_date, []).append(str(title))
+
+    def number(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    weekday_names = (
+        "lunes",
+        "martes",
+        "miércoles",
+        "jueves",
+        "viernes",
+        "sábado",
+        "domingo",
+    )
+    ranked: list[dict[str, Any]] = []
+    for entry in weather_days:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            day = date.fromisoformat(str(entry.get("date") or "")[:10])
+        except ValueError:
+            continue
+        if day < today or day > last_day:
+            continue
+
+        score = 0.0
+        reasons: list[str] = []
+        precip = number(entry.get("precip_prob_max"))
+        wind = number(entry.get("wind_kmh"))
+        temp = number(entry.get("temp_max_c"))
+        code = number(entry.get("weather_code"))
+
+        if precip is not None:
+            score += precip * 0.4
+            if precip <= 10:
+                reasons.append(f"poca probabilidad de lluvia ({precip:.0f} %)")
+            elif precip >= 50:
+                reasons.append(f"alta probabilidad de lluvia ({precip:.0f} %)")
+        if wind is not None:
+            score += wind * 0.6
+            if wind <= 10:
+                reasons.append(f"viento suave ({wind:.0f} km/h)")
+            elif wind >= 25:
+                reasons.append(f"viento fuerte ({wind:.0f} km/h)")
+        if temp is not None:
+            score += abs(temp - 15) * 1.5
+            if 10 <= temp <= 22:
+                reasons.append(f"temperatura agradable ({temp:.0f} °C)")
+            elif temp <= 5:
+                reasons.append(f"frío ({temp:.0f} °C)")
+            elif temp >= 28:
+                reasons.append(f"calor ({temp:.0f} °C)")
+        if code is not None and code >= 51:
+            score += 40 if code >= 71 else 20
+            reasons.append("precipitación prevista" if code < 71 else "nieve prevista")
+
+        iso = day.isoformat()
+        scheduled = busy.get(iso, [])
+        if scheduled:
+            score += 40
+            reasons.append(f"ya hay un entrenamiento planificado ({', '.join(scheduled)})")
+        else:
+            reasons.append("calendario libre")
+        if prefer_weekend and day.weekday() >= 5:
+            score -= 8
+            reasons.append("fin de semana")
+
+        ranked.append(
+            {
+                "date": iso,
+                "weekday": weekday_names[day.weekday()],
+                "score": round(score, 1),
+                "temp_max_c": temp,
+                "precip_prob_max": precip,
+                "wind_kmh": wind,
+                "weather_code": code,
+                "scheduled": scheduled,
+                "reasons": reasons,
+            }
+        )
+
+    if not ranked:
+        raise RuntimeError("El pronóstico no cubre los próximos días")
+    ranked.sort(key=lambda d: (d["score"], d["date"]))
+    for position, item in enumerate(ranked, start=1):
+        item["rank"] = position
+
+    return {
+        "best": ranked[0],
+        "ranked": ranked,
+        "lat": lat if lat is not None else forecast.get("lat"),
+        "lon": lon if lon is not None else forecast.get("lon"),
+        "days": days,
+        "note": "Solo recomienda; no modifica el calendario",
     }
 
 
@@ -10506,12 +10813,12 @@ def _render_route_map_html() -> str:
   .panel { position:absolute; top:16px; left:16px; z-index:500; background:rgba(13,17,23,.92); border:1px solid #30363d; border-radius:12px; padding:14px 16px; max-width:min(420px,calc(100vw - 64px)); box-shadow:0 8px 30px rgba(0,0,0,.45); }
   h1 { margin:0 0 6px; font-size:1.15rem; }
   p { margin:0; color:#9da7b3; font-size:.85rem; }
-  button { margin-top:10px; background:#c9f455; border:0; border-radius:8px; padding:8px 12px; font-weight:600; cursor:pointer; }
+  button, .button { display:inline-block; margin:10px 8px 0 0; background:#c9f455; border:0; border-radius:8px; padding:8px 12px; font-weight:600; cursor:pointer; color:#0d1117; text-decoration:none; font-size:.85rem; }
 </style>
 </head>
 <body>
 <div id="map"></div>
-<div class="panel"><h1 id="route-name">Ruta</h1><p id="route-info"></p><button id="copy">Copiar enlace</button></div>
+<div class="panel"><h1 id="route-name">Ruta</h1><p id="route-info"></p><button id="copy">Copiar enlace</button><a id="gpx-download" class="button" href="#">Descargar GPX</a></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 function decodePolyline(str, precision) {
@@ -10551,6 +10858,12 @@ if (points.length) {
   document.getElementById('route-info').textContent = 'Ruta no válida';
   map.setView([40.4168, -3.7038], 12);
 }
+var gpxLink = document.getElementById('gpx-download');
+if (gpxLink) {
+  gpxLink.href = '/rutas/gpx?' + params.toString();
+  gpxLink.download = name + '.gpx';
+  if (!params.get('d')) { gpxLink.style.display = 'none'; }
+}
 document.getElementById('copy').onclick = function () {
   navigator.clipboard.writeText(location.href).then(function () {
     document.getElementById('copy').textContent = 'Copiado ✓';
@@ -10560,6 +10873,19 @@ document.getElementById('copy').onclick = function () {
 </body>
 </html>
 """
+
+
+def _gpx_payload_from_query(params: dict) -> tuple[str, str]:
+    """Convierte la ruta codificada en la URL del visor a (XML GPX, nombre de archivo)."""
+    coords = [{"lat": lat, "lon": lon} for lat, lon in _decode_polyline(params.get("d") or "")]
+    if not coords:
+        raise ValueError("Ruta no válida: falta la ruta codificada en la URL")
+    name = params.get("n") or "Ruta Garmin Coach"
+    xml = _build_route_gpx_xml({"points": coords}, name)
+    filename = re.sub(r"[^A-Za-z0-9À-ÿ_-]+", "-", name).strip("-")[:60] or "ruta"
+    if not filename.lower().endswith(".gpx"):
+        filename += ".gpx"
+    return xml, filename
 
 
 def _build_route_gpx_xml(route_data: dict, name: str, description: str = "") -> str:
@@ -10710,6 +11036,56 @@ def get_course_list() -> dict[str, Any]:
 
     courses = (data or {}).get("coursesForUser") or [] if isinstance(data, dict) else []
     return {"courses": courses, "count": len(courses), "raw": data}
+
+
+def _normalize_course_id(course_id: str) -> str:
+    raw = str(course_id).strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        raise ValueError(f"ID de course no válido: {course_id!r}")
+    return raw
+
+
+@mcp.tool
+def delete_course(course_id: str, confirm: bool = False) -> dict[str, Any]:
+    """Borra un course (ruta navegable) de Garmin Connect. Requiere confirm=True.
+
+    Antes de borrar, comprueba su ID con get_course_list. No se puede deshacer.
+    """
+    cid = _normalize_course_id(course_id)
+    if not confirm:
+        return {"ok": True, "dry_run": True, "course_id": cid, "deleted": 0}
+
+    user = _get_auth_user()
+    if not user:
+        raise RuntimeError("No autenticado")
+    with _fetch_lock():
+        api = _get_api(user["id"])
+        try:
+            api.client.delete("connectapi", f"course-service/course/{cid}", timeout=30)
+        except Exception as e:
+            detail = str(e)
+            hint = (
+                " (Garmin aún no tiene lista la ruta; espera unos segundos y repite)"
+                if "429" in detail
+                else ""
+            )
+            raise RuntimeError(f"No se pudo borrar el course {cid}: {detail}{hint}") from e
+    return {"ok": True, "dry_run": False, "course_id": cid, "deleted": 1}
+
+
+@mcp.tool
+def delete_courses(
+    course_ids: list[str], dry_run: bool = True, confirm: bool = False
+) -> dict[str, Any]:
+    """Borra varios courses. Por defecto solo simula; hace falta dry_run=False y confirm=True."""
+    normalized = [_normalize_course_id(cid) for cid in course_ids]
+    if dry_run and not confirm:
+        return {"ok": True, "dry_run": True, "courses": normalized, "deleted": 0}
+    deleted = 0
+    for cid in normalized:
+        delete_course(cid, confirm=True)
+        deleted += 1
+    return {"ok": True, "dry_run": False, "courses": normalized, "deleted": deleted}
 
 
 @mcp.tool
