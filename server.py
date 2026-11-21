@@ -22,6 +22,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import requests
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_request
 from garminconnect import (
@@ -8397,6 +8398,49 @@ def delete_workouts(workout_ids: list[str], dry_run: bool = True) -> dict:
 
 
 @mcp.tool
+def rename_workout(workout_id: str, new_name: str) -> dict:
+    """Cambia el nombre de un entrenamiento conservando sus pasos y su ID."""
+    wid = _normalize_workout_id(workout_id)
+    name = (new_name or "").strip()
+    if not name:
+        raise ValueError("El nombre del entrenamiento no puede estar vacío")
+
+    with _fetch_lock():
+        api = _get_api()
+        try:
+            workout = api.get_workout_by_id(wid)
+            if not isinstance(workout, dict):
+                raise RuntimeError("Garmin no devolvió el entrenamiento")
+            old_name = workout.get("workoutName") or ""
+            payload = dict(workout)
+            payload["workoutName"] = name
+            api.update_workout(wid, payload)
+        except Exception as e:
+            raise RuntimeError(f"No se pudo renombrar el entrenamiento {wid}: {e}")
+
+    return {"ok": True, "workout_id": wid, "old_name": old_name, "new_name": name}
+
+
+@mcp.tool
+def delete_activity(activity_id: str, confirm: bool = False) -> dict:
+    """Elimina una actividad de Garmin Connect. Requiere confirm=True."""
+    aid = str(activity_id).strip()
+    if not aid.isdigit() or int(aid) <= 0:
+        raise ValueError(f"ID de actividad no válido: {activity_id!r}")
+    if not confirm:
+        return {"ok": True, "dry_run": True, "activity_id": aid, "deleted": 0}
+
+    with _fetch_lock():
+        api = _get_api()
+        try:
+            api.delete_activity(aid)
+        except Exception as e:
+            raise RuntimeError(f"No se pudo borrar la actividad {aid}: {e}")
+
+    return {"ok": True, "dry_run": False, "activity_id": aid, "deleted": 1}
+
+
+@mcp.tool
 def get_workout_detail(workout_id: str) -> dict:
     """Detalle completo de un entrenamiento: pasos, series, zonas de FC/potencia y objetivos.
     workout_id: ID numérico del entrenamiento (obtenible con get_workout_library o get_scheduled_workouts).
@@ -10259,6 +10303,78 @@ def get_route_map_url(
         "external_url": external_url,
         "encoded_polyline": encoded,
         "point_count": len(coords),
+    }
+
+
+@mcp.tool
+def get_route_weather(
+    route_data: dict | None = None,
+    lat: float | None = None,
+    lon: float | None = None,
+    date: str | None = None,
+) -> dict[str, Any]:
+    """Pronóstico meteorológico para una ruta, usando Open-Meteo (sin API key).
+
+    Pasa `route_data` (con 'points') o `lat`/`lon`. `date` filtra un día
+    concreto dentro de los próximos 7 días (YYYY-MM-DD).
+    """
+    if lat is None or lon is None:
+        points = (route_data or {}).get("points") or []
+        coords: list[tuple[float, float]] = []
+        for point in points:
+            try:
+                coords.append((float(point["lat"]), float(point["lon"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not coords:
+            raise ValueError("Indica lat/lon o una ruta con puntos GPS válidos")
+        lat = sum(c[0] for c in coords) / len(coords)
+        lon = sum(c[1] for c in coords) / len(coords)
+
+    params = {
+        "latitude": float(lat),
+        "longitude": float(lon),
+        "daily": (
+            "temperature_2m_max,temperature_2m_min,precipitation_probability_max,"
+            "wind_speed_10m_max,weather_code"
+        ),
+        "timezone": "auto",
+        "forecast_days": 7,
+    }
+    try:
+        response = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"No se pudo consultar el pronóstico meteorológico: {e}") from e
+
+    daily = data.get("daily") or {} if isinstance(data, dict) else {}
+    times = daily.get("time") or []
+
+    def field(name: str, index: int) -> Any:
+        values = daily.get(name) or []
+        return values[index] if index < len(values) else None
+
+    days = [
+        {
+            "date": day,
+            "temp_max_c": field("temperature_2m_max", i),
+            "temp_min_c": field("temperature_2m_min", i),
+            "precip_prob_max": field("precipitation_probability_max", i),
+            "wind_kmh": field("wind_speed_10m_max", i),
+            "weather_code": field("weather_code", i),
+        }
+        for i, day in enumerate(times)
+    ]
+    if date:
+        days = [day for day in days if day["date"] == date]
+
+    return {
+        "source": "open-meteo",
+        "lat": float(lat),
+        "lon": float(lon),
+        "timezone": data.get("timezone") if isinstance(data, dict) else None,
+        "days": days,
     }
 
 
