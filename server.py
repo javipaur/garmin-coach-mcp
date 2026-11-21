@@ -2210,6 +2210,14 @@ async def lock_session(request: Request) -> Response:
     return resp
 
 
+@mcp.custom_route("/rutas", methods=["GET"])
+async def route_map(_: Request) -> Response:
+    """Visor compartible de rutas; la ruta viaja codificada en el fragmento de la URL."""
+    from starlette.responses import HTMLResponse
+
+    return HTMLResponse(_render_route_map_html())
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
     lock_info = _lock_holder_info("fetch")
@@ -10029,6 +10037,165 @@ def suggest_routes_from_profile(
         surface=surface,
         max_results=max_results,
     )
+
+
+def _encode_polyline(points: list[tuple[float, float]]) -> str:
+    """Codifica coordenadas con el algoritmo polyline de Google (precisión 5)."""
+
+    def encode_delta(delta: int) -> str:
+        value = ~(delta << 1) if delta < 0 else (delta << 1)
+        chunks = []
+        while value >= 0x20:
+            chunks.append(chr((0x20 | (value & 0x1F)) + 63))
+            value >>= 5
+        chunks.append(chr(value + 63))
+        return "".join(chunks)
+
+    encoded = []
+    prev_lat = 0
+    prev_lon = 0
+    for lat, lon in points:
+        lat_i = int(round(lat * 100000))
+        lon_i = int(round(lon * 100000))
+        encoded.append(encode_delta(lat_i - prev_lat))
+        encoded.append(encode_delta(lon_i - prev_lon))
+        prev_lat, prev_lon = lat_i, lon_i
+    return "".join(encoded)
+
+
+def _decode_polyline(encoded: str) -> list[tuple[float, float]]:
+    """Decodifica una polyline; complemento de _encode_polyline."""
+    index = 0
+    lat = 0
+    lon = 0
+    decoded: list[tuple[float, float]] = []
+    while index < len(encoded):
+        lat_delta = lon_delta = 0
+        for is_lon in (False, True):
+            shift = 0
+            value = 0
+            while index < len(encoded):
+                byte = ord(encoded[index]) - 63
+                index += 1
+                value |= (byte & 0x1F) << shift
+                shift += 5
+                if byte < 0x20:
+                    break
+            delta = ~(value >> 1) if value & 1 else (value >> 1)
+            if is_lon:
+                lon_delta = delta
+            else:
+                lat_delta = delta
+        lat += lat_delta
+        lon += lon_delta
+        decoded.append((lat / 100000, lon / 100000))
+    return decoded
+
+
+@mcp.tool
+def get_route_map_url(
+    route_data: dict,
+    name: str = "",
+) -> dict[str, Any]:
+    """Devuelve un enlace compartible al visor de la ruta y un enlace externo a OpenStreetMap.
+
+    route_data: ruta devuelta por suggest_routes (con 'points').
+    name: nombre opcional para el visor.
+    """
+    import urllib.parse as _urlparse
+
+    points = route_data.get("points") or []
+    if not points:
+        raise RuntimeError("La ruta no tiene puntos GPS")
+
+    coords = [(float(p["lat"]), float(p["lon"])) for p in points]
+    encoded = _encode_polyline(coords)
+    route_name = name or route_data.get("name") or "Ruta Garmin Coach"
+    query = f"d={encoded}&n={_urlparse.quote(route_name, safe='')}"
+    base = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    viewer_url = f"{base}/rutas#{query}" if base else f"/rutas#{query}"
+
+    center_lat = sum(c[0] for c in coords) / len(coords)
+    center_lon = sum(c[1] for c in coords) / len(coords)
+    external_url = f"https://www.openstreetmap.org/#map=14/{center_lat:.5f}/{center_lon:.5f}"
+
+    return {
+        "viewer_url": viewer_url,
+        "external_url": external_url,
+        "encoded_polyline": encoded,
+        "point_count": len(coords),
+    }
+
+
+def _render_route_map_html() -> str:
+    """Página Leaflet que dibuja una ruta codificada en el fragmento de la URL."""
+    return """<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visor de rutas · Garmin Coach</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin:0; height:100%; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0d1117; color:#e6edf3; }
+  #map { position:absolute; inset:0; }
+  .panel { position:absolute; top:16px; left:16px; z-index:500; background:rgba(13,17,23,.92); border:1px solid #30363d; border-radius:12px; padding:14px 16px; max-width:min(420px,calc(100vw - 64px)); box-shadow:0 8px 30px rgba(0,0,0,.45); }
+  h1 { margin:0 0 6px; font-size:1.15rem; }
+  p { margin:0; color:#9da7b3; font-size:.85rem; }
+  button { margin-top:10px; background:#c9f455; border:0; border-radius:8px; padding:8px 12px; font-weight:600; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel"><h1 id="route-name">Ruta</h1><p id="route-info"></p><button id="copy">Copiar enlace</button></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+function decodePolyline(str, precision) {
+  precision = precision || 5;
+  var index = 0, lat = 0, lng = 0, factor = Math.pow(10, precision), result = [];
+  while (index < str.length) {
+    var shifts = [0, 0];
+    for (var i = 0; i < 2; i++) {
+      var b, shift = 0, value = 0;
+      do {
+        b = str.charCodeAt(index++) - 63;
+        value |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20 && index <= str.length);
+      shifts[i] = (value & 1) ? ~(value >> 1) : (value >> 1);
+    }
+    lat += shifts[0]; lng += shifts[1];
+    result.push([lat / factor, lng / factor]);
+  }
+  return result;
+}
+var params = new URLSearchParams(location.hash.slice(1));
+var points = decodePolyline(params.get('d') || '');
+var name = params.get('n') || 'Ruta';
+document.getElementById('route-name').textContent = decodeURIComponent(name);
+var map = L.map('map');
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors', maxZoom: 19
+}).addTo(map);
+if (points.length) {
+  L.polyline(points, { color: '#c9f455', weight: 4 }).addTo(map);
+  L.marker(points[0]).addTo(map);
+  L.marker(points[points.length - 1]).addTo(map);
+  map.fitBounds(L.latLngBounds(points).pad(0.15));
+  document.getElementById('route-info').textContent = points.length + ' puntos GPS · arrastra para explorar';
+} else {
+  document.getElementById('route-info').textContent = 'Ruta no válida';
+  map.setView([40.4168, -3.7038], 12);
+}
+document.getElementById('copy').onclick = function () {
+  navigator.clipboard.writeText(location.href).then(function () {
+    document.getElementById('copy').textContent = 'Copiado ✓';
+  });
+};
+</script>
+</body>
+</html>
+"""
 
 
 def _build_route_gpx_xml(route_data: dict, name: str, description: str = "") -> str:
